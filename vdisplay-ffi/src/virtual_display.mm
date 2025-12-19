@@ -44,12 +44,6 @@ struct DisplayObject {
 };
 
 class VDisplay {
-  /*
-  public:
-    static Napi::Function GetClass(Napi::Env);
-    VDisplay(const Napi::CallbackInfo &info);
-
-  */
 public:
   DisplayObject CreateVirtualDisplay(unsigned int width, unsigned int height,
                                      double refreshRate, bool hiDPI,
@@ -74,22 +68,6 @@ private:
     return (value < low) ? low : ((value > high) ? high : value);
   }
 };
-
-/*
-VDisplay::VDisplay(const Napi::CallbackInfo &info) : ObjectWrap(info) {}
-
-Napi::Function VDisplay::GetClass(Napi::Env env) {
-  return DefineClass(
-      env, "VDisplay",
-      {
-          InstanceMethod("createVirtualDisplay",
-                         &VDisplay::CreateVirtualDisplay),
-          InstanceMethod("cloneVirtualDisplay", &VDisplay::CloneVirtualDisplay),
-          InstanceMethod("destroyVirtualDisplay",
-                         &VDisplay::DestroyVirtualDisplay),
-      });
-}
-*/
 
 void VDisplay::InitializeDescriptor(NSString *displayName, unsigned int width,
                                     unsigned int height, int ppi) {
@@ -356,4 +334,34 @@ bool VDisplay::DestroyVirtualDisplay() {
   } else {
     return false;
   }
+}
+
+extern "C" {
+// Global instance or pass pointer
+static VDisplay *g_display = nullptr;
+
+void VDisplay_Init() { g_display = new VDisplay(); }
+
+DisplayObject VDisplay_CreateVirtualDisplay(unsigned int width,
+                                            unsigned int height,
+                                            double refreshRate, bool hiDPI,
+                                            char *displayNameStr, int ppi,
+                                            bool useMirror) {
+  return g_display->CreateVirtualDisplay(width, height, refreshRate, hiDPI,
+                                         displayNameStr, ppi, useMirror);
+}
+
+DisplayObject VDisplay_CloneVirtualDisplay(char *displayNameStr,
+                                           bool useMirror) {
+  return g_display->CloneVirtualDisplay(displayNameStr, useMirror);
+}
+
+bool VDisplay_DestroyVirtualDisplay() {
+  return g_display->DestroyVirtualDisplay();
+}
+
+void VDisplay_Cleanup() {
+  delete g_display;
+  g_display = nullptr;
+}
 }
