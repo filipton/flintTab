@@ -7,4 +7,5 @@ fn main() {
     std::thread::sleep(Duration::from_secs(60));
     let r = vdisplay_ffi::destroy_virtual_display();
     println!("r {r}");
+    vdisplay_ffi::init_virtual_cleanup();
 }
