@@ -7,7 +7,18 @@ fn main() -> Result<()> {
     let vd = vdisplay_ffi::create_virtual_display(1920, 1080, 30.0, true, "Test", 300, false);
     println!("{vd:?}");
 
-    let monitor = Monitor::from_point(2000, 100).unwrap();
+    let Some(monitor) = Monitor::all()?
+        .iter()
+        .filter(|m| m.id().unwrap_or(u32::max_value()) == vd.display_id)
+        .collect::<Vec<_>>()
+        .first()
+        .cloned()
+        .cloned()
+    else {
+        println!("Monitor not found!");
+        return Ok(());
+    };
+
     println!("{monitor:?}");
     let (video_recorder, sx) = monitor.video_recorder().unwrap();
 
@@ -22,19 +33,10 @@ fn main() -> Result<()> {
         }
     });
 
-    println!("start");
     video_recorder.start().unwrap();
-    std::thread::sleep(Duration::from_secs(2));
-    println!("stop");
-    video_recorder.stop().unwrap();
-    std::thread::sleep(Duration::from_secs(2));
-    println!("start");
-    video_recorder.start().unwrap();
-    std::thread::sleep(Duration::from_secs(2));
-    println!("stop");
-    video_recorder.stop().unwrap();
 
     std::thread::sleep(Duration::from_secs(60));
+    video_recorder.stop().unwrap();
     let r = vdisplay_ffi::destroy_virtual_display();
     println!("r {r}");
     vdisplay_ffi::init_virtual_cleanup();
