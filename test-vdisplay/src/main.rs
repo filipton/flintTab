@@ -1,5 +1,9 @@
 use anyhow::Result;
-use std::time::Duration;
+use image::{ImageBuffer, Rgba};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use xcap::Monitor;
 
 fn main() -> Result<()> {
@@ -26,7 +30,9 @@ fn main() -> Result<()> {
         loop {
             match sx.recv() {
                 Ok(frame) => {
-                    println!("frame: {:?}", frame.width);
+                    println!("frame: {:?} {}", frame.width, frame.raw.len());
+                    // frame raw is rgba
+                    // save_png(&PathBuf::from("/tmp/test.png"), &frame.raw, 1920, 1080).unwrap();
                 }
                 _ => continue,
             }
@@ -42,3 +48,21 @@ fn main() -> Result<()> {
     vdisplay_ffi::init_virtual_cleanup();
     Ok(())
 }
+
+/*
+pub fn save_png(
+    path: &Path,
+    rgba_data: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(rgba_data.len(), (width * height * 4) as usize);
+
+    let img = ImageBuffer::<Rgba<u8>, &[u8]>::from_raw(width, height, rgba_data)
+        .ok_or("Failed to create image buffer")?;
+
+    img.save(path)?;
+
+    Ok(())
+}
+*/
