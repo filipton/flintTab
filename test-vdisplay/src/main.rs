@@ -32,7 +32,14 @@ fn main() -> Result<()> {
                 Ok(frame) => {
                     println!("frame: {:?} {}", frame.width, frame.raw.len());
                     // frame raw is rgba
-                    // save_png(&PathBuf::from("/tmp/test.png"), &frame.raw, 1920, 1080).unwrap();
+                    save_webp(
+                        &PathBuf::from("/tmp/test.webp"),
+                        &frame.raw,
+                        1920,
+                        1080,
+                        80.0,
+                    )
+                    .unwrap();
                 }
                 _ => continue,
             }
@@ -41,7 +48,7 @@ fn main() -> Result<()> {
 
     video_recorder.start().unwrap();
 
-    std::thread::sleep(Duration::from_secs(60));
+    std::thread::sleep(Duration::from_secs(500));
     video_recorder.stop().unwrap();
     let r = vdisplay_ffi::destroy_virtual_display();
     println!("r {r}");
@@ -49,20 +56,19 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/*
-pub fn save_png(
+pub fn save_webp(
     path: &Path,
     rgba_data: &[u8],
     width: u32,
     height: u32,
+    quality: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(rgba_data.len(), (width * height * 4) as usize);
 
-    let img = ImageBuffer::<Rgba<u8>, &[u8]>::from_raw(width, height, rgba_data)
-        .ok_or("Failed to create image buffer")?;
+    let encoder = webp::Encoder::from_rgba(rgba_data, width, height);
+    let webp_data = encoder.encode(quality);
 
-    img.save(path)?;
+    std::fs::write(path, &*webp_data)?;
 
     Ok(())
 }
-*/

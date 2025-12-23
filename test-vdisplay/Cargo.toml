@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
-image = { version = "0.25.9", features = ["png"] }
+image = { version = "0.25.9", features = ["jpeg", "png", "webp"] }
 vdisplay-ffi = { path = "../vdisplay-ffi" }
+webp = "0.3.1"
 xcap = "0.8.0"

@@ -81,6 +81,10 @@ void VDisplay::InitializeDescriptor(NSString *displayName, unsigned int width,
   _descriptor.productID = 0xeeee + width + height + ppi;
   _descriptor.vendorID = 0xeeee;
   _descriptor.serialNum = 0x0001;
+
+  dispatch_queue_t queue =
+      dispatch_queue_create("com.vdisplay.queue", DISPATCH_QUEUE_SERIAL);
+  [_descriptor setDispatchQueue:queue];
 }
 
 void VDisplay::InitializeSettings(unsigned int width, unsigned int height,
