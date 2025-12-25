@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 image = { version = "0.25.9", features = ["jpeg", "png", "webp"] }
+libc = "0.2.178"
 screencapturekit = { version = "1.5.0", features = ["async", "macos_26_0"] }
 tokio = { version = "1.48.0", features = ["full"] }
 vdisplay-ffi = { path = "../vdisplay-ffi" }

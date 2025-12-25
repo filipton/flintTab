@@ -972,6 +972,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "image",
+ "libc",
  "screencapturekit",
  "tokio",
  "vdisplay-ffi",
