@@ -1,31 +1,67 @@
 use anyhow::Result;
-use image::{ImageBuffer, Rgba};
 use std::{
+    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{ChildStdin, Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
-use tokio::io::AsyncWriteExt;
 
 use screencapturekit::{
-    CMTime,
-    async_api::{AsyncSCShareableContent, AsyncSCStream},
+    CMSampleBuffer, CMTime,
     cv::CVPixelBufferLockFlags,
-    prelude::{PixelFormat, SCContentFilter, SCStreamConfiguration, SCStreamOutputType},
-    recording_output::{
-        RecordingCallbacks, SCRecordingOutput, SCRecordingOutputCodec,
-        SCRecordingOutputConfiguration, SCRecordingOutputFileType,
+    prelude::{
+        PixelFormat, SCContentFilter, SCShareableContent, SCStreamConfiguration, SCStreamOutputType,
     },
-    stream::SCStream,
+    stream::{SCStream, SCStreamOutput},
 };
+
+struct FrameHandler {
+    count: Arc<AtomicUsize>,
+    ffmpeg_stdin: Arc<Mutex<ChildStdin>>,
+    last_time: Arc<Mutex<Instant>>,
+}
+
+impl SCStreamOutput for FrameHandler {
+    fn did_output_sample_buffer(&self, sample: CMSampleBuffer, _type: SCStreamOutputType) {
+        let Some(pixel_buffer) = sample.image_buffer() else {
+            return;
+        };
+
+        let Ok(guard) = pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) else {
+            return;
+        };
+
+        let data = guard.as_slice();
+
+        {
+            let mut stdin = self.ffmpeg_stdin.lock().unwrap();
+            stdin.write_all(data).unwrap();
+        }
+
+        let n = self.count.fetch_add(1, Ordering::Relaxed);
+        if n % 30 == 0 {
+            let mut last_time = self.last_time.lock().unwrap();
+            println!(
+                "📹 Frame {n} | {}",
+                1000.0 / last_time.elapsed().as_millis() as f32
+            );
+
+            *last_time = Instant::now();
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     vdisplay_ffi::init_virtual_display();
-    let vd = vdisplay_ffi::create_virtual_display(1920, 1080, 30.0, true, "Test", 300, false);
+    let vd = vdisplay_ffi::create_virtual_display(1920, 1080, 60.0, true, "Test", 300, false);
     println!("{vd:?}");
 
-    let content = AsyncSCShareableContent::get().await?;
+    let content = SCShareableContent::get()?;
     let Some(display) = &content
         .displays()
         .iter()
@@ -46,113 +82,69 @@ async fn main() -> Result<()> {
         .with_width(1920)
         .with_height(1080)
         .with_pixel_format(PixelFormat::BGRA)
-        .with_minimum_frame_interval(&CMTime::new(1, 30));
+        .with_minimum_frame_interval(&CMTime::new(1, 60));
 
-    let stream = AsyncSCStream::new(&filter, &config, 30, SCStreamOutputType::Screen);
+    let mut stream = SCStream::new(&filter, &config);
 
-    // Stream target - change this IP to your receiving machine
-    let target_host = "127.0.0.1"; // localhost for same machine, or "192.168.1.100" for different machine
-    let target_port = 8554;
-
-    println!("🎯 Streaming target: {}:{}", target_host, target_port);
-    println!("💡 On the receiving machine, run:");
-    println!(
-        "   ffplay -fflags nobuffer -flags low_delay -framedrop tcp://{}:{}?listen",
-        target_host, target_port
-    );
-    println!("\nWaiting 3 seconds for you to start ffplay...");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // FFmpeg streams directly to the target via TCP
     let mut ffmpeg = Command::new("ffmpeg")
-        .args(&[
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            "bgra",
-            "-video_size",
-            "1920x1080",
-            "-framerate",
-            "30",
-            "-i",
-            "pipe:0",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-tune",
-            "zerolatency",
-            "-g",
-            "30",
-            "-bf",
-            "0",
-            "-pix_fmt",
-            "yuv420p",
-            "-f",
-            "mpegts", // MPEG-TS is better for streaming than raw h264
-            &format!("tcp://{}:{}", target_host, target_port),
-        ])
+        .arg("-f")
+        .arg("rawvideo")
+        .arg("-pixel_format")
+        .arg("bgra")
+        .arg("-video_size")
+        .arg("1920x1080")
+        .arg("-framerate")
+        .arg("60")
+        .arg("-i")
+        .arg("-")
+        //.arg("-c:v")
+        //.arg("libx264")
+        .arg("-c:v")
+        .arg("h264_videotoolbox")
+        .arg("-realtime")
+        .arg("true") // Key: real-time mode
+        .arg("-prio_speed")
+        .arg("true") // Prioritize speed (lower delay)
+        .arg("-preset")
+        .arg("ultrafast")
+        .arg("-tune")
+        .arg("zerolatency")
+        .arg("-bf")
+        .arg("0")
+        .arg("-g")
+        .arg("30")
+        .arg("-keyint_min")
+        .arg("30")
+        //.arg("-b:v")
+        //.arg("50M")
+        .arg("-f")
+        .arg("mpegts")
+        .arg("udp://192.168.1.38:1234?pkt_size=1316")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()?;
 
-    let mut ffmpeg_stdin = tokio::process::ChildStdin::from_std(ffmpeg.stdin.take().unwrap())?;
+    let stdin = ffmpeg.stdin.take().expect("Failed to open stdin");
 
+    let count = Arc::new(AtomicUsize::new(0));
+    let handler = FrameHandler {
+        count: count.clone(),
+        ffmpeg_stdin: Arc::new(Mutex::new(stdin)),
+        last_time: Arc::new(Mutex::new(Instant::now())),
+    };
+    stream.add_output_handler(handler, SCStreamOutputType::Screen);
     stream.start_capture()?;
 
     println!("🔴 Capturing and streaming...");
+    tokio::time::sleep(Duration::from_secs(600)).await;
 
-    let mut frame_count = 0u64;
-    let start_time = tokio::time::Instant::now();
-
-    // Stream for 30 seconds (or until interrupted)
-    while start_time.elapsed() < Duration::from_secs(30) {
-        if let Some(frame) = stream.next().await {
-            if let Some(image_buffer) = frame.image_buffer() {
-                let lock_guard = image_buffer
-                    .lock(CVPixelBufferLockFlags::READ_ONLY)
-                    .unwrap();
-
-                let base_address = lock_guard.base_address();
-                let bytes_per_row = lock_guard.bytes_per_row();
-                let height = lock_guard.height();
-                let frame_size = (height * bytes_per_row) as usize;
-
-                let frame_data = unsafe { std::slice::from_raw_parts(base_address, frame_size) };
-
-                if let Err(e) = ffmpeg_stdin.write_all(frame_data).await {
-                    eprintln!("❌ Failed to write frame: {}", e);
-                    eprintln!("   Is ffplay running and listening?");
-                    break;
-                }
-
-                frame_count += 1;
-                if frame_count % 30 == 0 {
-                    let elapsed = start_time.elapsed().as_secs_f32();
-                    let fps = frame_count as f32 / elapsed;
-                    println!(
-                        "📊 {}s | {} frames | {:.1} fps",
-                        elapsed as u32, frame_count, fps
-                    );
-                }
-            }
-        }
-    }
-
-    // Cleanup
-    println!("⏹️  Stopping capture...");
     stream.stop_capture()?;
 
-    drop(ffmpeg_stdin);
+    /*
+    drop(stdin);
     let _ = ffmpeg.kill();
-
-    let elapsed = start_time.elapsed().as_secs_f32();
-    let avg_fps = frame_count as f32 / elapsed;
-    println!(
-        "✅ Captured {} frames in {:.1}s ({:.1} fps)",
-        frame_count, elapsed, avg_fps
-    );
+    */
 
     std::thread::sleep(Duration::from_secs(500));
     let r = vdisplay_ffi::destroy_virtual_display();
