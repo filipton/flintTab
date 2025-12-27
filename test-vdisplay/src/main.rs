@@ -97,14 +97,14 @@ async fn main() -> Result<()> {
         .arg("60")
         .arg("-i")
         .arg("-")
-        //.arg("-c:v")
-        //.arg("libx264")
         .arg("-c:v")
-        .arg("h264_videotoolbox")
-        .arg("-realtime")
-        .arg("true") // Key: real-time mode
-        .arg("-prio_speed")
-        .arg("true") // Prioritize speed (lower delay)
+        .arg("libx264")
+        //.arg("-c:v")
+        //.arg("h264_videotoolbox")
+        //.arg("-realtime")
+        //.arg("true") // Key: real-time mode
+        //.arg("-prio_speed")
+        //.arg("true") // Prioritize speed (lower delay)
         .arg("-preset")
         .arg("ultrafast")
         .arg("-tune")
@@ -136,17 +136,12 @@ async fn main() -> Result<()> {
     stream.add_output_handler(handler, SCStreamOutputType::Screen);
     stream.start_capture()?;
 
-    println!("🔴 Capturing and streaming...");
-    tokio::time::sleep(Duration::from_secs(600)).await;
+    println!("Capturing and streaming... press ctrl-c to stop");
+    tokio::signal::ctrl_c().await?;
 
     stream.stop_capture()?;
 
-    /*
-    drop(stdin);
-    let _ = ffmpeg.kill();
-    */
-
-    std::thread::sleep(Duration::from_secs(500));
+    _ = ffmpeg.kill();
     let r = vdisplay_ffi::destroy_virtual_display();
     println!("r {r}");
     vdisplay_ffi::init_virtual_cleanup();
