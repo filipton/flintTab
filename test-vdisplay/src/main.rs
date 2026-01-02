@@ -57,15 +57,17 @@ impl SCStreamOutput for FrameHandler {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    vdisplay_ffi::init_virtual_display();
-    let vd = vdisplay_ffi::create_virtual_display(1920, 1080, 60.0, true, "Test", 300, false);
-    println!("{vd:?}");
+    /*
+        vdisplay_ffi::init_virtual_display();
+        let vd = vdisplay_ffi::create_virtual_display(1920, 1080, 60.0, true, "Test", 300, false);
+        println!("{vd:?}");
 
+    */
     let content = SCShareableContent::get()?;
     let Some(display) = &content
         .displays()
         .iter()
-        .filter(|d| d.display_id() == vd.display_id)
+        //.filter(|d| d.display_id() == vd.display_id)
         .cloned()
         .next()
     else {
