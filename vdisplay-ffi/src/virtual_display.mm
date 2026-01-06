@@ -402,26 +402,32 @@ void VDisplay_Cleanup() {
     delete _cppDisplay;
     _cppDisplay = nullptr;
   }
+  [super dealloc];
 }
 
-- (DisplayObject)createVirtualDisplayWithWidth:(unsigned int)width
-                                        height:(unsigned int)height
-                                   refreshRate:(double)refreshRate
-                                         hiDPI:(BOOL)hiDPI
-                                   displayName:(const char *)displayNameStr
-                                           ppi:(int)ppi
-                                     useMirror:(BOOL)useMirror {
-  if (!_cppDisplay) {
+- (DisplayObject)createVirtualDisplay:(unsigned int)width
+                               height:(unsigned int)height
+                          refreshRate:(double)refreshRate
+                                hiDPI:(BOOL)hiDPI
+                          displayName:(const char *)displayNameStr
+                                  ppi:(int)ppi
+                            useMirror:(BOOL)useMirror {
+  @try {
+    if (!_cppDisplay) {
+      DisplayObject null_obj = {0, 0, 0};
+      return null_obj;
+    }
+
+    return _cppDisplay->CreateVirtualDisplay(
+        width, height, refreshRate, hiDPI ? true : false,
+        (char *)displayNameStr, ppi, useMirror ? true : false);
+  } @catch (NSException *exception) {
+    NSLog(@"Exception in createVirtualDisplay: %@", exception);
     DisplayObject null_obj = {0, 0, 0};
     return null_obj;
   }
-
-  return _cppDisplay->CreateVirtualDisplay(
-      width, height, refreshRate, hiDPI ? true : false, (char *)displayNameStr,
-      ppi, useMirror ? true : false);
 }
-
-- (DisplayObject)cloneVirtualDisplayWithName:(const char *)displayNameStr
+- (DisplayObject)cloneVirtualDisplay:(const char *)displayNameStr
                                    useMirror:(BOOL)useMirror {
   if (!_cppDisplay) {
     DisplayObject null_obj = {0, 0, 0};
@@ -438,16 +444,6 @@ void VDisplay_Cleanup() {
   }
 
   return _cppDisplay->DestroyVirtualDisplay() ? YES : NO;
-}
-
-+ (BOOL)checkAvailability {
-  Class descriptorClass = NSClassFromString(@"CGVirtualDisplayDescriptor");
-  Class displayClass = NSClassFromString(@"CGVirtualDisplay");
-  Class settingsClass = NSClassFromString(@"CGVirtualDisplaySettings");
-  Class modeClass = NSClassFromString(@"CGVirtualDisplayMode");
-
-  return (descriptorClass && displayClass && settingsClass && modeClass) ? YES
-                                                                         : NO;
 }
 
 @end

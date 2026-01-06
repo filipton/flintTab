@@ -59,7 +59,12 @@ impl SCStreamOutput for FrameHandler {
 async fn main() -> Result<()> {
     let mut vd = vdisplay_ffi::VDisplay::new();
     let res = vd.create_virtual_display(1920, 1080, 60.0, true, "test", 300, false);
-    println!("{res:?}");
+    let res2 = vd.clone_virtual_display("test2", false);
+    println!("{res:?} {res2:?}");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let r = vd.destroy_virtual_display();
+    println!("{r:?}");
+    tokio::time::sleep(Duration::from_secs(10)).await;
     return Ok(());
 
     /*

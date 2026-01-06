@@ -37,8 +37,39 @@ impl VDisplay {
             let hi_dpi: BOOL = if hi_dpi { YES } else { NO };
             let use_mirror: BOOL = if use_mirror { YES } else { NO };
 
-            let res: DisplayObject = msg_send![self.obj, CreateVirtualDisplay:width height:height refreshRate:refresh_rate hiDPI:hi_dpi displayNameStr:display_name_ptr ppi:ppi useMirror:use_mirror];
+            let res: DisplayObject = msg_send![
+                self.obj,
+                createVirtualDisplay:width
+                height:height
+                refreshRate:refresh_rate
+                hiDPI:hi_dpi
+                displayName:display_name_ptr
+                ppi:ppi
+                useMirror:use_mirror
+            ];
             res
+        }
+    }
+
+    pub fn clone_virtual_display(&mut self, display_name: &str, use_mirror: bool) -> DisplayObject {
+        unsafe {
+            let display_name_cstr = CString::new(display_name).expect("CString failed");
+            let display_name_ptr: *const c_char = display_name_cstr.as_ptr();
+            let use_mirror: BOOL = if use_mirror { YES } else { NO };
+
+            let res: DisplayObject = msg_send![
+                self.obj,
+                cloneVirtualDisplay:display_name_ptr
+                useMirror:use_mirror
+            ];
+            res
+        }
+    }
+
+    pub fn destroy_virtual_display(&mut self) -> bool {
+        unsafe {
+            let result: BOOL = msg_send![self.obj, destroyVirtualDisplay];
+            result == YES
         }
     }
 }
