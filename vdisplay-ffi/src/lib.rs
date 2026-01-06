@@ -1,4 +1,65 @@
-use std::ffi::CString;
+#![allow(unexpected_cfgs)]
+
+use objc::{
+    msg_send,
+    runtime::{BOOL, Class, NO, Object, YES},
+    sel, sel_impl,
+};
+use std::ffi::{CString, c_char};
+
+pub struct VDisplay {
+    obj: *mut Object,
+}
+
+impl VDisplay {
+    pub fn new() -> Self {
+        unsafe {
+            let cls = Class::get("VDisplayWrapper").expect("Class not found");
+            let obj: *mut Object = msg_send![cls, alloc];
+            let obj: *mut Object = msg_send![obj, init];
+            VDisplay { obj }
+        }
+    }
+
+    pub fn create_virtual_display(
+        &mut self,
+        width: u32,
+        height: u32,
+        refresh_rate: f64,
+        hi_dpi: bool,
+        display_name: &str,
+        ppi: i32,
+        use_mirror: bool,
+    ) -> DisplayObject {
+        unsafe {
+            let display_name_cstr = CString::new(display_name).expect("CString failed");
+            let display_name_ptr: *const c_char = display_name_cstr.as_ptr();
+            let hi_dpi: BOOL = if hi_dpi { YES } else { NO };
+            let use_mirror: BOOL = if use_mirror { YES } else { NO };
+
+            let res: DisplayObject = msg_send![self.obj, CreateVirtualDisplay:width height:height refreshRate:refresh_rate hiDPI:hi_dpi displayNameStr:display_name_ptr ppi:ppi useMirror:use_mirror];
+            res
+        }
+    }
+}
+
+/*
+class VDisplay {
+public:
+  DisplayObject CreateVirtualDisplay(u32 width, u32 height, double refreshRate, bool hiDPI, char *displayNameStr, i32 ppi, bool useMirror);
+  DisplayObject CloneVirtualDisplay(char *displayNameStr, bool useMirror);
+  bool DestroyVirtualDisplay();
+
+private:
+  CGVirtualDisplay *_display;
+  CGVirtualDisplayDescriptor *_descriptor;
+  CGVirtualDisplaySettings *_settings;
+
+  void InitializeDescriptor(NSString *displayName, u32 width, u32 height, i32 ppi);
+  void InitializeSettings(u32 width, u32 height, CGFloat refreshRate, bool hiDPI);
+  DisplayObject CreateDisplayObject(unsigned int width, unsigned int height);
+  DisplayObject NullDisplayObject();
+*/
 
 #[repr(C)]
 #[derive(Debug)]

@@ -369,3 +369,85 @@ void VDisplay_Cleanup() {
   g_display = nullptr;
 }
 }
+
+@interface VDisplayWrapper : NSObject
+- (instancetype)init;
+- (DisplayObject)createVirtualDisplayWithWidth:(unsigned int)width
+                                        height:(unsigned int)height
+                                   refreshRate:(double)refreshRate
+                                         hiDPI:(BOOL)hiDPI
+                                   displayName:(const char *)displayNameStr
+                                           ppi:(int)ppi
+                                     useMirror:(BOOL)useMirror;
+- (DisplayObject)cloneVirtualDisplayWithName:(const char *)displayNameStr
+                                   useMirror:(BOOL)useMirror;
+- (BOOL)destroyVirtualDisplay;
++ (BOOL)checkAvailability;
+@end
+
+@implementation VDisplayWrapper {
+  VDisplay *_cppDisplay;
+}
+
+- (instancetype)init {
+  self = [super init];
+  if (self) {
+    _cppDisplay = new VDisplay();
+  }
+  return self;
+}
+
+- (void)dealloc {
+  if (_cppDisplay) {
+    delete _cppDisplay;
+    _cppDisplay = nullptr;
+  }
+}
+
+- (DisplayObject)createVirtualDisplayWithWidth:(unsigned int)width
+                                        height:(unsigned int)height
+                                   refreshRate:(double)refreshRate
+                                         hiDPI:(BOOL)hiDPI
+                                   displayName:(const char *)displayNameStr
+                                           ppi:(int)ppi
+                                     useMirror:(BOOL)useMirror {
+  if (!_cppDisplay) {
+    DisplayObject null_obj = {0, 0, 0};
+    return null_obj;
+  }
+
+  return _cppDisplay->CreateVirtualDisplay(
+      width, height, refreshRate, hiDPI ? true : false, (char *)displayNameStr,
+      ppi, useMirror ? true : false);
+}
+
+- (DisplayObject)cloneVirtualDisplayWithName:(const char *)displayNameStr
+                                   useMirror:(BOOL)useMirror {
+  if (!_cppDisplay) {
+    DisplayObject null_obj = {0, 0, 0};
+    return null_obj;
+  }
+
+  return _cppDisplay->CloneVirtualDisplay((char *)displayNameStr,
+                                          useMirror ? true : false);
+}
+
+- (BOOL)destroyVirtualDisplay {
+  if (!_cppDisplay) {
+    return NO;
+  }
+
+  return _cppDisplay->DestroyVirtualDisplay() ? YES : NO;
+}
+
++ (BOOL)checkAvailability {
+  Class descriptorClass = NSClassFromString(@"CGVirtualDisplayDescriptor");
+  Class displayClass = NSClassFromString(@"CGVirtualDisplay");
+  Class settingsClass = NSClassFromString(@"CGVirtualDisplaySettings");
+  Class modeClass = NSClassFromString(@"CGVirtualDisplayMode");
+
+  return (descriptorClass && displayClass && settingsClass && modeClass) ? YES
+                                                                         : NO;
+}
+
+@end

@@ -57,6 +57,11 @@ impl SCStreamOutput for FrameHandler {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut vd = vdisplay_ffi::VDisplay::new();
+    let res = vd.create_virtual_display(1920, 1080, 60.0, true, "test", 300, false);
+    println!("{res:?}");
+    return Ok(());
+
     /*
         vdisplay_ffi::init_virtual_display();
         let vd = vdisplay_ffi::create_virtual_display(1920, 1080, 60.0, true, "Test", 300, false);
