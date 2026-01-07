@@ -1,6 +1,5 @@
 fn main() {
     if cfg!(target_os = "macos") {
-        // Compile the Objective-C wrapper
         cc::Build::new()
             .file("src/virtual_display.mm")
             .cpp(true)
@@ -14,5 +13,6 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
 
         println!("cargo:rerun-if-changed=src/virtual_display.mm");
+        println!("cargo:rustc-link-lib=static=vdisplay");
     }
 }

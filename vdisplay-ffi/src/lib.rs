@@ -1,5 +1,4 @@
 #![allow(unexpected_cfgs)]
-
 use objc::{
     msg_send,
     runtime::{BOOL, Class, NO, Object, YES},
@@ -7,13 +6,31 @@ use objc::{
 };
 use std::ffi::{CString, c_char};
 
+#[repr(C)]
+#[derive(Debug)]
+pub struct DisplayObject {
+    pub display_id: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "vdisplay")]
+#[allow(dead_code)]
+unsafe extern "C" {
+    fn load();
+}
+
+#[cfg(target_os = "macos")]
 pub struct VDisplay {
     obj: *mut Object,
 }
 
+#[cfg(target_os = "macos")]
 impl VDisplay {
     pub fn new() -> Self {
         unsafe {
+            load();
             let cls = Class::get("VDisplayWrapper").expect("Class not found");
             let obj: *mut Object = msg_send![cls, alloc];
             let obj: *mut Object = msg_send![obj, init];
@@ -74,90 +91,33 @@ impl VDisplay {
     }
 }
 
-/*
-class VDisplay {
-public:
-  DisplayObject CreateVirtualDisplay(u32 width, u32 height, double refreshRate, bool hiDPI, char *displayNameStr, i32 ppi, bool useMirror);
-  DisplayObject CloneVirtualDisplay(char *displayNameStr, bool useMirror);
-  bool DestroyVirtualDisplay();
+#[cfg(not(target_os = "macos"))]
+pub struct VDisplay {}
 
-private:
-  CGVirtualDisplay *_display;
-  CGVirtualDisplayDescriptor *_descriptor;
-  CGVirtualDisplaySettings *_settings;
+#[cfg(not(target_os = "macos"))]
+impl VDisplay {
+    pub fn new() -> Self {
+        panic!("VDisplay is only availbale on macos");
+    }
 
-  void InitializeDescriptor(NSString *displayName, u32 width, u32 height, i32 ppi);
-  void InitializeSettings(u32 width, u32 height, CGFloat refreshRate, bool hiDPI);
-  DisplayObject CreateDisplayObject(unsigned int width, unsigned int height);
-  DisplayObject NullDisplayObject();
-*/
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct DisplayObject {
-    pub display_id: u32,
-    pub width: u32,
-    pub height: u32,
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "vdisplay")]
-unsafe extern "C" {
-    fn VDisplay_Init();
-    fn VDisplay_CreateVirtualDisplay(
+    pub fn create_virtual_display(
+        &mut self,
         width: u32,
         height: u32,
         refresh_rate: f64,
         hi_dpi: bool,
-        display_name_str: *const std::os::raw::c_char,
+        display_name: &str,
         ppi: i32,
         use_mirror: bool,
-    ) -> DisplayObject;
-    fn VDisplay_CloneVirtualDisplay(
-        display_name_str: *const std::os::raw::c_char,
-        use_mirror: bool,
-    ) -> DisplayObject;
-    fn VDisplay_DestroyVirtualDisplay() -> bool;
-    fn VDisplay_Cleanup();
-}
-
-pub fn init_virtual_display() {
-    unsafe { VDisplay_Init() }
-}
-
-pub fn init_virtual_cleanup() {
-    unsafe { VDisplay_Cleanup() }
-}
-
-pub fn create_virtual_display(
-    width: u32,
-    height: u32,
-    refresh_rate: f64,
-    hi_dpi: bool,
-    display_name: &str,
-    ppi: i32,
-    use_mirror: bool,
-) -> DisplayObject {
-    let c_name = CString::new(display_name).expect("CString creation failed");
-
-    unsafe {
-        VDisplay_CreateVirtualDisplay(
-            width,
-            height,
-            refresh_rate,
-            hi_dpi,
-            c_name.as_ptr(),
-            ppi,
-            use_mirror,
-        )
+    ) -> DisplayObject {
+        panic!("VDisplay is only availbale on macos");
     }
-}
 
-pub fn clone_virtual_display(display_name: &str, use_mirror: bool) -> DisplayObject {
-    let c_name = CString::new(display_name).expect("CString creation failed");
-    unsafe { VDisplay_CloneVirtualDisplay(c_name.as_ptr(), use_mirror) }
-}
+    pub fn clone_virtual_display(&mut self, display_name: &str, use_mirror: bool) -> DisplayObject {
+        panic!("VDisplay is only availbale on macos");
+    }
 
-pub fn destroy_virtual_display() -> bool {
-    unsafe { VDisplay_DestroyVirtualDisplay() }
+    pub fn destroy_virtual_display(&mut self) -> bool {
+        panic!("VDisplay is only availbale on macos");
+    }
 }

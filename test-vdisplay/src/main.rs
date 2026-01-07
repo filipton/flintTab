@@ -57,22 +57,10 @@ impl SCStreamOutput for FrameHandler {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut vd = vdisplay_ffi::VDisplay::new();
-    let res = vd.create_virtual_display(1920, 1080, 60.0, true, "test", 300, false);
-    let res2 = vd.clone_virtual_display("test2", false);
-    println!("{res:?} {res2:?}");
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    let r = vd.destroy_virtual_display();
-    println!("{r:?}");
-    tokio::time::sleep(Duration::from_secs(10)).await;
-    return Ok(());
+    let mut vd_manager = vdisplay_ffi::VDisplay::new();
+    let vd = vd_manager.create_virtual_display(1920, 1080, 60.0, true, "Test", 300, false);
+    println!("{vd:?}");
 
-    /*
-        vdisplay_ffi::init_virtual_display();
-        let vd = vdisplay_ffi::create_virtual_display(1920, 1080, 60.0, true, "Test", 300, false);
-        println!("{vd:?}");
-
-    */
     let content = SCShareableContent::get()?;
     let Some(display) = &content
         .displays()
@@ -154,25 +142,7 @@ async fn main() -> Result<()> {
     stream.stop_capture()?;
 
     _ = ffmpeg.kill();
-    let r = vdisplay_ffi::destroy_virtual_display();
+    let r = vd_manager.destroy_virtual_display();
     println!("r {r}");
-    vdisplay_ffi::init_virtual_cleanup();
-    Ok(())
-}
-
-pub fn save_webp(
-    path: &Path,
-    rgba_data: &[u8],
-    width: u32,
-    height: u32,
-    quality: f32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    assert_eq!(rgba_data.len(), (width * height * 4) as usize);
-
-    let encoder = webp::Encoder::from_rgba(rgba_data, width, height);
-    let webp_data = encoder.encode(quality);
-
-    std::fs::write(path, &*webp_data)?;
-
     Ok(())
 }

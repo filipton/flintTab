@@ -1,6 +1,26 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
 
+struct DisplayObject {
+  uint32_t displayId;
+  unsigned int width;
+  unsigned int height;
+};
+
+@interface VDisplayWrapper : NSObject
+- (instancetype)init;
+- (DisplayObject)createVirtualDisplay:(unsigned int)width
+                               height:(unsigned int)height
+                          refreshRate:(double)refreshRate
+                                hiDPI:(BOOL)hiDPI
+                          displayName:(const char *)displayNameStr
+                                  ppi:(int)ppi
+                            useMirror:(BOOL)useMirror;
+- (DisplayObject)cloneVirtualDisplay:(const char *)displayNameStr
+                           useMirror:(BOOL)useMirror;
+- (BOOL)destroyVirtualDisplay;
+@end
+
 @class CGVirtualDisplayDescriptor;
 @interface CGVirtualDisplayMode : NSObject
 @property(readonly, nonatomic) CGFloat refreshRate;
@@ -36,12 +56,6 @@
 - (nullable dispatch_queue_t)dispatchQueue;
 - (void)setDispatchQueue:(dispatch_queue_t)arg1;
 @end
-
-struct DisplayObject {
-  uint32_t displayId;
-  unsigned int width;
-  unsigned int height;
-};
 
 class VDisplay {
 public:
@@ -340,53 +354,11 @@ bool VDisplay::DestroyVirtualDisplay() {
   }
 }
 
-extern "C" {
-// Global instance or pass pointer
-static VDisplay *g_display = nullptr;
-
-void VDisplay_Init() { g_display = new VDisplay(); }
-
-DisplayObject VDisplay_CreateVirtualDisplay(unsigned int width,
-                                            unsigned int height,
-                                            double refreshRate, bool hiDPI,
-                                            char *displayNameStr, int ppi,
-                                            bool useMirror) {
-  return g_display->CreateVirtualDisplay(width, height, refreshRate, hiDPI,
-                                         displayNameStr, ppi, useMirror);
-}
-
-DisplayObject VDisplay_CloneVirtualDisplay(char *displayNameStr,
-                                           bool useMirror) {
-  return g_display->CloneVirtualDisplay(displayNameStr, useMirror);
-}
-
-bool VDisplay_DestroyVirtualDisplay() {
-  return g_display->DestroyVirtualDisplay();
-}
-
-void VDisplay_Cleanup() {
-  delete g_display;
-  g_display = nullptr;
-}
-}
-
-@interface VDisplayWrapper : NSObject
-- (instancetype)init;
-- (DisplayObject)createVirtualDisplayWithWidth:(unsigned int)width
-                                        height:(unsigned int)height
-                                   refreshRate:(double)refreshRate
-                                         hiDPI:(BOOL)hiDPI
-                                   displayName:(const char *)displayNameStr
-                                           ppi:(int)ppi
-                                     useMirror:(BOOL)useMirror;
-- (DisplayObject)cloneVirtualDisplayWithName:(const char *)displayNameStr
-                                   useMirror:(BOOL)useMirror;
-- (BOOL)destroyVirtualDisplay;
-+ (BOOL)checkAvailability;
-@end
-
 @implementation VDisplayWrapper {
   VDisplay *_cppDisplay;
+}
+
++ (void)load {
 }
 
 - (instancetype)init {
@@ -428,7 +400,7 @@ void VDisplay_Cleanup() {
   }
 }
 - (DisplayObject)cloneVirtualDisplay:(const char *)displayNameStr
-                                   useMirror:(BOOL)useMirror {
+                           useMirror:(BOOL)useMirror {
   if (!_cppDisplay) {
     DisplayObject null_obj = {0, 0, 0};
     return null_obj;
@@ -447,3 +419,7 @@ void VDisplay_Cleanup() {
 }
 
 @end
+
+extern "C" {
+void load() {}
+}
