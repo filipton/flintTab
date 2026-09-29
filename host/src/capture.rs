@@ -1,24 +1,22 @@
-//! ScreenCaptureKit capture of one display (NV12 video) plus system audio (i16 PCM).
+//! ScreenCaptureKit capture of one display (NV12 IOSurface buffers) plus system audio (i16 PCM).
 
 use anyhow::{Result, bail};
 use screencapturekit::{
     CMSampleBuffer, CMTime,
-    cv::CVPixelBufferLockFlags,
     prelude::{
         PixelFormat, SCContentFilter, SCShareableContent, SCStreamConfiguration, SCStreamOutputType,
     },
     stream::{SCStream, SCStreamOutput},
 };
-use std::{sync::Mutex, thread, time::Duration};
+use std::{ffi::c_void, sync::Mutex, thread, time::Duration};
 
 use crate::protocol::{AUDIO_CHANNELS, AUDIO_RATE};
 
-type VideoSink = Box<dyn FnMut(&[u8]) + Send>;
+type VideoSink = Box<dyn FnMut(*mut c_void) + Send>;
 type AudioSink = Box<dyn FnMut(&[u8]) + Send>;
 
 struct VideoHandler {
     sink: Mutex<VideoSink>,
-    packed: Mutex<Vec<u8>>,
 }
 
 struct AudioHandler {
@@ -29,32 +27,8 @@ impl SCStreamOutput for VideoHandler {
     fn did_output_sample_buffer(&self, sample: CMSampleBuffer, _t: SCStreamOutputType) {
         // Status-only samples (idle/blank frames) carry no image.
         let Some(pixel_buffer) = sample.image_buffer() else { return };
-        let Ok(guard) = pixel_buffer.lock(CVPixelBufferLockFlags::READ_ONLY) else { return };
-        if guard.plane_count() != 2 {
-            return;
-        }
-
-        // Copy plane by plane, dropping any row padding, so ffmpeg sees tight NV12.
-        let mut packed = self.packed.lock().unwrap();
-        packed.clear();
-        for plane in 0..2 {
-            let (Some(data), w, h, stride) = (
-                guard.plane_data(plane),
-                guard.width_of_plane(plane) * if plane == 0 { 1 } else { 2 },
-                guard.height_of_plane(plane),
-                guard.bytes_per_row_of_plane(plane),
-            ) else {
-                return;
-            };
-            if stride == w {
-                packed.extend_from_slice(&data[..w * h]);
-            } else {
-                for row in data.chunks(stride).take(h) {
-                    packed.extend_from_slice(&row[..w]);
-                }
-            }
-        }
-        (self.sink.lock().unwrap())(&packed);
+        // Zero-copy: the IOSurface-backed NV12 buffer goes straight to the encoder.
+        (self.sink.lock().unwrap())(pixel_buffer.as_ptr());
     }
 }
 
@@ -109,7 +83,7 @@ impl Capture {
         width: u32,
         height: u32,
         fps: u32,
-        video: impl FnMut(&[u8]) + Send + 'static,
+        video: impl FnMut(*mut c_void) + Send + 'static,
         audio: impl FnMut(&[u8]) + Send + 'static,
     ) -> Result<Self> {
         // The virtual display needs a moment before ScreenCaptureKit lists it.
@@ -146,7 +120,7 @@ impl Capture {
 
         let mut stream = SCStream::new(&filter, &config);
         stream.add_output_handler(
-            VideoHandler { sink: Mutex::new(Box::new(video)), packed: Mutex::new(Vec::new()) },
+            VideoHandler { sink: Mutex::new(Box::new(video)) },
             SCStreamOutputType::Screen,
         );
         stream.add_output_handler(

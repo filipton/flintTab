@@ -1,14 +1,14 @@
 # TabDisplay – Android tablet as a USB secondary display for macOS
 
 ```
-macOS: virtual display -> ScreenCaptureKit (NV12 + system audio)
-       -> ffmpeg h264_videotoolbox (low latency) -> TCP 127.0.0.1:27183
+macOS: virtual display -> ScreenCaptureKit (NV12 IOSurface + system audio)
+       -> VideoToolbox H.264 in-process (zero-copy, low-latency rate control) -> TCP 127.0.0.1:27183
                  |  adb reverse (USB)
 Android app: MediaCodec low-latency decode -> SurfaceView, PCM -> AudioTrack (low-latency)
 ```
 
 ## Requirements
-- Mac: Rust, `brew install ffmpeg android-platform-tools`, Screen Recording permission for your terminal
+- Mac: Rust, `brew install android-platform-tools`, Screen Recording permission for your terminal
 - Tablet: USB debugging on, authorize the Mac, Android 11+ (minSdk 30)
 
 ## Build & install the tablet app

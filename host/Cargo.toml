@@ -11,4 +11,5 @@ libc = "0.2"
 vdisplay-ffi = { path = "../vdisplay-ffi" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
 screencapturekit = { version = "1.5.0", features = ["macos_26_0"] }

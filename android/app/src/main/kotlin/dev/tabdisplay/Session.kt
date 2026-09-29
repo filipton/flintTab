@@ -4,6 +4,8 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.view.Surface
 import java.io.DataInputStream
@@ -135,9 +137,21 @@ class Session(
     }
 }
 
+private fun createLowLatencyDecoder(): MediaCodec {
+    // Prefer a hardware decoder that advertises low-latency support.
+    val info = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull { c ->
+        !c.isEncoder && !c.isSoftwareOnly &&
+            c.supportedTypes.contains(MediaFormat.MIMETYPE_VIDEO_AVC) &&
+            c.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+    }
+    return if (info != null) MediaCodec.createByCodecName(info.name)
+    else MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+}
+
 /** H.264 decoder configured for minimum latency, rendering straight to the surface. */
 private class Decoder(surface: Surface, width: Int, height: Int, fps: Int) {
-    private val codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+    private val codec = createLowLatencyDecoder()
     @Volatile private var open = true
     private val drain: Thread
 

@@ -4,11 +4,11 @@
 //! connects and reports its screen size, we create a virtual display of that size,
 //! capture it, encode it to H.264 and stream it back over the same socket.
 
-mod annexb;
 #[cfg(target_os = "macos")]
 mod capture;
-mod encoder;
 mod protocol;
+#[cfg(target_os = "macos")]
+mod vt;
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -169,22 +169,20 @@ fn run_session(
 
     let started = Instant::now();
     let tx_video = tx.clone();
-    let mut encoder = encoder::Encoder::spawn(w, h, fps, args.bitrate, move |au| {
-        let pts = started.elapsed().as_micros() as u64;
-        tx_video.send(protocol::video_msg(pts, &au)).ok();
+    let encoder = vt::VtEncoder::new(w, h, fps, args.bitrate, move |au, _| {
+        tx_video.send(protocol::video_msg(started.elapsed().as_micros() as u64, &au)).ok();
     })?;
-    let mut ffmpeg_in = encoder.stdin.take().unwrap();
 
-    let alive_v = alive.clone();
     let tx_audio = tx.clone();
     let capture = capture::Capture::start(
         disp.display_id,
         w,
         h,
         fps,
-        move |frame| {
-            if ffmpeg_in.write_all(frame).is_err() {
-                alive_v.store(false, Ordering::Relaxed);
+        move |pixel_buffer| {
+            let pts = started.elapsed().as_micros() as u64;
+            if !encoder.encode(pixel_buffer, pts) {
+                // dropped frame; the next one will do
             }
         },
         move |pcm| {
@@ -207,7 +205,6 @@ fn run_session(
     }
 
     drop(capture);
-    drop(encoder);
     let _ = sock.shutdown(Shutdown::Both);
     vd.destroy_virtual_display();
     println!("session ended");
