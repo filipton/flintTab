@@ -1,2 +1,7 @@
 target
 *.o
+.gradle
+build
+local.properties
+*.apk
+.idea
