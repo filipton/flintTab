@@ -39,6 +39,7 @@ unsafe extern "C" {
     static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFStringRef;
     static kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: CFStringRef;
     static kVTCompressionPropertyKey_RealTime: CFStringRef;
+    static kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality: CFStringRef;
     static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;
     static kVTCompressionPropertyKey_AllowFrameReordering: CFStringRef;
     static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
@@ -176,6 +177,8 @@ impl VtEncoder {
         };
         unsafe {
             set(kVTCompressionPropertyKey_RealTime, &t.as_CFType());
+            // Apple's recommended setup for cloud gaming / conferencing in VTCompressionProperties.h
+            set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, &t.as_CFType());
             set(
                 kVTCompressionPropertyKey_ProfileLevel,
                 &CFString::wrap_under_get_rule(kVTProfileLevel_H264_ConstrainedHigh_AutoLevel).as_CFType(),

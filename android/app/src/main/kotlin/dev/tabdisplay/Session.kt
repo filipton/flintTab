@@ -7,6 +7,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Build
 import android.os.Process
 import android.view.Surface
 import java.io.DataInputStream
@@ -110,8 +111,8 @@ class Session(
                         audio?.close()
                         config = intArrayOf(w, h, fps)
                         // Let the display switch to a refresh rate that fits the stream.
-                        try { surface.setFrameRate(fps.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE) } catch (_: Exception) {}
-                        decoder = Decoder(surface, w, h, fps)
+                        setStreamFrameRate(surface, fps)
+                        decoder = Decoder(surface, w, h)
                         needKeyframe = false
                         audio = AudioPlayer(rate, ch).also { it.setEnabled(audioWanted) }
                         // host starts with audio off; tell it what the switch currently says
@@ -132,7 +133,7 @@ class Session(
                                 // a keyframe instead of tearing the whole connection down.
                                 d.close()
                                 val c = config!!
-                                decoder = Decoder(surface, c[0], c[1], c[2])
+                                decoder = Decoder(surface, c[0], c[1])
                                 needKeyframe = true
                                 sendControl(KIND_IDR, 0)
                             }
@@ -168,6 +169,18 @@ class Session(
     }
 }
 
+/** Tells the display which rate the stream runs at, so it can switch to a matching refresh rate. */
+private fun setStreamFrameRate(surface: Surface, fps: Int) {
+    try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            surface.setFrameRate(fps.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                Surface.CHANGE_FRAME_RATE_ALWAYS)
+        } else {
+            surface.setFrameRate(fps.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+        }
+    } catch (_: Exception) {}
+}
+
 /** True if the Annex-B access unit holds an IDR slice or an SPS (a point a decoder can start at). */
 private fun isKeyframe(au: ByteArray, size: Int): Boolean {
     var i = 0
@@ -197,21 +210,53 @@ fun maxDecodableFps(width: Int, height: Int, refreshHz: Int): Int {
     return 60
 }
 
-private fun createLowLatencyDecoder(): MediaCodec {
-    // Prefer a hardware decoder that advertises low-latency support.
-    val info = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull { c ->
-        !c.isEncoder && !c.isSoftwareOnly &&
-            c.supportedTypes.contains(MediaFormat.MIMETYPE_VIDEO_AVC) &&
-            c.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
-                .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+private fun pickDecoder(): MediaCodecInfo? {
+    val avc = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter {
+        !it.isEncoder && !it.isSoftwareOnly && it.supportedTypes.contains(MediaFormat.MIMETYPE_VIDEO_AVC)
     }
-    return if (info != null) MediaCodec.createByCodecName(info.name)
-    else MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+    // Prefer a hardware decoder that advertises low-latency support.
+    return avc.firstOrNull {
+        it.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+    } ?: avc.firstOrNull()
+}
+
+/**
+ * Low-latency MediaFormat options, most aggressive first; the first set the codec accepts is
+ * used. Keys and fallbacks follow Moonlight's MediaCodecHelper.setDecoderLowLatencyOptions.
+ */
+private fun lowLatencyOptions(info: MediaCodecInfo?): List<Map<String, Int>> {
+    val name = info?.name?.lowercase() ?: ""
+    if (info != null && info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)) {
+        return listOf(mapOf(MediaFormat.KEY_LOW_LATENCY to 1), emptyMap())
+    }
+    val qcom = name.startsWith("omx.qcom") || name.startsWith("c2.qti")
+    val vendor = when {
+        qcom -> mapOf(
+            "vendor.qti-ext-dec-picture-order.enable" to 1,
+            "vendor.qti-ext-dec-low-latency.enable" to 1,
+        )
+        name.contains("exynos") -> mapOf("vendor.rtc-ext-dec-low-latency.enable" to 1)
+        name.contains("hisi") -> mapOf(
+            "vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req" to 1,
+            "vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-rdy" to -1,
+        )
+        name.contains("amlogic") -> mapOf("vendor.low-latency.enable" to 1)
+        else -> emptyMap()
+    }
+    // MediaTek and Amlogic read this from their modified ACodec.
+    val mtk = if (name.contains("mtk") || name.contains("amlogic")) mapOf("vdec-lowlatency" to 1) else emptyMap()
+    // Qualcomm: run the decoder at full clocks. Others: real-time priority.
+    val clocks = if (qcom) mapOf(MediaFormat.KEY_OPERATING_RATE to Short.MAX_VALUE.toInt())
+    else mapOf(MediaFormat.KEY_PRIORITY to 0)
+    val base = mapOf(MediaFormat.KEY_LOW_LATENCY to 1) + clocks
+    return listOf(base + vendor + mtk, base + vendor, base, emptyMap())
 }
 
 /** H.264 decoder configured for minimum latency, rendering straight to the surface. */
-private class Decoder(surface: Surface, width: Int, height: Int, fps: Int) {
-    private val codec = createLowLatencyDecoder()
+private class Decoder(surface: Surface, width: Int, height: Int) {
+    private val codec: MediaCodec
     @Volatile private var open = true
     /** Set when the codec threw on the output side; the owner then rebuilds it. */
     @Volatile var failed = false
@@ -219,31 +264,44 @@ private class Decoder(surface: Surface, width: Int, height: Int, fps: Int) {
     private val drain: Thread
 
     init {
-        val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
-        fmt.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-        fmt.setInteger(MediaFormat.KEY_PRIORITY, 0) // real-time
-        fmt.setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
-        // Vendor hints (ignored where unsupported)
-        fmt.setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
-        fmt.setInteger("vendor.rtc-ext-dec-low-latency.enable", 1)
-        codec.configure(fmt, surface, null, 0)
+        val info = pickDecoder()
+        codec = if (info != null) MediaCodec.createByCodecName(info.name)
+        else MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        var configured = false
+        for (opts in lowLatencyOptions(info)) {
+            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
+            for ((k, v) in opts) fmt.setInteger(k, v)
+            try {
+                codec.configure(fmt, surface, null, 0)
+                configured = true
+                break
+            } catch (_: Exception) {
+                codec.reset()
+            }
+        }
+        if (!configured) {
+            codec.release()
+            throw IllegalStateException("no H.264 decoder configuration accepted")
+        }
         codec.start()
 
         drain = thread(name = "decoder-out", isDaemon = true) {
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
-            val info = MediaCodec.BufferInfo()
+            val bi = MediaCodec.BufferInfo()
             while (open) {
                 try {
-                    var idx = codec.dequeueOutputBuffer(info, 10_000)
+                    var idx = codec.dequeueOutputBuffer(bi, 10_000)
                     if (idx < 0) continue
                     // If newer frames are already waiting, skip the older ones.
                     while (true) {
-                        val next = codec.dequeueOutputBuffer(info, 0)
+                        val next = codec.dequeueOutputBuffer(bi, 0)
                         if (next < 0) break
                         codec.releaseOutputBuffer(idx, false)
                         idx = next
                     }
-                    codec.releaseOutputBuffer(idx, true)
+                    // Show at the next vsync; if a newer frame targets the same vsync, the
+                    // compositor drops this one (Moonlight's min-latency mode).
+                    codec.releaseOutputBuffer(idx, System.nanoTime())
                 } catch (_: Exception) {
                     if (open) failed = true
                     return@thread
