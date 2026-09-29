@@ -7,6 +7,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Process
 import android.view.Surface
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -33,7 +34,10 @@ class Session(
     @Volatile private var audioWanted = false
     @Volatile private var audio: AudioPlayer? = null
 
-    private val worker = thread(name = "session", isDaemon = true) { loop() }
+    private val worker = thread(name = "session", isDaemon = true) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
+        loop()
+    }
 
     fun setAudio(enabled: Boolean) {
         audioWanted = enabled
@@ -89,6 +93,7 @@ class Session(
         }
 
         var decoder: Decoder? = null
+        var frameBuf = ByteArray(1 shl 20) // reused: no per-frame allocation/GC
         try {
             while (running) {
                 val kind = input.readUnsignedByte()
@@ -107,9 +112,10 @@ class Session(
                     }
                     MSG_VIDEO -> {
                         input.readLong() // pts, unused: frames are shown as soon as decoded
-                        val data = ByteArray(len - 8)
-                        input.readFully(data)
-                        decoder?.feed(data)
+                        val n = len - 8
+                        if (n > frameBuf.size) frameBuf = ByteArray(n * 2)
+                        input.readFully(frameBuf, 0, n)
+                        decoder?.feed(frameBuf, n)
                     }
                     MSG_AUDIO -> {
                         val data = ByteArray(len)
@@ -167,6 +173,7 @@ private class Decoder(surface: Surface, width: Int, height: Int, fps: Int) {
         codec.start()
 
         drain = thread(name = "decoder-out", isDaemon = true) {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
             val info = MediaCodec.BufferInfo()
             while (open) {
                 try {
@@ -187,15 +194,15 @@ private class Decoder(surface: Surface, width: Int, height: Int, fps: Int) {
         }
     }
 
-    fun feed(au: ByteArray) {
-        var pts = System.nanoTime() / 1000
+    fun feed(au: ByteArray, size: Int) {
+        val pts = System.nanoTime() / 1000
         while (open) {
             val i = codec.dequeueInputBuffer(10_000)
             if (i < 0) continue
             val buf = codec.getInputBuffer(i)!!
             buf.clear()
-            buf.put(au)
-            codec.queueInputBuffer(i, 0, au.size, pts, 0)
+            buf.put(au, 0, size)
+            codec.queueInputBuffer(i, 0, size, pts, 0)
             return
         }
     }
@@ -240,6 +247,7 @@ private class AudioPlayer(rate: Int, channels: Int) {
             .build()
 
         worker = thread(name = "audio-out", isDaemon = true) {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             while (open) {
                 val pcm = queue.poll(50, TimeUnit.MILLISECONDS) ?: continue
                 synchronized(this) { queuedBytes -= pcm.size }

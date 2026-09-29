@@ -18,7 +18,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -135,15 +135,28 @@ fn run_session(
     let alive = Arc::new(AtomicBool::new(true));
     let audio_on = Arc::new(AtomicBool::new(false)); // audio is off until the tablet asks
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    // Video frames queued for the socket. If the link stalls we drop frames *before*
+    // the encoder (safe for P-frames) instead of letting latency pile up in a queue.
+    let pending_video = Arc::new(AtomicUsize::new(0));
     tx.send(protocol::config_msg(w, h, fps)).ok();
 
     // writer: the only thread that writes to the socket
     {
         let mut out = sock.try_clone()?;
         let alive = alive.clone();
+        let pending_video = pending_video.clone();
         thread::spawn(move || {
+            #[cfg(target_os = "macos")]
+            unsafe {
+                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+            }
             for msg in rx {
-                if out.write_all(&msg).is_err() {
+                let is_video = msg[0] == protocol::MSG_VIDEO;
+                let ok = out.write_all(&msg).is_ok();
+                if is_video {
+                    pending_video.fetch_sub(1, Ordering::Relaxed);
+                }
+                if !ok {
                     break;
                 }
             }
@@ -169,7 +182,9 @@ fn run_session(
 
     let started = Instant::now();
     let tx_video = tx.clone();
+    let pending_enc = pending_video.clone();
     let encoder = vt::VtEncoder::new(w, h, fps, args.bitrate, move |au, _| {
+        pending_enc.fetch_add(1, Ordering::Relaxed);
         tx_video.send(protocol::video_msg(started.elapsed().as_micros() as u64, &au)).ok();
     })?;
 
@@ -180,10 +195,10 @@ fn run_session(
         h,
         fps,
         move |pixel_buffer| {
-            let pts = started.elapsed().as_micros() as u64;
-            if !encoder.encode(pixel_buffer, pts) {
-                // dropped frame; the next one will do
+            if pending_video.load(Ordering::Relaxed) >= 2 {
+                return; // link is behind: skip this capture, keep latency low
             }
+            encoder.encode(pixel_buffer, started.elapsed().as_micros() as u64);
         },
         move |pcm| {
             if audio_on.load(Ordering::Relaxed) {
