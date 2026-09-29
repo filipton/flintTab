@@ -46,7 +46,11 @@ unsafe extern "C" {
     static kVTCompressionPropertyKey_MaxKeyFrameInterval: CFStringRef;
     static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
     static kVTCompressionPropertyKey_MaxFrameDelayCount: CFStringRef;
+    static kVTCompressionPropertyKey_ColorPrimaries: CFStringRef;
+    static kVTCompressionPropertyKey_TransferFunction: CFStringRef;
+    static kVTCompressionPropertyKey_YCbCrMatrix: CFStringRef;
     static kVTProfileLevel_H264_ConstrainedHigh_AutoLevel: CFStringRef;
+    static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
 
     fn VTCompressionSessionCreate(
         allocator: *const c_void,
@@ -73,6 +77,13 @@ unsafe extern "C" {
     ) -> OSStatus;
     fn VTCompressionSessionCompleteFrames(session: Session, until: CMTime) -> OSStatus;
     fn VTCompressionSessionInvalidate(session: Session);
+}
+
+#[link(name = "CoreVideo", kind = "framework")]
+unsafe extern "C" {
+    static kCVImageBufferColorPrimaries_ITU_R_709_2: CFStringRef;
+    static kCVImageBufferTransferFunction_ITU_R_709_2: CFStringRef;
+    static kCVImageBufferYCbCrMatrix_ITU_R_709_2: CFStringRef;
 }
 
 #[link(name = "CoreMedia", kind = "framework")]
@@ -107,6 +118,7 @@ type Sink = Box<dyn FnMut(Vec<u8>, u64) + Send>;
 pub struct VtEncoder {
     session: Session,
     sink: *mut Sink,
+    force_key: CFDictionary<CFString, CFType>,
 }
 
 // The VT session is thread-safe; `sink` is only touched by VT's callback and by Drop
@@ -179,14 +191,22 @@ impl VtEncoder {
             // a long GOP avoids periodic bitrate spikes.
             set(kVTCompressionPropertyKey_MaxKeyFrameInterval, &CFNumber::from(fps as i32 * 20).as_CFType());
             set(kVTCompressionPropertyKey_MaxFrameDelayCount, &CFNumber::from(0i32).as_CFType());
+            // Tag the stream as BT.709 (what ScreenCaptureKit produces) so the SPS carries
+            // colour info and the tablet does not guess BT.601 and shift the colours.
+            set(kVTCompressionPropertyKey_ColorPrimaries, &cf_key(kCVImageBufferColorPrimaries_ITU_R_709_2).as_CFType());
+            set(kVTCompressionPropertyKey_TransferFunction, &cf_key(kCVImageBufferTransferFunction_ITU_R_709_2).as_CFType());
+            set(kVTCompressionPropertyKey_YCbCrMatrix, &cf_key(kCVImageBufferYCbCrMatrix_ITU_R_709_2).as_CFType());
             VTCompressionSessionPrepareToEncodeFrames(session);
         }
-        Ok(Self { session, sink })
+        let force_key = unsafe {
+            CFDictionary::from_CFType_pairs(&[(cf_key(kVTEncodeFrameOptionKey_ForceKeyFrame), t.as_CFType())])
+        };
+        Ok(Self { session, sink, force_key })
     }
 
     /// Encodes one IOSurface-backed CVPixelBuffer and blocks until its access unit was
-    /// delivered to the sink.
-    pub fn encode(&self, pixel_buffer: *mut c_void, pts_us: u64) -> bool {
+    /// delivered to the sink (the encoder may also drop it to hold the bitrate).
+    pub fn encode(&self, pixel_buffer: *mut c_void, pts_us: u64, keyframe: bool) -> bool {
         let pts = CMTime { value: pts_us as i64, timescale: 1_000_000, flags: TIME_VALID, epoch: 0 };
         unsafe {
             let st = VTCompressionSessionEncodeFrame(
@@ -194,7 +214,7 @@ impl VtEncoder {
                 pixel_buffer,
                 pts,
                 TIME_INVALID,
-                ptr::null(),
+                if keyframe { self.force_key.as_concrete_TypeRef() as *const c_void } else { ptr::null() },
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
@@ -239,8 +259,12 @@ extern "C" fn output_callback(refcon: *mut c_void, _frame: *mut c_void, status: 
                 let mut p: *const u8 = ptr::null();
                 let mut n = 0usize;
                 if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, i, &mut p, &mut n, ptr::null_mut(), ptr::null_mut()) == 0 {
+                    let ps = std::slice::from_raw_parts(p, n);
                     out.extend_from_slice(&[0, 0, 0, 1]);
-                    out.extend_from_slice(std::slice::from_raw_parts(p, n));
+                    match crate::sps::add_low_latency_vui(ps) {
+                        Some(sps) => out.extend_from_slice(&sps),
+                        None => out.extend_from_slice(ps), // PPS, or an SPS we could not parse
+                    }
                 }
             }
         }

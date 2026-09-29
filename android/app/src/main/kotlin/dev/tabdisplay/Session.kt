@@ -25,6 +25,7 @@ class Session(
     private val port: Int,
     private val screenW: Int,
     private val screenH: Int,
+    private val maxFps: Int,
     private val surfaceProvider: () -> Surface?,
     private val onState: (connected: Boolean) -> Unit,
 ) {
@@ -89,10 +90,13 @@ class Session(
             output.writeByte(VERSION)
             output.writeInt(screenW)
             output.writeInt(screenH)
+            output.writeInt(maxFps)
             output.flush()
         }
 
         var decoder: Decoder? = null
+        var config: IntArray? = null // w, h, fps
+        var needKeyframe = false
         var frameBuf = ByteArray(1 shl 20) // reused: no per-frame allocation/GC
         try {
             while (running) {
@@ -104,7 +108,11 @@ class Session(
                         val rate = input.readInt(); val ch = input.readUnsignedByte()
                         decoder?.close()
                         audio?.close()
+                        config = intArrayOf(w, h, fps)
+                        // Let the display switch to a refresh rate that fits the stream.
+                        try { surface.setFrameRate(fps.toFloat(), Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE) } catch (_: Exception) {}
                         decoder = Decoder(surface, w, h, fps)
+                        needKeyframe = false
                         audio = AudioPlayer(rate, ch).also { it.setEnabled(audioWanted) }
                         // host starts with audio off; tell it what the switch currently says
                         sendControl(KIND_AUDIO, if (audioWanted) 1 else 0)
@@ -115,7 +123,22 @@ class Session(
                         val n = len - 8
                         if (n > frameBuf.size) frameBuf = ByteArray(n * 2)
                         input.readFully(frameBuf, 0, n)
-                        decoder?.feed(frameBuf, n)
+                        if (needKeyframe && isKeyframe(frameBuf, n)) needKeyframe = false
+                        val d = decoder
+                        if (d != null && !needKeyframe) {
+                            val ok = !d.failed && try { d.feed(frameBuf, n); true } catch (_: Exception) { false }
+                            if (!ok) {
+                                // Decoder died (e.g. a codec error): rebuild it and ask the host for
+                                // a keyframe instead of tearing the whole connection down.
+                                d.close()
+                                val c = config!!
+                                decoder = Decoder(surface, c[0], c[1], c[2])
+                                needKeyframe = true
+                                sendControl(KIND_IDR, 0)
+                            }
+                        }
+                        // Flow control: the host keeps at most a couple of frames unacknowledged.
+                        sendControl(KIND_ACK, 0)
                     }
                     MSG_AUDIO -> {
                         val data = ByteArray(len)
@@ -135,12 +158,43 @@ class Session(
     }
 
     companion object {
-        const val VERSION = 1
+        const val VERSION = 2
         const val MSG_CONFIG = 1
         const val MSG_VIDEO = 2
         const val MSG_AUDIO = 3
         const val KIND_AUDIO = 1
+        const val KIND_ACK = 2
+        const val KIND_IDR = 3
     }
+}
+
+/** True if the Annex-B access unit holds an IDR slice or an SPS (a point a decoder can start at). */
+private fun isKeyframe(au: ByteArray, size: Int): Boolean {
+    var i = 0
+    while (i + 3 < size) {
+        if (au[i].toInt() == 0 && au[i + 1].toInt() == 0 && au[i + 2].toInt() == 1) {
+            val type = au[i + 3].toInt() and 0x1f
+            if (type == 5 || type == 7) return true
+            i += 3
+        } else {
+            i++
+        }
+    }
+    return false
+}
+
+/**
+ * Highest frame rate up to [refreshHz] the H.264 decoder can handle at this size,
+ * so the host never sends more frames than the tablet can show or decode.
+ */
+fun maxDecodableFps(width: Int, height: Int, refreshHz: Int): Int {
+    val caps = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+        .filter { !it.isEncoder && it.supportedTypes.contains(MediaFormat.MIMETYPE_VIDEO_AVC) }
+        .map { it.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities }
+    for (fps in listOf(refreshHz, 120, 90, 60).filter { it <= refreshHz }.distinct()) {
+        if (caps.any { it.areSizeAndRateSupported(width, height, fps.toDouble()) }) return fps
+    }
+    return 60
 }
 
 private fun createLowLatencyDecoder(): MediaCodec {
@@ -159,6 +213,9 @@ private fun createLowLatencyDecoder(): MediaCodec {
 private class Decoder(surface: Surface, width: Int, height: Int, fps: Int) {
     private val codec = createLowLatencyDecoder()
     @Volatile private var open = true
+    /** Set when the codec threw on the output side; the owner then rebuilds it. */
+    @Volatile var failed = false
+        private set
     private val drain: Thread
 
     init {
@@ -188,6 +245,7 @@ private class Decoder(surface: Surface, width: Int, height: Int, fps: Int) {
                     }
                     codec.releaseOutputBuffer(idx, true)
                 } catch (_: Exception) {
+                    if (open) failed = true
                     return@thread
                 }
             }

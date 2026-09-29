@@ -2,17 +2,17 @@
 
 use anyhow::{Result, bail};
 use screencapturekit::{
-    CMSampleBuffer, CMTime,
+    CMSampleBuffer, CMTime, CVPixelBuffer,
     prelude::{
         PixelFormat, SCContentFilter, SCShareableContent, SCStreamConfiguration, SCStreamOutputType,
     },
     stream::{SCStream, SCStreamOutput},
 };
-use std::{ffi::c_void, sync::Mutex, thread, time::Duration};
+use std::{sync::Mutex, thread, time::Duration};
 
 use crate::protocol::{AUDIO_CHANNELS, AUDIO_RATE};
 
-type VideoSink = Box<dyn FnMut(*mut c_void) + Send>;
+type VideoSink = Box<dyn FnMut(CVPixelBuffer) + Send>;
 type AudioSink = Box<dyn FnMut(&[u8]) + Send>;
 
 struct VideoHandler {
@@ -27,8 +27,8 @@ impl SCStreamOutput for VideoHandler {
     fn did_output_sample_buffer(&self, sample: CMSampleBuffer, _t: SCStreamOutputType) {
         // Status-only samples (idle/blank frames) carry no image.
         let Some(pixel_buffer) = sample.image_buffer() else { return };
-        // Zero-copy: the IOSurface-backed NV12 buffer goes straight to the encoder.
-        (self.sink.lock().unwrap())(pixel_buffer.as_ptr());
+        // Zero-copy: the IOSurface-backed NV12 buffer (retained) goes straight to the encoder.
+        (self.sink.lock().unwrap())(pixel_buffer);
     }
 }
 
@@ -83,7 +83,7 @@ impl Capture {
         width: u32,
         height: u32,
         fps: u32,
-        video: impl FnMut(*mut c_void) + Send + 'static,
+        video: impl FnMut(CVPixelBuffer) + Send + 'static,
         audio: impl FnMut(&[u8]) + Send + 'static,
     ) -> Result<Self> {
         // The virtual display needs a moment before ScreenCaptureKit lists it.
@@ -111,7 +111,9 @@ impl Capture {
             .with_height(height)
             .with_pixel_format(PixelFormat::YCbCr_420v)
             .with_minimum_frame_interval(&CMTime::new(1, fps as i32))
-            .with_queue_depth(3)
+            // The encoder keeps the newest frame to re-encode it while the screen is idle,
+            // so leave ScreenCaptureKit enough surfaces not to stall on that one.
+            .with_queue_depth(5)
             .with_shows_cursor(true)
             .with_captures_audio(true)
             .with_sample_rate(AUDIO_RATE as i32)

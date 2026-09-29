@@ -13,6 +13,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.Switch
 import android.widget.TextView
+import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
     private lateinit var surfaceView: SurfaceView
@@ -21,10 +22,27 @@ class MainActivity : Activity() {
     private lateinit var audioSwitch: Switch
     private var session: Session? = null
     private val hidePanel = Runnable { panel.visibility = View.GONE }
+    private var refreshHz = 60
+
+    /**
+     * Asks for the highest refresh rate the panel offers at its current resolution.
+     * At 120 Hz a decoded frame waits at most ~8 ms for the next vsync instead of ~17 ms,
+     * and the Mac can stream at that rate too.
+     */
+    private fun pickFastestDisplayMode(): Int {
+        val d = display ?: return 60
+        val cur = d.mode
+        val best = d.supportedModes
+            .filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+            .maxByOrNull { it.refreshRate } ?: cur
+        window.attributes = window.attributes.also { it.preferredDisplayModeId = best.modeId }
+        return best.refreshRate.roundToInt()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        refreshHz = pickFastestDisplayMode()
 
         surfaceView = SurfaceView(this)
 
@@ -95,6 +113,7 @@ class MainActivity : Activity() {
             port = 27183,
             screenW = w,
             screenH = h,
+            maxFps = maxDecodableFps(w, h, refreshHz),
             surfaceProvider = { surfaceView.holder.surface },
             onState = { connected -> runOnUiThread { status.visibility = if (connected) View.GONE else View.VISIBLE } },
         ).also { it.setAudio(audioSwitch.isChecked) }

@@ -1,8 +1,12 @@
 //! Wire protocol between the host and the tablet app (all integers big-endian).
 //!
 //! Tablet -> host:
-//!   handshake: b"TDSP", u8 version, u32 width, u32 height   (screen size in px)
-//!   control:   u8 kind, u8 value                             (KIND_AUDIO: 0/1)
+//!   handshake: b"TDSP", u8 version, u32 width, u32 height, u32 max_fps
+//!              (screen size in px; max_fps = highest refresh rate the tablet can both
+//!              show and decode at that size)
+//!   control:   u8 kind, u8 value
+//!              KIND_AUDIO value 0/1, KIND_ACK (one video frame taken off the wire),
+//!              KIND_IDR (decoder was reset, send a keyframe)
 //! Host -> tablet, a stream of frames: u8 kind, u32 len, payload
 //!   MSG_CONFIG: u32 width, u32 height, u32 fps, u32 audio_rate, u8 audio_channels
 //!   MSG_VIDEO:  u64 pts_us, H.264 Annex-B access unit
@@ -11,13 +15,15 @@
 use std::io::{self, Read};
 
 pub const MAGIC: &[u8; 4] = b"TDSP";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 pub const MSG_CONFIG: u8 = 1;
 pub const MSG_VIDEO: u8 = 2;
 pub const MSG_AUDIO: u8 = 3;
 
 pub const KIND_AUDIO: u8 = 1;
+pub const KIND_ACK: u8 = 2;
+pub const KIND_IDR: u8 = 3;
 
 pub const AUDIO_RATE: u32 = 48_000;
 pub const AUDIO_CHANNELS: u8 = 2;
@@ -25,10 +31,11 @@ pub const AUDIO_CHANNELS: u8 = 2;
 pub struct Hello {
     pub width: u32,
     pub height: u32,
+    pub max_fps: u32,
 }
 
 pub fn read_hello(r: &mut impl Read) -> io::Result<Hello> {
-    let mut buf = [0u8; 13];
+    let mut buf = [0u8; 17];
     r.read_exact(&mut buf)?;
     if &buf[0..4] != MAGIC || buf[4] != VERSION {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad handshake"));
@@ -36,6 +43,7 @@ pub fn read_hello(r: &mut impl Read) -> io::Result<Hello> {
     Ok(Hello {
         width: u32::from_be_bytes(buf[5..9].try_into().unwrap()),
         height: u32::from_be_bytes(buf[9..13].try_into().unwrap()),
+        max_fps: u32::from_be_bytes(buf[13..17].try_into().unwrap()),
     })
 }
 
@@ -80,8 +88,9 @@ mod tests {
         b.push(VERSION);
         b.extend_from_slice(&2560u32.to_be_bytes());
         b.extend_from_slice(&1600u32.to_be_bytes());
+        b.extend_from_slice(&120u32.to_be_bytes());
         let h = read_hello(&mut &b[..]).unwrap();
-        assert_eq!((h.width, h.height), (2560, 1600));
+        assert_eq!((h.width, h.height, h.max_fps), (2560, 1600, 120));
     }
 
     #[test]
