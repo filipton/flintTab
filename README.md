@@ -22,7 +22,7 @@ The host installs the app over adb when the tablet is plugged in, updates it whe
 from the one the host has, and opens it. It uses, in order: `--apk PATH`, `tabdisplay.apk` next
 to the host or in the current folder, a local build in `android/app/build/outputs/apk/`, and
 otherwise the build GitHub Actions publishes for this protocol version (downloaded to the cache
-folder). `--no-install` turns this off.
+folder with curl, or with the GitHub CLI while the repository is private). `--no-install` turns this off.
 
 To build it yourself (needs JDK 17 and the Android SDK, e.g. from Android Studio):
 ```

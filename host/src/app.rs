@@ -9,11 +9,12 @@ use crate::protocol;
 
 const PACKAGE: &str = "dev.tabdisplay";
 const APK_NAME: &str = "tabdisplay.apk";
+const REPO: &str = "filipton/macos-usb-display";
 
 /// Published by .github/workflows/android.yml, one release per protocol version.
 fn release_url() -> String {
     format!(
-        "https://github.com/filipton/macos-usb-display/releases/download/apk-v{}/{APK_NAME}",
+        "https://github.com/{REPO}/releases/download/apk-v{}/{APK_NAME}",
         protocol::VERSION
     )
 }
@@ -41,7 +42,8 @@ pub fn find_apk(explicit: Option<&Path>) -> Option<PathBuf> {
     local.or_else(download)
 }
 
-/// Downloads the published APK with curl, only when the server has a newer one.
+/// Downloads the published APK: with curl when the repository is public (only when the
+/// server has a newer one), else with the GitHub CLI, which can read a private repository.
 fn download() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -58,13 +60,27 @@ fn download() -> Option<PathBuf> {
     if path.is_file() {
         cmd.arg("-z").arg(&path); // skip when ours is up to date
     }
-    let ok = cmd.arg(release_url()).status().map(|s| s.success()).unwrap_or(false);
+    cmd.arg(release_url()).stderr(Stdio::null());
+    let ok = cmd.status().map(|s| s.success()).unwrap_or(false)
+        || Command::new("gh")
+            .args(["release", "download", &format!("apk-v{}", protocol::VERSION), "--repo", REPO])
+            .args(["--pattern", APK_NAME, "--clobber", "--output"])
+            .arg(&part)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
     if ok && part.metadata().map(|m| m.len() > 0).unwrap_or(false) {
         std::fs::rename(&part, &path).ok()?;
     } else {
         let _ = std::fs::remove_file(&part);
         if !ok && !path.is_file() {
-            eprintln!("could not download the tablet app from {}", release_url());
+            eprintln!(
+                "could not download the tablet app from {} (for a private repository, install the \
+                 GitHub CLI and run `gh auth login`)",
+                release_url()
+            );
         }
     }
     path.is_file().then_some(path)
