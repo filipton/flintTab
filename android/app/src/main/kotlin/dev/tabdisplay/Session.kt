@@ -30,6 +30,10 @@ class Session(
     private val maxFps: Int,
     private val surfaceProvider: () -> Surface?,
     private val onState: (connected: Boolean) -> Unit,
+    /** The computer's mouse: x, y as 0..65535 across the display, and whether it is on it. */
+    private val onCursor: (x: Int, y: Int, visible: Boolean) -> Unit = { _, _, _ -> },
+    /** MSG_CURSOR_IMAGE payload. */
+    private val onCursorImage: (ByteArray) -> Unit = {},
 ) {
     @Volatile private var running = true
     @Volatile private var socket: Socket? = null
@@ -181,10 +185,22 @@ class Session(
                         input.readFully(data)
                         audio?.enqueue(data)
                     }
+                    MSG_CURSOR -> {
+                        val x = input.readUnsignedShort(); val y = input.readUnsignedShort()
+                        val visible = input.readUnsignedByte() != 0
+                        input.skipBytes(len - 5)
+                        onCursor(x, y, visible)
+                    }
+                    MSG_CURSOR_IMAGE -> {
+                        val data = ByteArray(len)
+                        input.readFully(data)
+                        onCursorImage(data)
+                    }
                     else -> input.skipBytes(len)
                 }
             }
         } finally {
+            onCursor(0, 0, false)
             decoder?.close()
             audio?.close()
             audio = null
@@ -198,6 +214,8 @@ class Session(
         const val MSG_CONFIG = 1
         const val MSG_VIDEO = 2
         const val MSG_AUDIO = 3
+        const val MSG_CURSOR = 4
+        const val MSG_CURSOR_IMAGE = 5
         const val KIND_AUDIO = 1
         const val KIND_ACK = 2
         const val KIND_IDR = 3

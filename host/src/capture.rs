@@ -83,6 +83,7 @@ impl Capture {
         width: u32,
         height: u32,
         fps: u32,
+        shows_cursor: bool,
         video: impl FnMut(CVPixelBuffer) + Send + 'static,
         audio: impl FnMut(&[u8]) + Send + 'static,
     ) -> Result<Self> {
@@ -114,7 +115,7 @@ impl Capture {
             // The encoder keeps the newest frame to re-encode it while the screen is idle,
             // so leave ScreenCaptureKit enough surfaces not to stall on that one.
             .with_queue_depth(5)
-            .with_shows_cursor(true)
+            .with_shows_cursor(shows_cursor)
             .with_captures_audio(true)
             .with_sample_rate(AUDIO_RATE as i32)
             .with_channel_count(AUDIO_CHANNELS as i32)

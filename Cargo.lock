@@ -1078,6 +1078,7 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "libc",
+ "objc",
  "screencapturekit",
  "tokio",
  "vdisplay-ffi",

@@ -17,6 +17,11 @@
 //!   MSG_VIDEO:  u64 pts_us (when the frame was captured, or handed to the encoder,
 //!               on the host's session clock), H.264 Annex-B access unit
 //!   MSG_AUDIO:  interleaved signed 16-bit little-endian PCM
+//!   MSG_CURSOR: u16 x, u16 y (hotspot position, 0..=65535 across the display), u8 visible.
+//!               The host's own mouse, drawn by the tablet on top of the video so it moves
+//!               without waiting for capture, encode and decode.
+//!   MSG_CURSOR_IMAGE: u16 display_width_pt, u16 w_pt, u16 h_pt, u16 hot_x_pt, u16 hot_y_pt,
+//!               then a PNG (any resolution; drawn at w_pt x h_pt display points)
 
 use std::io::{self, Read};
 
@@ -26,6 +31,8 @@ pub const VERSION: u8 = 2;
 pub const MSG_CONFIG: u8 = 1;
 pub const MSG_VIDEO: u8 = 2;
 pub const MSG_AUDIO: u8 = 3;
+pub const MSG_CURSOR: u8 = 4;
+pub const MSG_CURSOR_IMAGE: u8 = 5;
 
 pub const KIND_AUDIO: u8 = 1;
 pub const KIND_ACK: u8 = 2;
@@ -96,6 +103,20 @@ pub fn config_msg(width: u32, height: u32, fps: u32) -> Vec<u8> {
 
 pub fn video_msg(pts_us: u64, au: &[u8]) -> Vec<u8> {
     frame(MSG_VIDEO, &[&pts_us.to_be_bytes(), au])
+}
+
+pub fn cursor_msg(x: f64, y: f64, visible: bool) -> Vec<u8> {
+    let n = |v: f64| ((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_be_bytes();
+    frame(MSG_CURSOR, &[&n(x), &n(y), &[visible as u8]])
+}
+
+/// Sizes are in display points; `png` is the cursor picture at any resolution.
+pub fn cursor_image_msg(display_width_pt: u16, size: (u16, u16), hotspot: (u16, u16), png: &[u8]) -> Vec<u8> {
+    let mut head = Vec::with_capacity(10);
+    for v in [display_width_pt, size.0, size.1, hotspot.0, hotspot.1] {
+        head.extend_from_slice(&v.to_be_bytes());
+    }
+    frame(MSG_CURSOR_IMAGE, &[&head, png])
 }
 
 pub fn audio_msg(pcm: &[u8]) -> Vec<u8> {

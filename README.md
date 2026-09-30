@@ -40,23 +40,29 @@ tablet's screen and streams it.
 - **X11:** make room for the tablet (`xrandr --fb`, `xrandr --setmonitor tablet 2560/0x1600/0+1920+0 none`,
   or an EVDI output) and run with `--x11-region 1920,0`.
 
-**Touch and pen** control the mouse on the tablet's display: tap to click, drag to drag,
-two-finger drag to scroll, two-finger tap to right-click. A pen moves the cursor while hovering
-and its barrel button right-clicks.
+**Touch and pen** are off by default, so the tablet is purely a display for the computer's own
+mouse and keyboard; a tap shows the settings panel. Turn on *Touch controls mouse* there to
+use them: tap to click, drag to drag, two-finger drag to scroll, two-finger tap to right-click,
+three-finger tap for the panel. A pen moves the cursor while hovering and its barrel button
+right-clicks.
 - macOS: allow your terminal under System Settings > Privacy & Security > Accessibility.
 - Linux (Wayland): the portal dialog asks for pointer control along with the screen. On X11 it
   uses XTEST. Sway's portal has no remote-desktop support, so no touch input there yet.
 
-**Audio** is off by default. Tap the tablet with three fingers and use the *Audio* switch
-(top right) any time.
+**Audio** is off by default; use the *Audio* switch in the same panel (top right).
 Only system audio is captured; the host mutes nothing on the computer.
 
 The stream runs at the tablet's refresh rate (up to 120 Hz) when its decoder can keep up.
 
 Options: `--fps N --bitrate MBPS --keep-display SECS --max-width 2560 --no-launch --width W --height H`;
-macOS: `--ppi 220 --no-hidpi`; Linux: `--encoder NAME --portal-monitor --x11-region X,Y`.
+macOS: `--ppi 220 --no-hidpi --cursor-in-video`; Linux: `--encoder NAME --portal-monitor --x11-region X,Y`.
 
 ## How it keeps latency low
+- **The mouse skips the video (macOS).** The host reads the Mac's cursor position every 4 ms
+  and sends it, with the cursor's shape, ahead of the video. The tablet draws it on its own
+  compositor layer and just moves that layer, so the pointer reaches the tablet's screen at the
+  next vsync instead of after capture, encode and decode. The cursor is left out of the video;
+  `--cursor-in-video` puts it back there. On Linux the cursor is still part of the video.
 - **Newest frame wins.** Capture only replaces a single slot the encoder reads from, so nothing
   queues up between the screen and the encoder.
 - **Frame acks.** The tablet acknowledges every frame; the host keeps at most 2 unacknowledged.

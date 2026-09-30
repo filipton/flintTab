@@ -4,6 +4,7 @@ import android.app.Activity
 import android.graphics.Color
 import android.os.Bundle
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -20,6 +21,9 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var panel: LinearLayout
     private lateinit var audioSwitch: Switch
+    private lateinit var touchSwitch: Switch
+    private lateinit var hostCursor: HostCursor
+    private var tapDownAt = 0L
     private var session: Session? = null
     private val hidePanel = Runnable { panel.visibility = View.GONE }
     private var refreshHz = 60
@@ -63,10 +67,24 @@ class MainActivity : Activity() {
                 scheduleHide()
             }
         }
+        // Off by default: the tablet is a display for the computer's own mouse. When on, touches
+        // and the pen drive the mouse and a three-finger tap brings this panel back.
+        val prefs = getPreferences(MODE_PRIVATE)
+        touchSwitch = Switch(this).apply {
+            text = "Touch controls mouse  "
+            setTextColor(Color.WHITE)
+            textSize = 18f
+            isChecked = prefs.getBoolean("touch", false)
+            setOnCheckedChangeListener { _, on ->
+                prefs.edit().putBoolean("touch", on).apply()
+                scheduleHide()
+            }
+        }
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(40, 24, 40, 24)
             setBackgroundColor(0xCC000000.toInt())
+            addView(touchSwitch)
             addView(audioSwitch)
             visibility = View.GONE
         }
@@ -86,8 +104,10 @@ class MainActivity : Activity() {
         )
         setContentView(root)
 
-        // A tap shows the audio switch for a few seconds.
-        // Touches and the pen control the computer's mouse; a three-finger tap shows the panel.
+        hostCursor = HostCursor(surfaceView)
+
+        // With touch input off, a tap shows the panel for a few seconds. With it on, touches and
+        // the pen control the computer's mouse and a three-finger tap shows the panel.
         val touch = TouchInput(
             send = { a, x, y -> session?.sendPointer(a, x, y) },
             scroll = { dx, dy -> session?.sendScroll(dx, dy) },
@@ -98,13 +118,33 @@ class MainActivity : Activity() {
             touchSlop = ViewConfiguration.get(this).scaledTouchSlop.toFloat(),
         )
         surfaceView.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ -> touch.setViewSize(v.width, v.height) }
-        surfaceView.setOnTouchListener { _, e -> cursor.onPen(e); touch.onTouch(e) }
-        surfaceView.setOnGenericMotionListener { _, e -> cursor.onPen(e); touch.onHover(e) }
+        surfaceView.setOnTouchListener { _, e ->
+            if (touchSwitch.isChecked) {
+                cursor.onPen(e)
+                touch.onTouch(e)
+            } else {
+                showPanelOnTap(e)
+            }
+        }
+        surfaceView.setOnGenericMotionListener { _, e ->
+            touchSwitch.isChecked && run { cursor.onPen(e); touch.onHover(e) }
+        }
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(h: SurfaceHolder) {}
             override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {}
-            override fun surfaceDestroyed(h: SurfaceHolder) {}
+            override fun surfaceDestroyed(h: SurfaceHolder) = hostCursor.release()
         })
+    }
+
+    private fun showPanelOnTap(e: MotionEvent): Boolean {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> tapDownAt = e.eventTime
+            MotionEvent.ACTION_UP -> if (e.eventTime - tapDownAt < 300) {
+                panel.visibility = View.VISIBLE
+                scheduleHide()
+            }
+        }
+        return true
     }
 
     private fun scheduleHide() {
@@ -124,6 +164,8 @@ class MainActivity : Activity() {
             maxFps = maxDecodableFps(w, h, refreshHz),
             surfaceProvider = { surfaceView.holder.surface },
             onState = { connected -> runOnUiThread { status.visibility = if (connected) View.GONE else View.VISIBLE } },
+            onCursor = hostCursor::move,
+            onCursorImage = hostCursor::setImage,
         ).also { it.setAudio(audioSwitch.isChecked) }
     }
 

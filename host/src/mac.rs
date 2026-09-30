@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Args, Button, Control, Host, Input, Pointer, Stream, StreamConfig, capture, gate::Gate, protocol, vt};
+use crate::{Args, Button, Control, Host, Input, Pointer, Stream, StreamConfig, capture, cursor, gate::Gate, protocol, vt};
 use std::ffi::c_void;
 
 /// Owns the virtual display and keeps it alive for a while after the tablet goes away,
@@ -61,12 +61,14 @@ impl Control for Gate<CVPixelBuffer> {
 /// Stops capture first (no more frames), then the encoder thread.
 struct Running {
     capture: Option<capture::Capture>,
+    cursor: Option<cursor::CursorSender>,
     gate: Arc<Gate<CVPixelBuffer>>,
     encode_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
+        drop(self.cursor.take());
         drop(self.capture.take());
         self.gate.close();
         if let Some(t) = self.encode_thread.take() {
@@ -113,14 +115,19 @@ impl Host for MacHost {
                 }
             })
         };
-        let mut running = Running { capture: None, gate: gate.clone(), encode_thread: Some(encode_thread) };
+        let mut running = Running { capture: None, cursor: None, gate: gate.clone(), encode_thread: Some(encode_thread) };
 
+        // The cursor goes to the tablet separately, ahead of the video, unless asked otherwise.
+        if !args.cursor_in_video {
+            running.cursor = Some(cursor::CursorSender::start(display_id, tx.clone()));
+        }
         let capture_gate = gate.clone();
         running.capture = Some(capture::Capture::start(
             display_id,
             w,
             h,
             fps,
+            args.cursor_in_video,
             move |pixel_buffer| capture_gate.push(pixel_buffer),
             move |pcm| {
                 if audio_on.load(Ordering::Relaxed) {

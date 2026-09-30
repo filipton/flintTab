@@ -6,6 +6,8 @@
 
 #[cfg(target_os = "macos")]
 mod capture;
+#[cfg(target_os = "macos")]
+mod cursor;
 mod gate;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -77,6 +79,10 @@ pub struct Args {
     /// Linux: stream a GStreamer test pattern instead of a screen (for testing without a desktop)
     #[arg(long, hide = true)]
     test_source: bool,
+    /// macOS: draw the mouse cursor into the video instead of sending it separately
+    /// (the separate cursor is drawn by the tablet and moves with much less delay)
+    #[arg(long)]
+    cursor_in_video: bool,
     /// Linux: H.264 encoder element to use instead of the first available one
     /// (nvh264enc, vah264lpenc, vah264enc, vaapih264enc, qsvh264enc, x264enc)
     #[arg(long)]
