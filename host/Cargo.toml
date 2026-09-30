@@ -18,5 +18,6 @@ screencapturekit = { version = "1.5.0", features = ["macos_26_0"] }
 gstreamer = "0.24"
 gstreamer-app = "0.24"
 gstreamer-video = "0.24"
-ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"] }
-tokio = { version = "1", features = ["rt"] }
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast", "remote_desktop"] }
+x11rb = { version = "0.13", features = ["xtest"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }

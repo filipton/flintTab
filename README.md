@@ -40,7 +40,15 @@ tablet's screen and streams it.
 - **X11:** make room for the tablet (`xrandr --fb`, `xrandr --setmonitor tablet 2560/0x1600/0+1920+0 none`,
   or an EVDI output) and run with `--x11-region 1920,0`.
 
-**Audio** is off by default. Tap the tablet screen and use the *Audio* switch (top right) any time.
+**Touch and pen** control the mouse on the tablet's display: tap to click, drag to drag,
+two-finger drag to scroll, two-finger tap to right-click. A pen moves the cursor while hovering
+and its barrel button right-clicks.
+- macOS: allow your terminal under System Settings > Privacy & Security > Accessibility.
+- Linux (Wayland): the portal dialog asks for pointer control along with the screen. On X11 it
+  uses XTEST. Sway's portal has no remote-desktop support, so no touch input there yet.
+
+**Audio** is off by default. Tap the tablet with three fingers and use the *Audio* switch
+(top right) any time.
 Only system audio is captured; the host mutes nothing on the computer.
 
 The stream runs at the tablet's refresh rate (up to 120 Hz) when its decoder can keep up.
@@ -71,5 +79,4 @@ python3 tools/fake_tablet.py                             # checks frames, flow c
 ```
 
 ## Notes
-- No touch input yet (display + audio only).
 - Protocol: `host/src/protocol.rs`.

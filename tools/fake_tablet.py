@@ -16,7 +16,8 @@ def rd(n):
     return b
 lock = threading.Lock(); owed = [0]
 def ack():
-    s.sendall(bytes([2,0]))
+    # a pointer move and a scroll before every ack also exercise the variable-length framing
+    s.sendall(bytes([4,0]) + struct.pack(">HH", 30000, 20000) + bytes([5,0]) + struct.pack(">hh", -3, 7) + bytes([2,0]))
 stream = bytearray(); log=[]; t0=time.time()
 def releaser():
     time.sleep(3.0)

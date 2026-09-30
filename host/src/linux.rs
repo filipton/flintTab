@@ -5,6 +5,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use ashpd::desktop::{
     PersistMode, Session,
+    remote_desktop::{DeviceType, KeyState, NotifyPointerAxisOptions, RemoteDesktop, SelectDevicesOptions},
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
 };
 use gstreamer::{self as gst, prelude::*};
@@ -20,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Args, Control, Host, Stream, StreamConfig, gate::MAX_IN_FLIGHT, protocol, sps};
+use crate::{Args, Button, Control, Host, Input, Pointer, Stream, StreamConfig, gate::MAX_IN_FLIGHT, protocol, sps};
 
 /// What gets captured.
 enum Source {
@@ -32,17 +33,25 @@ enum Source {
     Portal(PortalCast),
 }
 
+/// A RemoteDesktop session also lets us inject pointer input into the monitor we capture;
+/// portals without RemoteDesktop (e.g. wlroots) get a plain ScreenCast session.
+enum PortalSession {
+    Cast(Session<Screencast>),
+    Remote(Arc<RemoteDesktop>, Arc<Session<RemoteDesktop>>),
+}
+
 struct PortalCast {
-    proxy: Screencast,
-    session: Session<Screencast>,
+    session: PortalSession,
     fd: OwnedFd,
     node: u32,
+    /// The stream's size in the compositor's logical pixels (pointer coordinates use it).
+    size: (f64, f64),
     /// Size the tablet asked for when the monitor was created.
     mode: (u32, u32),
 }
 
 pub struct LinuxHost {
-    rt: tokio::runtime::Runtime,
+    rt: Arc<tokio::runtime::Runtime>,
     source: Option<Source>,
     idle_since: Option<Instant>,
     encoder: Option<String>,
@@ -63,7 +72,9 @@ impl LinuxHost {
             None => None,
         };
         Ok(Self {
-            rt: tokio::runtime::Builder::new_current_thread().enable_all().build()?,
+            // multi-thread so the D-Bus connection keeps running between our block_on calls
+            // (input events are sent from the session's reader thread)
+            rt: Arc::new(tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?),
             source: None,
             idle_since: None,
             encoder: args.encoder.clone(),
@@ -73,53 +84,112 @@ impl LinuxHost {
         })
     }
 
-    fn token_path() -> Option<PathBuf> {
+    fn token_path(name: &str) -> Option<PathBuf> {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-        Some(base.join("tabdisplay").join("portal-restore-token"))
+        Some(base.join("tabdisplay").join(name))
     }
 
     /// Asks the compositor for a new virtual monitor (GNOME, KDE Plasma 6; wlroots
-    /// compositors via xdg-desktop-portal-wlr pick an existing output instead). The
-    /// permission is remembered with a restore token so the dialog only shows once.
+    /// compositors via xdg-desktop-portal-wlr pick an existing output instead), together
+    /// with pointer control when the desktop has the RemoteDesktop portal. The permission
+    /// is remembered with a restore token so the dialog only shows once.
     fn open_portal(&self, cfg: &StreamConfig) -> Result<PortalCast> {
-        let token_file = Self::token_path();
-        let token = token_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
         let kind = if self.portal_monitor { SourceType::Monitor } else { SourceType::Virtual };
-        let (proxy, session, stream, new_token) = self.rt.block_on(async {
-            let proxy = Screencast::new().await?;
-            let available = proxy.available_source_types().await?;
+        let with_input = self.rt.block_on(async {
+            match RemoteDesktop::new().await {
+                Ok(r) => r.available_device_types().await.map(|t| t.contains(DeviceType::Pointer)).unwrap_or(false),
+                Err(_) => false,
+            }
+        });
+        let token_file = Self::token_path(if with_input { "portal-remote-token" } else { "portal-restore-token" });
+        let token = token_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+
+        let (session, stream, new_token, fd) = self.rt.block_on(async {
+            let cast = Screencast::new().await?;
+            let available = cast.available_source_types().await?;
             if !available.contains(kind) {
                 return Err(anyhow!(
                     "this desktop's ScreenCast portal cannot create a {kind:?} source \
                      (GNOME 46+ or KDE Plasma 6 can; otherwise use --portal-monitor or --x11-region)"
                 ));
             }
-            let session = proxy.create_session(Default::default()).await?;
-            proxy
-                .select_sources(
+            let sources = SelectSourcesOptions::default()
+                .set_cursor_mode(CursorMode::Embedded)
+                .set_sources(ashpd::enumflags2::BitFlags::from(kind))
+                .set_multiple(false);
+            if with_input {
+                let remote = RemoteDesktop::new().await?;
+                let session = remote.create_session(Default::default()).await?;
+                remote
+                    .select_devices(
+                        &session,
+                        SelectDevicesOptions::default()
+                            .set_devices(ashpd::enumflags2::BitFlags::from(DeviceType::Pointer))
+                            .set_persist_mode(PersistMode::ExplicitlyRevoked)
+                            .set_restore_token(token.as_deref()),
+                    )
+                    .await?;
+                cast.select_sources(&session, sources).await?;
+                let resp = remote.start(&session, None, Default::default()).await?.response()?;
+                let stream = resp.streams().first().cloned().ok_or_else(|| anyhow!("portal returned no stream"))?;
+                let token = resp.restore_token().map(str::to_owned);
+                let fd = cast.open_pipe_wire_remote(&session, Default::default()).await?;
+                anyhow::Ok((PortalSession::Remote(Arc::new(remote), Arc::new(session)), stream, token, fd))
+            } else {
+                let session = cast.create_session(Default::default()).await?;
+                cast.select_sources(
                     &session,
-                    SelectSourcesOptions::default()
-                        .set_cursor_mode(CursorMode::Embedded)
-                        .set_sources(ashpd::enumflags2::BitFlags::from(kind))
-                        .set_multiple(false)
-                        .set_persist_mode(PersistMode::ExplicitlyRevoked)
-                        .set_restore_token(token.as_deref()),
+                    sources.set_persist_mode(PersistMode::ExplicitlyRevoked).set_restore_token(token.as_deref()),
                 )
                 .await?;
-            let resp = proxy.start(&session, None, Default::default()).await?.response()?;
-            let stream = resp.streams().first().cloned().ok_or_else(|| anyhow!("portal returned no stream"))?;
-            let new_token = resp.restore_token().map(str::to_owned);
-            anyhow::Ok((proxy, session, stream, new_token))
+                let resp = cast.start(&session, None, Default::default()).await?.response()?;
+                let stream = resp.streams().first().cloned().ok_or_else(|| anyhow!("portal returned no stream"))?;
+                let token = resp.restore_token().map(str::to_owned);
+                let fd = cast.open_pipe_wire_remote(&session, Default::default()).await?;
+                anyhow::Ok((PortalSession::Cast(session), stream, token, fd))
+            }
         })?;
         if let (Some(path), Some(t)) = (token_file, new_token) {
             let _ = std::fs::create_dir_all(path.parent().unwrap());
             let _ = std::fs::write(path, t);
         }
-        let fd = self.rt.block_on(proxy.open_pipe_wire_remote(&session, Default::default()))?;
-        println!("portal stream node {} ({:?})", stream.pipe_wire_node_id(), stream.size());
-        Ok(PortalCast { proxy, session, fd, node: stream.pipe_wire_node_id(), mode: (cfg.width, cfg.height) })
+        let size = stream
+            .size()
+            .map(|(w, h)| (w as f64, h as f64))
+            .unwrap_or((cfg.width as f64, cfg.height as f64));
+        println!(
+            "portal stream node {} ({}x{}){}",
+            stream.pipe_wire_node_id(),
+            size.0,
+            size.1,
+            if with_input { ", with pointer input" } else { "" }
+        );
+        Ok(PortalCast { session, fd, node: stream.pipe_wire_node_id(), size, mode: (cfg.width, cfg.height) })
+    }
+
+    fn input(&self, cfg: &StreamConfig) -> Option<Box<dyn Input>> {
+        match self.source.as_ref()? {
+            Source::Test => None,
+            Source::X11 { x, y } => match X11Input::new(*x, *y, cfg.width, cfg.height) {
+                Ok(i) => Some(Box::new(i)),
+                Err(e) => {
+                    eprintln!("X11 input unavailable: {e:#}");
+                    None
+                }
+            },
+            Source::Portal(p) => match &p.session {
+                PortalSession::Remote(remote, session) => Some(Box::new(PortalInput {
+                    rt: self.rt.clone(),
+                    remote: remote.clone(),
+                    session: session.clone(),
+                    node: p.node,
+                    size: p.size,
+                })),
+                PortalSession::Cast(_) => None,
+            },
+        }
     }
 
     fn source_desc(&mut self, cfg: &StreamConfig) -> Result<String> {
@@ -420,7 +490,8 @@ impl Host for LinuxHost {
                         Ok(a) => pipelines.push(a),
                         Err(e) => eprintln!("audio unavailable: {e:#}"),
                     }
-                    return Ok(Stream { control: flow, guard: Box::new(Running(pipelines)) });
+                    let input = self.input(cfg);
+                    return Ok(Stream { control: flow, input, guard: Box::new(Running(pipelines)) });
                 }
                 Err(e) => {
                     let _ = p.set_state(gst::State::Null);
@@ -444,10 +515,110 @@ impl Host for LinuxHost {
 
     fn shutdown(&mut self) {
         if let Some(Source::Portal(p)) = self.source.take() {
-            let _ = self.rt.block_on(p.session.close());
-            drop(p.proxy);
+            let _ = match &p.session {
+                PortalSession::Cast(s) => self.rt.block_on(s.close()),
+                PortalSession::Remote(_, s) => self.rt.block_on(s.close()),
+            };
             println!("virtual monitor removed");
         }
         self.idle_since = None;
+    }
+}
+
+const BTN_LEFT: i32 = 0x110;
+const BTN_RIGHT: i32 = 0x111;
+
+/// Pointer input through the RemoteDesktop portal, in the captured stream's coordinates.
+struct PortalInput {
+    rt: Arc<tokio::runtime::Runtime>,
+    remote: Arc<RemoteDesktop>,
+    session: Arc<Session<RemoteDesktop>>,
+    node: u32,
+    size: (f64, f64),
+}
+
+impl Input for PortalInput {
+    fn pointer(&mut self, ev: Pointer, x: f64, y: f64, _clicks: u32) {
+        let (r, s) = (&self.remote, &*self.session);
+        let (px, py) = (x * self.size.0, y * self.size.1);
+        let res = self.rt.block_on(async {
+            r.notify_pointer_motion_absolute(s, self.node, px, py, Default::default()).await?;
+            let button = match ev {
+                Pointer::Down(b) => Some((b, KeyState::Pressed)),
+                Pointer::Up(b) => Some((b, KeyState::Released)),
+                _ => None,
+            };
+            if let Some((b, state)) = button {
+                let code = if b == Button::Left { BTN_LEFT } else { BTN_RIGHT };
+                r.notify_pointer_button(s, code, state, Default::default()).await?;
+            }
+            ashpd::Result::Ok(())
+        });
+        if let Err(e) = res {
+            eprintln!("pointer input failed: {e}");
+        }
+    }
+
+    fn scroll(&mut self, dx: f64, dy: f64) {
+        // The portal's axis is in scroll direction; content following the fingers is the opposite.
+        let opts = NotifyPointerAxisOptions::default().set_finish(true);
+        let _ = self.rt.block_on(self.remote.notify_pointer_axis(&self.session, -dx, -dy, opts));
+    }
+}
+
+/// Pointer input on X11 through the XTEST extension, inside the captured region.
+struct X11Input {
+    conn: x11rb::rust_connection::RustConnection,
+    root: u32,
+    region: (f64, f64, f64, f64),
+    scroll: (f64, f64),
+}
+
+impl X11Input {
+    fn new(x: u32, y: u32, w: u32, h: u32) -> Result<Self> {
+        let (conn, screen) = x11rb::connect(None)?;
+        let root = x11rb::connection::Connection::setup(&conn).roots[screen].root;
+        Ok(Self { conn, root, region: (x as f64, y as f64, w as f64, h as f64), scroll: (0.0, 0.0) })
+    }
+
+    fn fake(&self, kind: u8, detail: u8, x: f64, y: f64) {
+        use x11rb::{connection::Connection, protocol::xtest::ConnectionExt};
+        let (rx, ry, rw, rh) = self.region;
+        let _ = self.conn.xtest_fake_input(kind, detail, 0, self.root, (rx + x * (rw - 1.0)) as i16, (ry + y * (rh - 1.0)) as i16, 0);
+        let _ = self.conn.flush();
+    }
+}
+
+impl Input for X11Input {
+    fn pointer(&mut self, ev: Pointer, x: f64, y: f64, _clicks: u32) {
+        use x11rb::protocol::xproto::{BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT, MOTION_NOTIFY_EVENT};
+        self.fake(MOTION_NOTIFY_EVENT, 0, x, y);
+        match ev {
+            Pointer::Down(b) => self.fake(BUTTON_PRESS_EVENT, if b == Button::Left { 1 } else { 3 }, x, y),
+            Pointer::Up(b) => self.fake(BUTTON_RELEASE_EVENT, if b == Button::Left { 1 } else { 3 }, x, y),
+            _ => {}
+        }
+    }
+
+    fn scroll(&mut self, dx: f64, dy: f64) {
+        use x11rb::{
+            connection::Connection,
+            protocol::xproto::{BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT},
+            protocol::xtest::ConnectionExt,
+        };
+        // X11 scrolls in wheel clicks (buttons 4-7); one click per 40 px of finger travel.
+        const STEP: f64 = 40.0;
+        self.scroll.0 += dx;
+        self.scroll.1 += dy;
+        let mut clicks = Vec::new();
+        while self.scroll.1 >= STEP { clicks.push(4); self.scroll.1 -= STEP; } // fingers down: scroll up
+        while self.scroll.1 <= -STEP { clicks.push(5); self.scroll.1 += STEP; }
+        while self.scroll.0 >= STEP { clicks.push(6); self.scroll.0 -= STEP; }
+        while self.scroll.0 <= -STEP { clicks.push(7); self.scroll.0 += STEP; }
+        for b in clicks {
+            let _ = self.conn.xtest_fake_input(BUTTON_PRESS_EVENT, b, 0, self.root, 0, 0, 0);
+            let _ = self.conn.xtest_fake_input(BUTTON_RELEASE_EVENT, b, 0, self.root, 0, 0, 0);
+        }
+        let _ = self.conn.flush();
     }
 }

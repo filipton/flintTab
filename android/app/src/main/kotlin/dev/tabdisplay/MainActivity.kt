@@ -4,10 +4,10 @@ import android.app.Activity
 import android.graphics.Color
 import android.os.Bundle
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -47,7 +47,7 @@ class MainActivity : Activity() {
         surfaceView = SurfaceView(this)
 
         status = TextView(this).apply {
-            text = "Waiting for the Mac…\nRun tabdisplay-host and keep the USB cable connected."
+            text = "Waiting for the computer…\nRun tabdisplay-host and keep the USB cable connected."
             setTextColor(Color.LTGRAY)
             textSize = 18f
             gravity = Gravity.CENTER
@@ -85,13 +85,19 @@ class MainActivity : Activity() {
         setContentView(root)
 
         // A tap shows the audio switch for a few seconds.
-        surfaceView.setOnTouchListener { _, e ->
-            if (e.action == MotionEvent.ACTION_DOWN) {
+        // Touches and the pen control the computer's mouse; a three-finger tap shows the panel.
+        val touch = TouchInput(
+            send = { a, x, y -> session?.sendPointer(a, x, y) },
+            scroll = { dx, dy -> session?.sendScroll(dx, dy) },
+            onThreeFingerTap = {
                 panel.visibility = View.VISIBLE
                 scheduleHide()
-            }
-            true
-        }
+            },
+            touchSlop = ViewConfiguration.get(this).scaledTouchSlop.toFloat(),
+        )
+        surfaceView.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ -> touch.setViewSize(v.width, v.height) }
+        surfaceView.setOnTouchListener { _, e -> touch.onTouch(e) }
+        surfaceView.setOnGenericMotionListener { _, e -> touch.onHover(e) }
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(h: SurfaceHolder) {}
             override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {}

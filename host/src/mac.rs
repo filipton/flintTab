@@ -12,7 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Args, Control, Host, Stream, StreamConfig, capture, gate::Gate, protocol, vt};
+use crate::{Args, Button, Control, Host, Input, Pointer, Stream, StreamConfig, capture, gate::Gate, protocol, vt};
+use std::ffi::c_void;
 
 /// Owns the virtual display and keeps it alive for a while after the tablet goes away,
 /// so a quick reconnect reuses it and macOS does not shuffle windows back to the main screen.
@@ -122,7 +123,8 @@ impl Host for MacHost {
                 }
             },
         )?);
-        Ok(Stream { control: gate, guard: Box::new(running) })
+        let input = MouseInput::new(display_id);
+        Ok(Stream { control: gate, input: Some(Box::new(input)), guard: Box::new(running) })
     }
 
     fn release(&mut self) {
@@ -141,5 +143,123 @@ impl Host for MacHost {
             println!("virtual display removed");
         }
         self.idle_since = None;
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGRect {
+    origin: CGPoint,
+    size: CGPoint,
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGDisplayBounds(display: u32) -> CGRect;
+    fn CGEventCreateMouseEvent(source: *const c_void, kind: u32, pos: CGPoint, button: u32) -> *mut c_void;
+    fn CGEventCreateScrollWheelEvent2(
+        source: *const c_void,
+        units: u32,
+        wheel_count: u32,
+        wheel1: i32,
+        wheel2: i32,
+        wheel3: i32,
+    ) -> *mut c_void;
+    fn CGEventSetIntegerValueField(event: *mut c_void, field: u32, value: i64);
+    fn CGEventPost(tap: u32, event: *mut c_void);
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrusted() -> u8;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRelease(cf: *const c_void);
+}
+
+const LEFT_DOWN: u32 = 1;
+const LEFT_UP: u32 = 2;
+const RIGHT_DOWN: u32 = 3;
+const RIGHT_UP: u32 = 4;
+const MOVED: u32 = 5;
+const LEFT_DRAGGED: u32 = 6;
+const RIGHT_DRAGGED: u32 = 7;
+const FIELD_CLICK_STATE: u32 = 1;
+const HID_EVENT_TAP: u32 = 0;
+const SCROLL_UNIT_PIXEL: u32 = 0;
+
+/// Posts the tablet's touches as mouse events on the virtual display (needs the
+/// Accessibility permission for the terminal running the host).
+struct MouseInput {
+    display_id: u32,
+    held: Option<Button>,
+}
+
+impl MouseInput {
+    fn new(display_id: u32) -> Self {
+        if unsafe { AXIsProcessTrusted() } == 0 {
+            eprintln!(
+                "touch input needs the Accessibility permission: System Settings > Privacy & Security > \
+                 Accessibility, enable your terminal, then restart the host"
+            );
+        }
+        Self { display_id, held: None }
+    }
+
+    fn post(&self, event: *mut c_void) {
+        if !event.is_null() {
+            unsafe {
+                CGEventPost(HID_EVENT_TAP, event);
+                CFRelease(event);
+            }
+        }
+    }
+}
+
+impl Input for MouseInput {
+    fn pointer(&mut self, ev: Pointer, x: f64, y: f64, clicks: u32) {
+        let b = unsafe { CGDisplayBounds(self.display_id) };
+        let pos = CGPoint { x: b.origin.x + x * b.size.x, y: b.origin.y + y * b.size.y };
+        let (kind, button) = match ev {
+            Pointer::Move => (MOVED, 0),
+            Pointer::Down(Button::Left) => (LEFT_DOWN, 0),
+            Pointer::Down(Button::Right) => (RIGHT_DOWN, 1),
+            Pointer::Up(Button::Left) => (LEFT_UP, 0),
+            Pointer::Up(Button::Right) => (RIGHT_UP, 1),
+            Pointer::Drag => match self.held {
+                Some(Button::Right) => (RIGHT_DRAGGED, 1),
+                Some(Button::Left) => (LEFT_DRAGGED, 0),
+                None => (MOVED, 0),
+            },
+        };
+        match ev {
+            Pointer::Down(b) => self.held = Some(b),
+            Pointer::Up(_) => self.held = None,
+            _ => {}
+        }
+        unsafe {
+            let e = CGEventCreateMouseEvent(std::ptr::null(), kind, pos, button);
+            if !e.is_null() && kind != MOVED {
+                CGEventSetIntegerValueField(e, FIELD_CLICK_STATE, clicks as i64);
+            }
+            self.post(e);
+        }
+    }
+
+    fn scroll(&mut self, dx: f64, dy: f64) {
+        // Positive wheel values scroll content down/right, i.e. follow the fingers.
+        let e = unsafe {
+            CGEventCreateScrollWheelEvent2(std::ptr::null(), SCROLL_UNIT_PIXEL, 2, dy as i32, dx as i32, 0)
+        };
+        self.post(e);
     }
 }

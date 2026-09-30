@@ -7,6 +7,9 @@
 //!   control:   u8 kind, u8 value
 //!              KIND_AUDIO value 0/1, KIND_ACK (one video frame taken off the wire),
 //!              KIND_IDR (decoder was reset, send a keyframe)
+//!              KIND_POINTER value = POINTER_* action, then u16 x, u16 y
+//!                (position on the stream, 0..=65535 across the width / height)
+//!              KIND_SCROLL value 0, then i16 dx, i16 dy (stream pixels, finger direction)
 //! Host -> tablet, a stream of frames: u8 kind, u32 len, payload
 //!   MSG_CONFIG: u32 width, u32 height, u32 fps, u32 audio_rate, u8 audio_channels
 //!   MSG_VIDEO:  u64 pts_us, H.264 Annex-B access unit
@@ -24,6 +27,23 @@ pub const MSG_AUDIO: u8 = 3;
 pub const KIND_AUDIO: u8 = 1;
 pub const KIND_ACK: u8 = 2;
 pub const KIND_IDR: u8 = 3;
+pub const KIND_POINTER: u8 = 4;
+pub const KIND_SCROLL: u8 = 5;
+
+pub const POINTER_MOVE: u8 = 0; // no button held (pen hover, cursor placement)
+pub const POINTER_LEFT_DOWN: u8 = 1;
+pub const POINTER_DRAG: u8 = 2; // move with the left button held
+pub const POINTER_LEFT_UP: u8 = 3;
+pub const POINTER_RIGHT_DOWN: u8 = 4;
+pub const POINTER_RIGHT_UP: u8 = 5;
+
+/// Bytes that follow the 2-byte header of a control message of this kind.
+pub fn control_payload_len(kind: u8) -> usize {
+    match kind {
+        KIND_POINTER | KIND_SCROLL => 4,
+        _ => 0,
+    }
+}
 
 pub const AUDIO_RATE: u32 = 48_000;
 pub const AUDIO_CHANNELS: u8 = 2;

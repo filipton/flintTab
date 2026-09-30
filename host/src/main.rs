@@ -159,7 +159,74 @@ pub struct StreamConfig {
 /// A running capture + encode pipeline; dropping `guard` stops it.
 pub struct Stream {
     pub control: Arc<dyn Control>,
+    /// Injects the tablet's touches and pen as mouse input, where the platform allows it.
+    pub input: Option<Box<dyn Input>>,
     pub guard: Box<dyn std::any::Any>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Button {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pointer {
+    Move,
+    Down(Button),
+    Drag,
+    Up(Button),
+}
+
+/// Mouse input on the virtual display. `x`/`y` are 0..=1 across the display.
+pub trait Input: Send {
+    /// `clicks` is 2 for the second press of a double click, etc. (macOS needs it).
+    fn pointer(&mut self, ev: Pointer, x: f64, y: f64, clicks: u32);
+    /// Finger movement in display pixels; positive dy = fingers moved down (content follows).
+    fn scroll(&mut self, dx: f64, dy: f64);
+}
+
+/// Turns control messages into `Input` calls and counts multi-clicks.
+struct InputDecoder {
+    input: Box<dyn Input>,
+    last_down: Option<(std::time::Instant, f64, f64, u32)>,
+}
+
+impl InputDecoder {
+    fn handle(&mut self, kind: u8, value: u8, payload: &[u8]) {
+        let a = u16::from_be_bytes([payload[0], payload[1]]);
+        let b = u16::from_be_bytes([payload[2], payload[3]]);
+        if kind == protocol::KIND_SCROLL {
+            self.input.scroll(a as i16 as f64, b as i16 as f64);
+            return;
+        }
+        let (x, y) = (a as f64 / 65535.0, b as f64 / 65535.0);
+        let ev = match value {
+            protocol::POINTER_MOVE => Pointer::Move,
+            protocol::POINTER_LEFT_DOWN => Pointer::Down(Button::Left),
+            protocol::POINTER_DRAG => Pointer::Drag,
+            protocol::POINTER_LEFT_UP => Pointer::Up(Button::Left),
+            protocol::POINTER_RIGHT_DOWN => Pointer::Down(Button::Right),
+            protocol::POINTER_RIGHT_UP => Pointer::Up(Button::Right),
+            _ => return,
+        };
+        let mut clicks = self.last_down.map_or(1, |l| l.3);
+        if ev == Pointer::Down(Button::Left) {
+            let now = std::time::Instant::now();
+            clicks = match self.last_down {
+                Some((t, lx, ly, n))
+                    if now.duration_since(t) < Duration::from_millis(400)
+                        && (x - lx).abs() < 0.01
+                        && (y - ly).abs() < 0.01 =>
+                {
+                    n + 1
+                }
+                _ => 1,
+            };
+            self.last_down = Some((now, x, y, clicks));
+        }
+        self.input.pointer(ev, x, y, clicks);
+    }
 }
 
 /// A platform backend. It owns the virtual display, which outlives single sessions.
@@ -202,7 +269,7 @@ fn run_session(mut sock: TcpStream, args: &Args, host: &mut dyn Host, running: &
     tx.send(protocol::config_msg(width, height, fps)).ok();
 
     let cfg = StreamConfig { width, height, fps, bitrate };
-    let stream = match host.start(args, &cfg, audio_on.clone(), tx) {
+    let mut stream = match host.start(args, &cfg, audio_on.clone(), tx) {
         Ok(s) => s,
         Err(e) => {
             host.release();
@@ -231,13 +298,28 @@ fn run_session(mut sock: TcpStream, args: &Args, host: &mut dyn Host, running: &
     }
     // reader: control messages from the tablet
     {
+        let input = stream.input.take();
+        if input.is_none() {
+            println!("touch input is not available with this capture source");
+        }
         let mut inp = sock.try_clone()?;
         let alive = alive.clone();
         let control = stream.control.clone();
         thread::spawn(move || {
+            let mut input = input.map(|input| InputDecoder { input, last_down: None });
             let mut m = [0u8; 2];
+            let mut payload = [0u8; 4];
             while inp.read_exact(&mut m).is_ok() {
+                let extra = protocol::control_payload_len(m[0]);
+                if inp.read_exact(&mut payload[..extra]).is_err() {
+                    break;
+                }
                 match m[0] {
+                    protocol::KIND_POINTER | protocol::KIND_SCROLL => {
+                        if let Some(i) = input.as_mut() {
+                            i.handle(m[0], m[1], &payload);
+                        }
+                    }
                     protocol::KIND_ACK => control.ack(),
                     protocol::KIND_IDR => {
                         println!("tablet asked for a keyframe");
@@ -324,4 +406,44 @@ fn main() -> Result<()> {
     }
     host.shutdown();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl Input for Recorder {
+        fn pointer(&mut self, ev: Pointer, x: f64, y: f64, clicks: u32) {
+            self.0.lock().unwrap().push(format!("{ev:?} {x:.2} {y:.2} x{clicks}"));
+        }
+        fn scroll(&mut self, dx: f64, dy: f64) {
+            self.0.lock().unwrap().push(format!("scroll {dx} {dy}"));
+        }
+    }
+
+    #[test]
+    fn decodes_pointer_messages_and_counts_double_clicks() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut d = InputDecoder { input: Box::new(Recorder(log.clone())), last_down: None };
+        let half = 32768u16.to_be_bytes();
+        let p = [half[0], half[1], 0, 0];
+        d.handle(protocol::KIND_POINTER, protocol::POINTER_LEFT_DOWN, &p);
+        d.handle(protocol::KIND_POINTER, protocol::POINTER_LEFT_UP, &p);
+        d.handle(protocol::KIND_POINTER, protocol::POINTER_LEFT_DOWN, &p);
+        d.handle(protocol::KIND_POINTER, protocol::POINTER_RIGHT_DOWN, &[255, 255, 255, 255]);
+        d.handle(protocol::KIND_SCROLL, 0, &[0xff, 0xf6, 0, 20]);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                "Down(Left) 0.50 0.00 x1",
+                "Up(Left) 0.50 0.00 x1",
+                "Down(Left) 0.50 0.00 x2",
+                "Down(Right) 1.00 1.00 x2",
+                "scroll -10 20",
+            ]
+        );
+    }
 }

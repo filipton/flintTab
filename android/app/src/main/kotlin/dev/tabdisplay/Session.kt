@@ -15,6 +15,7 @@ import java.io.DataOutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.LinkedBlockingDeque
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
@@ -53,13 +54,37 @@ class Session(
         worker.join(1500)
     }
 
+    /** Control messages go out on their own thread: touch events arrive on the UI thread,
+     *  where Android forbids network I/O. */
+    private val outbox = LinkedBlockingQueue<ByteArray>()
+    private val sender = thread(name = "control-out", isDaemon = true) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
+        while (running) {
+            val msg = outbox.poll(200, TimeUnit.MILLISECONDS) ?: continue
+            val o = out ?: continue
+            try {
+                synchronized(o) { o.write(msg); o.flush() }
+            } catch (_: Exception) {}
+        }
+    }
+
     private fun sendControl(kind: Int, value: Int) {
-        val o = out ?: return
-        try {
-            synchronized(o) {
-                o.writeByte(kind); o.writeByte(value); o.flush()
-            }
-        } catch (_: Exception) {}
+        if (out != null) outbox.add(byteArrayOf(kind.toByte(), value.toByte()))
+    }
+
+    /** Pointer event at a position given as 0..65535 across the stream. */
+    fun sendPointer(action: Int, x: Int, y: Int) {
+        if (out == null) return
+        outbox.add(byteArrayOf(Proto.KIND_POINTER.toByte(), action.toByte(),
+            (x shr 8).toByte(), x.toByte(), (y shr 8).toByte(), y.toByte()))
+    }
+
+    /** Two-finger scroll, finger movement in pixels. */
+    fun sendScroll(dx: Int, dy: Int) {
+        if (out == null) return
+        val x = dx.coerceIn(-32768, 32767); val y = dy.coerceIn(-32768, 32767)
+        outbox.add(byteArrayOf(Proto.KIND_SCROLL.toByte(), 0,
+            (x shr 8).toByte(), x.toByte(), (y shr 8).toByte(), y.toByte()))
     }
 
     private fun loop() {
@@ -83,9 +108,8 @@ class Session(
         socket = s
         val input = DataInputStream(s.getInputStream().buffered(1 shl 16))
         val output = DataOutputStream(s.getOutputStream())
-        out = output
 
-        // handshake: magic, version, screen size
+        // handshake: magic, version, screen size, refresh rate
         synchronized(output) {
             output.write("TDSP".toByteArray())
             output.writeByte(VERSION)
@@ -94,6 +118,8 @@ class Session(
             output.writeInt(maxFps)
             output.flush()
         }
+        outbox.clear() // nothing from an earlier connection
+        out = output
 
         var decoder: Decoder? = null
         var config: IntArray? = null // w, h, fps
