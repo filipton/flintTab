@@ -154,6 +154,8 @@ pub struct StreamConfig {
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
+    /// Session clock: video pts are microseconds since this instant.
+    pub epoch: std::time::Instant,
 }
 
 /// A running capture + encode pipeline; dropping `guard` stops it.
@@ -184,6 +186,33 @@ pub trait Input: Send {
     fn pointer(&mut self, ev: Pointer, x: f64, y: f64, clicks: u32);
     /// Finger movement in display pixels; positive dy = fingers moved down (content follows).
     fn scroll(&mut self, dx: f64, dy: f64);
+}
+
+/// Rolling end-to-end latency (host capture/encode start -> frame on the tablet's screen),
+/// printed every few seconds.
+#[derive(Default)]
+struct LatencyStats {
+    samples: Vec<f64>,
+    since: Option<std::time::Instant>,
+}
+
+impl LatencyStats {
+    fn add(&mut self, ms: f64) {
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        self.samples.push(ms);
+        if since.elapsed() >= Duration::from_secs(5) {
+            self.samples.sort_by(|a, b| a.total_cmp(b));
+            let n = self.samples.len();
+            println!(
+                "latency to the tablet's screen: median {:.1} ms, p95 {:.1} ms, {:.0} frames/s (+ up to one vsync)",
+                self.samples[n / 2],
+                self.samples[(n * 95 / 100).min(n - 1)],
+                n as f64 / since.elapsed().as_secs_f64()
+            );
+            self.samples.clear();
+            self.since = None;
+        }
+    }
 }
 
 /// Turns control messages into `Input` calls and counts multi-clicks.
@@ -268,7 +297,8 @@ fn run_session(mut sock: TcpStream, args: &Args, host: &mut dyn Host, running: &
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     tx.send(protocol::config_msg(width, height, fps)).ok();
 
-    let cfg = StreamConfig { width, height, fps, bitrate };
+    let cfg = StreamConfig { width, height, fps, bitrate, epoch: std::time::Instant::now() };
+    let epoch = cfg.epoch;
     let mut stream = match host.start(args, &cfg, audio_on.clone(), tx) {
         Ok(s) => s,
         Err(e) => {
@@ -308,13 +338,19 @@ fn run_session(mut sock: TcpStream, args: &Args, host: &mut dyn Host, running: &
         thread::spawn(move || {
             let mut input = input.map(|input| InputDecoder { input, last_down: None });
             let mut m = [0u8; 2];
-            let mut payload = [0u8; 4];
+            let mut payload = [0u8; 8];
+            let mut latency = LatencyStats::default();
             while inp.read_exact(&mut m).is_ok() {
                 let extra = protocol::control_payload_len(m[0]);
                 if inp.read_exact(&mut payload[..extra]).is_err() {
                     break;
                 }
                 match m[0] {
+                    protocol::KIND_SHOWN => {
+                        let pts = u64::from_be_bytes(payload);
+                        let now = epoch.elapsed().as_micros() as u64;
+                        latency.add(now.saturating_sub(pts) as f64 / 1000.0);
+                    }
                     protocol::KIND_POINTER | protocol::KIND_SCROLL => {
                         if let Some(i) = input.as_mut() {
                             i.handle(m[0], m[1], &payload);

@@ -10,9 +10,12 @@
 //!              KIND_POINTER value = POINTER_* action, then u16 x, u16 y
 //!                (position on the stream, 0..=65535 across the width / height)
 //!              KIND_SCROLL value 0, then i16 dx, i16 dy (stream pixels, finger direction)
+//!              KIND_SHOWN value 0, then u64 pts_us of a video frame the tablet just put on
+//!                screen (the host's clock, so the host can measure end-to-end latency)
 //! Host -> tablet, a stream of frames: u8 kind, u32 len, payload
 //!   MSG_CONFIG: u32 width, u32 height, u32 fps, u32 audio_rate, u8 audio_channels
-//!   MSG_VIDEO:  u64 pts_us, H.264 Annex-B access unit
+//!   MSG_VIDEO:  u64 pts_us (when the frame was captured, or handed to the encoder,
+//!               on the host's session clock), H.264 Annex-B access unit
 //!   MSG_AUDIO:  interleaved signed 16-bit little-endian PCM
 
 use std::io::{self, Read};
@@ -29,6 +32,7 @@ pub const KIND_ACK: u8 = 2;
 pub const KIND_IDR: u8 = 3;
 pub const KIND_POINTER: u8 = 4;
 pub const KIND_SCROLL: u8 = 5;
+pub const KIND_SHOWN: u8 = 6;
 
 pub const POINTER_MOVE: u8 = 0; // no button held (pen hover, cursor placement)
 pub const POINTER_LEFT_DOWN: u8 = 1;
@@ -41,6 +45,7 @@ pub const POINTER_RIGHT_UP: u8 = 5;
 pub fn control_payload_len(kind: u8) -> usize {
     match kind {
         KIND_POINTER | KIND_SCROLL => 4,
+        KIND_SHOWN => 8,
         _ => 0,
     }
 }

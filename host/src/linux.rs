@@ -456,7 +456,7 @@ impl Host for LinuxHost {
                 }
             });
 
-            let started = Instant::now();
+            let started = cfg.epoch;
             let f = flow.clone();
             let tx_video = tx.clone();
             let first = Arc::new(Mutex::new(true));
@@ -476,7 +476,20 @@ impl Host for LinuxHost {
                             *first = false;
                         }
                         f.in_flight.fetch_add(1, Ordering::Relaxed);
-                        tx_video.send(protocol::video_msg(started.elapsed().as_micros() as u64, au)).ok();
+                        // Stamp the frame with its capture time: how long ago the source
+                        // timestamped it, per the pipeline clock, back-dated on our session clock.
+                        let now = started.elapsed().as_micros() as u64;
+                        // (pts -> running time through the segment: encoders shift pts, x264 by 1000 h)
+                        let running = sample
+                            .segment()
+                            .and_then(|seg| seg.downcast_ref::<gst::ClockTime>())
+                            .zip(buf.pts())
+                            .and_then(|(seg, pts)| seg.to_running_time(pts));
+                        let age_us = match (s.clock(), s.base_time(), running) {
+                            (Some(c), Some(base), Some(rt)) => c.time().saturating_sub(base).saturating_sub(rt).useconds(),
+                            _ => 0,
+                        };
+                        tx_video.send(protocol::video_msg(now.saturating_sub(age_us), au)).ok();
                         Ok(gst::FlowSuccess::Ok)
                     })
                     .build(),

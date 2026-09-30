@@ -83,17 +83,20 @@ impl Host for MacHost {
         audio_on: Arc<AtomicBool>,
         tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<Stream> {
-        let StreamConfig { width: w, height: h, fps, bitrate } = *cfg;
+        let StreamConfig { width: w, height: h, fps, bitrate, epoch: started } = *cfg;
         let display_id = self.display(args, w, h, fps)?;
         let gate = Arc::new(Gate::<CVPixelBuffer>::new());
 
-        let started = Instant::now();
+        // When the frame being encoded was handed to the encoder; encoding is synchronous,
+        // so the output callback reads it back as the frame's timestamp.
+        let submitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let encoder = {
             let tx = tx.clone();
             let gate = gate.clone();
+            let submitted = submitted.clone();
             vt::VtEncoder::new(w, h, fps, bitrate, move |au, _| {
                 gate.sent();
-                tx.send(protocol::video_msg(started.elapsed().as_micros() as u64, &au)).ok();
+                tx.send(protocol::video_msg(submitted.load(Ordering::Relaxed), &au)).ok();
             })?
         };
         // encoder: takes the newest captured frame whenever the tablet can take another one
@@ -104,7 +107,9 @@ impl Host for MacHost {
                     libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
                 }
                 while let Some(job) = gate.next() {
-                    encoder.encode(job.frame.as_ptr(), started.elapsed().as_micros() as u64, job.keyframe);
+                    let now = started.elapsed().as_micros() as u64;
+                    submitted.store(now, Ordering::Relaxed);
+                    encoder.encode(job.frame.as_ptr(), now, job.keyframe);
                 }
             })
         };

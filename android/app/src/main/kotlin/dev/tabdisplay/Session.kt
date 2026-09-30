@@ -79,6 +79,15 @@ class Session(
             (x shr 8).toByte(), x.toByte(), (y shr 8).toByte(), y.toByte()))
     }
 
+    /** Tells the host a frame is on its way to the screen, so it can print end-to-end latency. */
+    private fun sendShown(pts: Long) {
+        if (out == null) return
+        val b = ByteArray(10)
+        b[0] = KIND_SHOWN.toByte()
+        for (i in 0 until 8) b[2 + i] = (pts shr (56 - 8 * i)).toByte()
+        outbox.add(b)
+    }
+
     /** Two-finger scroll, finger movement in pixels. */
     fun sendScroll(dx: Int, dy: Int) {
         if (out == null) return
@@ -138,7 +147,7 @@ class Session(
                         config = intArrayOf(w, h, fps)
                         // Let the display switch to a refresh rate that fits the stream.
                         setStreamFrameRate(surface, fps)
-                        decoder = Decoder(surface, w, h)
+                        decoder = Decoder(surface, w, h, ::sendShown)
                         needKeyframe = false
                         audio = AudioPlayer(rate, ch).also { it.setEnabled(audioWanted) }
                         // host starts with audio off; tell it what the switch currently says
@@ -146,20 +155,20 @@ class Session(
                         onState(true)
                     }
                     MSG_VIDEO -> {
-                        input.readLong() // pts, unused: frames are shown as soon as decoded
+                        val pts = input.readLong() // host clock; echoed back once shown, for latency stats
                         val n = len - 8
                         if (n > frameBuf.size) frameBuf = ByteArray(n * 2)
                         input.readFully(frameBuf, 0, n)
                         if (needKeyframe && isKeyframe(frameBuf, n)) needKeyframe = false
                         val d = decoder
                         if (d != null && !needKeyframe) {
-                            val ok = !d.failed && try { d.feed(frameBuf, n); true } catch (_: Exception) { false }
+                            val ok = !d.failed && try { d.feed(frameBuf, n, pts); true } catch (_: Exception) { false }
                             if (!ok) {
                                 // Decoder died (e.g. a codec error): rebuild it and ask the host for
                                 // a keyframe instead of tearing the whole connection down.
                                 d.close()
                                 val c = config!!
-                                decoder = Decoder(surface, c[0], c[1])
+                                decoder = Decoder(surface, c[0], c[1], ::sendShown)
                                 needKeyframe = true
                                 sendControl(KIND_IDR, 0)
                             }
@@ -192,6 +201,7 @@ class Session(
         const val KIND_AUDIO = 1
         const val KIND_ACK = 2
         const val KIND_IDR = 3
+        const val KIND_SHOWN = 6
     }
 }
 
@@ -281,7 +291,7 @@ private fun lowLatencyOptions(info: MediaCodecInfo?): List<Map<String, Int>> {
 }
 
 /** H.264 decoder configured for minimum latency, rendering straight to the surface. */
-private class Decoder(surface: Surface, width: Int, height: Int) {
+private class Decoder(surface: Surface, width: Int, height: Int, private val onShown: (Long) -> Unit) {
     private val codec: MediaCodec
     @Volatile private var open = true
     /** Set when the codec threw on the output side; the owner then rebuilds it. */
@@ -318,16 +328,19 @@ private class Decoder(surface: Surface, width: Int, height: Int) {
                 try {
                     var idx = codec.dequeueOutputBuffer(bi, 10_000)
                     if (idx < 0) continue
+                    var pts = bi.presentationTimeUs
                     // If newer frames are already waiting, skip the older ones.
                     while (true) {
                         val next = codec.dequeueOutputBuffer(bi, 0)
                         if (next < 0) break
                         codec.releaseOutputBuffer(idx, false)
                         idx = next
+                        pts = bi.presentationTimeUs
                     }
                     // Show at the next vsync; if a newer frame targets the same vsync, the
                     // compositor drops this one (Moonlight's min-latency mode).
                     codec.releaseOutputBuffer(idx, System.nanoTime())
+                    onShown(pts)
                 } catch (_: Exception) {
                     if (open) failed = true
                     return@thread
@@ -336,8 +349,8 @@ private class Decoder(surface: Surface, width: Int, height: Int) {
         }
     }
 
-    fun feed(au: ByteArray, size: Int) {
-        val pts = System.nanoTime() / 1000
+    /** [pts] is the host's timestamp; it only travels through the codec for latency stats. */
+    fun feed(au: ByteArray, size: Int, pts: Long) {
         while (open) {
             val i = codec.dequeueInputBuffer(10_000)
             if (i < 0) continue

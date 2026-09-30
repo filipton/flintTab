@@ -72,6 +72,11 @@ macOS: `--ppi 220 --no-hidpi`; Linux: `--encoder NAME --portal-monitor --x11-reg
   connection and the virtual display stay up. The virtual display also survives a disconnect
   for `--keep-display` seconds (default 15) so windows stay put.
 
+## Measuring latency
+While streaming, the host prints the end-to-end latency every 5 seconds: from capture (Linux)
+or the hand-off to the encoder (macOS) until the tablet releases the decoded frame to its screen.
+Add up to one vsync on the tablet (8 ms at 120 Hz, 17 ms at 60 Hz) for the panel itself.
+
 ## Testing without a tablet
 ```
 cargo run -p tabdisplay-host -- --no-adb --test-source   # Linux: test pattern, no desktop needed

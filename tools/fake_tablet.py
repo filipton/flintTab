@@ -5,7 +5,8 @@ It streams for ~6 s, stops acking for one second (the host must pause after 2 fr
 asks for a keyframe, and prints what arrived. With PyAV installed it also decodes the stream.
 """
 import socket, struct, time, threading, io, statistics
-W,H,FPS = 1280,800,60
+import os
+W,H,FPS = int(os.environ.get("W",1280)),int(os.environ.get("H",800)),60
 s = socket.create_connection(("127.0.0.1", 27183))
 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 s.sendall(b"TDSP" + bytes([2]) + struct.pack(">III", W, H, FPS))
@@ -33,6 +34,7 @@ try:
         if kind == 1: print("config", struct.unpack(">IIII", body[:16]), body[16]); continue
         if kind != 2: continue
         au = body[8:]; now = time.time()-t0
+        s.sendall(bytes([6,0]) + body[:8])  # "shown" right away: the host prints its side of the latency
         nals = [au[i+3] & 0x1f for i in range(len(au)-3) if au[i:i+3]==b"\0\0\1"]
         log.append((now, 5 in nals, len(au))); stream += au
         with lock:
