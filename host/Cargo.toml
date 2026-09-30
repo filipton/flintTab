@@ -13,3 +13,10 @@ vdisplay-ffi = { path = "../vdisplay-ffi" }
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 screencapturekit = { version = "1.5.0", features = ["macos_26_0"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gstreamer = "0.24"
+gstreamer-app = "0.24"
+gstreamer-video = "0.24"
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "screencast"] }
+tokio = { version = "1", features = ["rt"] }

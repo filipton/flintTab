@@ -1,4 +1,5 @@
 #![allow(unexpected_cfgs)]
+#![cfg_attr(not(target_os = "macos"), allow(unused))]
 use objc::{
     msg_send,
     runtime::{BOOL, Class, NO, Object, YES},

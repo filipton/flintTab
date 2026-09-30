@@ -252,6 +252,47 @@ pub fn add_low_latency_vui(nal: &[u8]) -> Option<Vec<u8>> {
     Some(escape(&w.out))
 }
 
+/// Rewrites every SPS in an Annex-B access unit with [`add_low_latency_vui`].
+/// Returns `None` when the access unit carries no SPS (the common case), so it can be sent as is.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn patch_annexb(au: &[u8]) -> Option<Vec<u8>> {
+    // (payload start, payload end) of every NAL unit
+    let mut nals = Vec::new();
+    let mut start = None;
+    let mut i = 0;
+    while i + 3 <= au.len() {
+        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+            if let Some(s) = start {
+                let mut e = i;
+                while e > s && au[e - 1] == 0 {
+                    e -= 1; // zero_byte of a 4-byte start code / trailing zeros
+                }
+                nals.push((s, e));
+            }
+            i += 3;
+            start = Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    if let Some(s) = start {
+        nals.push((s, au.len()));
+    }
+    if !nals.iter().any(|&(s, e)| e > s && au[s] & 0x1f == 7) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(au.len() + 16);
+    for (s, e) in nals {
+        let nal = &au[s..e];
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        match add_low_latency_vui(nal) {
+            Some(sps) => out.extend_from_slice(&sps),
+            None => out.extend_from_slice(nal),
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +357,35 @@ mod tests {
         let esc = escape(&raw);
         assert_eq!(esc, vec![0x67, 0, 0, 3, 1, 0, 0, 3, 0, 0, 3, 3, 5]);
         assert_eq!(unescape(&esc), raw);
+    }
+
+    #[test]
+    fn patches_sps_inside_access_unit() {
+        let mut w = Writer { out: vec![], bits: 0 };
+        for v in [0x67, 66, 0xc0, 40] {
+            w.bits(v, 8);
+        }
+        for v in [0, 0, 2, 1] {
+            w.ue(v);
+        }
+        w.bit(0);
+        w.ue(119);
+        w.ue(67);
+        w.bits(0b11001, 5);
+        while !w.bits.is_multiple_of(8) {
+            w.bit(0);
+        }
+        let sps = escape(&w.out);
+        let mut au = vec![0, 0, 0, 1];
+        au.extend_from_slice(&sps);
+        au.extend_from_slice(&[0, 0, 1, 0x68, 0xce, 0x3c, 0x80, 0, 0, 0, 1, 0x65, 0x88, 0x84]);
+        let out = patch_annexb(&au).unwrap();
+        let patched = add_low_latency_vui(&sps).unwrap();
+        let mut want = vec![0, 0, 0, 1];
+        want.extend_from_slice(&patched);
+        want.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, 0, 0, 0, 1, 0x65, 0x88, 0x84]);
+        assert_eq!(out, want);
+        assert!(patch_annexb(&[0, 0, 0, 1, 0x41, 0x9a]).is_none());
     }
 
     #[test]

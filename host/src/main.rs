@@ -1,4 +1,4 @@
-//! Turns an Android tablet (connected over USB) into a secondary macOS display.
+//! Turns an Android tablet (connected over USB) into a secondary display for macOS or Linux.
 //!
 //! Flow: `adb reverse` exposes this host's TCP port inside the tablet, the tablet app
 //! connects and reports its screen size, we create a virtual display of that size,
@@ -7,12 +7,18 @@
 #[cfg(target_os = "macos")]
 mod capture;
 mod gate;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod mac;
 mod protocol;
 mod sps;
 #[cfg(target_os = "macos")]
 mod vt;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[allow(unused_imports)]
+use anyhow::bail;
 use clap::Parser;
 use std::{
     io::{Read, Write},
@@ -24,14 +30,14 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const APP_ACTIVITY: &str = "dev.tabdisplay/.MainActivity";
 
 #[derive(Parser)]
 #[command(about = "Use an Android tablet as a USB secondary display for macOS")]
-struct Args {
+pub struct Args {
     /// TCP port used between host and tablet (via `adb reverse`)
     #[arg(long, default_value_t = 27183)]
     port: u16,
@@ -65,6 +71,22 @@ struct Args {
     /// Do not start the tablet app automatically
     #[arg(long)]
     no_launch: bool,
+    /// Do not run adb at all (the tablet connects some other way, e.g. a test client)
+    #[arg(long, hide = true)]
+    no_adb: bool,
+    /// Linux: stream a GStreamer test pattern instead of a screen (for testing without a desktop)
+    #[arg(long, hide = true)]
+    test_source: bool,
+    /// Linux: H.264 encoder element to use instead of the first available one
+    /// (nvh264enc, vah264lpenc, vah264enc, vaapih264enc, qsvh264enc, x264enc)
+    #[arg(long)]
+    encoder: Option<String>,
+    /// Linux: capture this X11 screen area (X,Y; size = the tablet's) instead of a portal virtual monitor
+    #[arg(long)]
+    x11_region: Option<String>,
+    /// Linux: let the portal pick an existing monitor instead of creating a virtual one
+    #[arg(long)]
+    portal_monitor: bool,
 }
 
 fn even(v: u32) -> u32 {
@@ -117,85 +139,84 @@ fn spawn_adb_watcher(args: &Args, busy: Arc<AtomicBool>) {
     });
 }
 
-/// Owns the virtual display and keeps it alive for a while after the tablet goes away,
-/// so a quick reconnect reuses it and macOS does not shuffle windows back to the main screen.
-#[cfg(target_os = "macos")]
-struct Displays {
-    vd: vdisplay_ffi::VDisplay,
-    current: Option<((u32, u32, u32), u32)>, // (w, h, fps), display id
-    idle_since: Option<Instant>,
+/// What a session needs from the platform's video pipeline while it runs.
+pub trait Control: Send + Sync {
+    /// The tablet took one frame off the wire.
+    fn ack(&self);
+    /// The tablet's decoder restarted: the next frame must be a keyframe.
+    fn request_keyframe(&self);
+    /// The connection is gone; stop producing frames.
+    fn close(&self);
 }
 
-#[cfg(target_os = "macos")]
-impl Displays {
-    fn get(&mut self, args: &Args, w: u32, h: u32, fps: u32) -> Result<u32> {
-        self.idle_since = None;
-        if let Some((mode, id)) = self.current {
-            if mode == (w, h, fps) {
-                println!("reusing the virtual display");
-                return Ok(id);
-            }
-            self.destroy();
-        }
-        let d = self.vd.create_virtual_display(w, h, fps as f64, !args.no_hidpi, "Tablet", args.ppi, false);
-        if d.display_id == 0 {
-            bail!("failed to create the virtual display");
-        }
-        self.current = Some(((w, h, fps), d.display_id));
-        Ok(d.display_id)
-    }
-
-    fn release(&mut self) {
-        self.idle_since = Some(Instant::now());
-    }
-
-    fn expire(&mut self, after: Duration) {
-        if self.idle_since.is_some_and(|t| t.elapsed() >= after) {
-            self.destroy();
-        }
-    }
-
-    fn destroy(&mut self) {
-        if self.current.take().is_some() {
-            self.vd.destroy_virtual_display();
-            println!("virtual display removed");
-        }
-        self.idle_since = None;
-    }
+pub struct StreamConfig {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate: u32,
 }
 
-#[cfg(target_os = "macos")]
-fn run_session(mut sock: TcpStream, args: &Args, displays: &mut Displays, running: &AtomicBool) -> Result<()> {
-    use screencapturekit::CVPixelBuffer;
+/// A running capture + encode pipeline; dropping `guard` stops it.
+pub struct Stream {
+    pub control: Arc<dyn Control>,
+    pub guard: Box<dyn std::any::Any>,
+}
 
+/// A platform backend. It owns the virtual display, which outlives single sessions.
+pub trait Host {
+    /// Makes sure a virtual display of this size exists and starts streaming it: every
+    /// encoded access unit goes to `tx` as a `protocol::video_msg`, audio as `audio_msg`
+    /// while `audio_on` is set.
+    fn start(
+        &mut self,
+        args: &Args,
+        cfg: &StreamConfig,
+        audio_on: Arc<AtomicBool>,
+        tx: mpsc::Sender<Vec<u8>>,
+    ) -> Result<Stream>;
+    /// The tablet disconnected; keep the display for now.
+    fn release(&mut self);
+    /// Removes the display once it has been unused for `after`.
+    fn expire(&mut self, after: Duration);
+    fn shutdown(&mut self);
+}
+
+fn run_session(mut sock: TcpStream, args: &Args, host: &mut dyn Host, running: &AtomicBool) -> Result<()> {
     sock.set_nodelay(true)?;
     sock.set_read_timeout(Some(Duration::from_secs(5)))?;
     let hello = protocol::read_hello(&mut sock)?;
     sock.set_read_timeout(None)?;
 
-    let (w, h) = pick_size(args, hello.width, hello.height);
+    let (width, height) = pick_size(args, hello.width, hello.height);
     let tablet_fps = if hello.max_fps == 0 { 60 } else { hello.max_fps };
     let fps = args.fps.unwrap_or(tablet_fps).clamp(30, 120);
     let bitrate = args.bitrate.unwrap_or(if fps > 60 { 40 } else { 25 });
     println!(
-        "tablet screen {}x{} ({} Hz) -> virtual display {w}x{h}@{fps}, {bitrate} Mbit/s",
+        "tablet screen {}x{} ({} Hz) -> virtual display {width}x{height}@{fps}, {bitrate} Mbit/s",
         hello.width, hello.height, hello.max_fps
     );
 
-    let display_id = displays.get(args, w, h, fps)?;
-
     let alive = Arc::new(AtomicBool::new(true));
     let audio_on = Arc::new(AtomicBool::new(false)); // audio is off until the tablet asks
-    let gate = Arc::new(gate::Gate::<CVPixelBuffer>::new());
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    tx.send(protocol::config_msg(w, h, fps)).ok();
+    tx.send(protocol::config_msg(width, height, fps)).ok();
+
+    let cfg = StreamConfig { width, height, fps, bitrate };
+    let stream = match host.start(args, &cfg, audio_on.clone(), tx) {
+        Ok(s) => s,
+        Err(e) => {
+            host.release();
+            return Err(e);
+        }
+    };
 
     // writer: the only thread that writes to the socket
     {
         let mut out = sock.try_clone()?;
         let alive = alive.clone();
-        let gate = gate.clone();
+        let control = stream.control.clone();
         thread::spawn(move || {
+            #[cfg(target_os = "macos")]
             unsafe {
                 libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
             }
@@ -205,23 +226,22 @@ fn run_session(mut sock: TcpStream, args: &Args, displays: &mut Displays, runnin
                 }
             }
             alive.store(false, Ordering::Relaxed);
-            gate.close();
+            control.close();
         });
     }
     // reader: control messages from the tablet
     {
         let mut inp = sock.try_clone()?;
         let alive = alive.clone();
-        let audio_on = audio_on.clone();
-        let gate = gate.clone();
+        let control = stream.control.clone();
         thread::spawn(move || {
             let mut m = [0u8; 2];
             while inp.read_exact(&mut m).is_ok() {
                 match m[0] {
-                    protocol::KIND_ACK => gate.ack(),
+                    protocol::KIND_ACK => control.ack(),
                     protocol::KIND_IDR => {
                         println!("tablet asked for a keyframe");
-                        gate.request_keyframe();
+                        control.request_keyframe();
                     }
                     protocol::KIND_AUDIO => {
                         audio_on.store(m[1] != 0, Ordering::Relaxed);
@@ -231,65 +251,44 @@ fn run_session(mut sock: TcpStream, args: &Args, displays: &mut Displays, runnin
                 }
             }
             alive.store(false, Ordering::Relaxed);
-            gate.close();
+            control.close();
         });
     }
 
-    let started = Instant::now();
-    let encoder = {
-        let tx = tx.clone();
-        let gate = gate.clone();
-        vt::VtEncoder::new(w, h, fps, bitrate, move |au, _| {
-            gate.sent();
-            tx.send(protocol::video_msg(started.elapsed().as_micros() as u64, &au)).ok();
-        })?
-    };
-    // encoder: takes the newest captured frame whenever the tablet can take another one
-    let encode_thread = {
-        let gate = gate.clone();
-        thread::spawn(move || {
-            unsafe {
-                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-            }
-            while let Some(job) = gate.next() {
-                encoder.encode(job.frame.as_ptr(), started.elapsed().as_micros() as u64, job.keyframe);
-            }
-        })
-    };
+    println!("streaming");
+    while alive.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(100));
+    }
 
-    let tx_audio = tx.clone();
-    let capture_gate = gate.clone();
-    let capture = capture::Capture::start(
-        display_id,
-        w,
-        h,
-        fps,
-        move |pixel_buffer| capture_gate.push(pixel_buffer),
-        move |pcm| {
-            if audio_on.load(Ordering::Relaxed) {
-                tx_audio.send(protocol::audio_msg(pcm)).ok();
-            }
-        },
-    );
-
-    let result = capture.map(|capture| {
-        println!("streaming");
-        while alive.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(100));
-        }
-        drop(capture); // no more frames after this
-    });
-
-    gate.close();
-    let _ = encode_thread.join();
+    stream.control.close();
+    drop(stream);
     let _ = sock.shutdown(Shutdown::Both);
-    displays.release();
+    host.release();
     println!("session ended");
-    result
+    Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn serve(args: Args) -> Result<()> {
+fn make_host(args: &Args) -> Result<Box<dyn Host>> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = args;
+        Ok(Box::new(mac::MacHost::new()))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(linux::LinuxHost::new(args)?))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = args;
+        bail!("the host runs on macOS and Linux only");
+    }
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let mut host = make_host(&args)?;
+
     let running = Arc::new(AtomicBool::new(true));
     {
         let running = running.clone();
@@ -300,10 +299,10 @@ fn serve(args: Args) -> Result<()> {
     listener.set_nonblocking(true)?;
 
     let busy = Arc::new(AtomicBool::new(false));
-    spawn_adb_watcher(&args, busy.clone());
+    if !args.no_adb {
+        spawn_adb_watcher(&args, busy.clone());
+    }
     println!("waiting for the tablet (USB debugging on, app installed)...");
-
-    let mut displays = Displays { vd: vdisplay_ffi::VDisplay::new(), current: None, idle_since: None };
     let keep = Duration::from_secs(args.keep_display);
 
     while running.load(Ordering::Relaxed) {
@@ -311,30 +310,18 @@ fn serve(args: Args) -> Result<()> {
             Ok((sock, _)) => {
                 sock.set_nonblocking(false)?;
                 busy.store(true, Ordering::Relaxed);
-                if let Err(e) = run_session(sock, &args, &mut displays, &running) {
+                if let Err(e) = run_session(sock, &args, host.as_mut(), &running) {
                     eprintln!("session error: {e:#}");
-                    displays.release();
                 }
                 busy.store(false, Ordering::Relaxed);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                displays.expire(keep);
+                host.expire(keep);
                 thread::sleep(Duration::from_millis(100));
             }
             Err(e) => return Err(e.into()),
         }
     }
-    displays.destroy();
+    host.shutdown();
     Ok(())
-}
-
-fn main() -> Result<()> {
-    let args = Args::parse();
-    #[cfg(target_os = "macos")]
-    return serve(args);
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = args;
-        bail!("the host only runs on macOS (virtual display + ScreenCaptureKit)");
-    }
 }
