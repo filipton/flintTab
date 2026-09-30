@@ -8,6 +8,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 libc = "0.2"
+md5 = "0.7"
 vdisplay-ffi = { path = "../vdisplay-ffi" }
 
 [target.'cfg(target_os = "macos")'.dependencies]

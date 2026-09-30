@@ -1,0 +1,43 @@
+name: Tablet app
+
+on:
+  push:
+    paths: ["android/**", ".github/workflows/android.yml"]
+  pull_request:
+    paths: ["android/**", ".github/workflows/android.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build
+        working-directory: android
+        run: ./gradlew --no-daemon assembleRelease
+      - run: cp android/app/build/outputs/apk/release/app-release.apk tabdisplay.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tabdisplay-apk
+          path: tabdisplay.apk
+      # The host downloads this when it has no local APK (see ensure_app_installed in
+      # host/src/main.rs). One release per protocol version, so a host never gets an app
+      # that speaks a different protocol.
+      - name: Publish for the host's auto-install
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=$(grep -oP 'const val VERSION = \K[0-9]+' android/app/src/main/kotlin/dev/tabdisplay/Session.kt)
+          tag="apk-v$v"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --prerelease --target "$GITHUB_SHA" \
+            --title "Tablet app (protocol v$v)" --notes "Installed automatically by tabdisplay-host."
+          gh release upload "$tag" tabdisplay.apk --clobber

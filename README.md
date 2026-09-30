@@ -17,16 +17,23 @@ Android app: MediaCodec low-latency decode -> SurfaceView, PCM -> AudioTrack (lo
   `intel-media-va-driver`/Mesa VA) or NVIDIA nvcodec plugins. Debian/Ubuntu:
   `sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-{good,bad,ugly} gstreamer1.0-pipewire adb`
 
-## Build & install the tablet app
+## The tablet app
+The host installs the app over adb when the tablet is plugged in, updates it when it differs
+from the one the host has, and opens it. It uses, in order: `--apk PATH`, `tabdisplay.apk` next
+to the host or in the current folder, a local build in `android/app/build/outputs/apk/`, and
+otherwise the build GitHub Actions publishes for this protocol version (downloaded to the cache
+folder). `--no-install` turns this off.
+
+To build it yourself (needs JDK 17 and the Android SDK, e.g. from Android Studio):
 ```
-cd android && gradle installRelease      # or open android/ in Android Studio
+cd android && ./gradlew assembleRelease
 ```
 
 ## Run
 ```
 cargo run --release -p tabdisplay-host
 ```
-Plug in the tablet: the host detects it, opens the app, creates a virtual display matching the
+Plug in the tablet: the host detects it, installs or updates the app, opens it, creates a virtual display matching the
 tablet's screen and streams it.
 
 - **macOS:** arrange the new display under System Settings > Displays.
@@ -54,7 +61,7 @@ Only system audio is captured; the host mutes nothing on the computer.
 
 The stream runs at the tablet's refresh rate (up to 120 Hz) when its decoder can keep up.
 
-Options: `--fps N --bitrate MBPS --keep-display SECS --max-width 2560 --no-launch --width W --height H`;
+Options: `--fps N --bitrate MBPS --keep-display SECS --max-width 2560 --no-launch --apk PATH --no-install --width W --height H`;
 macOS: `--ppi 220 --no-hidpi --cursor-in-video`; Linux: `--encoder NAME --portal-monitor --x11-region X,Y`.
 
 ## How it keeps latency low

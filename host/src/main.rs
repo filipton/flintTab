@@ -4,6 +4,7 @@
 //! connects and reports its screen size, we create a virtual display of that size,
 //! capture it, encode it to H.264 and stream it back over the same socket.
 
+mod app;
 #[cfg(target_os = "macos")]
 mod capture;
 #[cfg(target_os = "macos")]
@@ -73,6 +74,13 @@ pub struct Args {
     /// Do not start the tablet app automatically
     #[arg(long)]
     no_launch: bool,
+    /// Tablet app to install (default: tabdisplay.apk next to the host or in the current
+    /// folder, a local Gradle build, or else the published build, downloaded)
+    #[arg(long)]
+    apk: Option<std::path::PathBuf>,
+    /// Do not install or update the tablet app
+    #[arg(long)]
+    no_install: bool,
     /// Do not run adb at all (the tablet connects some other way, e.g. a test client)
     #[arg(long, hide = true)]
     no_adb: bool,
@@ -111,11 +119,14 @@ fn pick_size(args: &Args, dev_w: u32, dev_h: u32) -> (u32, u32) {
     (even(w), even(h))
 }
 
-/// Keeps `adb reverse` alive (it is dropped on unplug) and opens the app on connect.
+/// Keeps `adb reverse` alive (it is dropped on unplug), and on connect installs or
+/// updates the app and opens it.
 fn spawn_adb_watcher(args: &Args, busy: Arc<AtomicBool>) {
     let adb = args.adb.clone();
     let port = args.port;
     let launch = !args.no_launch;
+    let install = !args.no_install;
+    let apk = args.apk.clone();
     thread::spawn(move || {
         let mut was_ok = false;
         loop {
@@ -130,6 +141,12 @@ fn spawn_adb_watcher(args: &Args, busy: Arc<AtomicBool>) {
                     .unwrap_or(false);
                 if ok && !was_ok {
                     println!("tablet detected over USB");
+                    if install {
+                        match app::find_apk(apk.as_deref()) {
+                            Some(path) => app::ensure_installed(&adb, &path),
+                            None => eprintln!("no tablet app to install; pass --apk or build android/"),
+                        }
+                    }
                     if launch {
                         let _ = Command::new(&adb)
                             .args(["shell", "am", "start", "-n", APP_ACTIVITY])
@@ -426,7 +443,7 @@ fn main() -> Result<()> {
     if !args.no_adb {
         spawn_adb_watcher(&args, busy.clone());
     }
-    println!("waiting for the tablet (USB debugging on, app installed)...");
+    println!("waiting for the tablet (plug it in with USB debugging on)...");
     let keep = Duration::from_secs(args.keep_display);
 
     while running.load(Ordering::Relaxed) {

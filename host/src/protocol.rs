@@ -31,7 +31,10 @@ pub const VERSION: u8 = 2;
 pub const MSG_CONFIG: u8 = 1;
 pub const MSG_VIDEO: u8 = 2;
 pub const MSG_AUDIO: u8 = 3;
+// The cursor is sent separately only on macOS; Linux keeps it in the video.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const MSG_CURSOR: u8 = 4;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const MSG_CURSOR_IMAGE: u8 = 5;
 
 pub const KIND_AUDIO: u8 = 1;
@@ -105,12 +108,14 @@ pub fn video_msg(pts_us: u64, au: &[u8]) -> Vec<u8> {
     frame(MSG_VIDEO, &[&pts_us.to_be_bytes(), au])
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn cursor_msg(x: f64, y: f64, visible: bool) -> Vec<u8> {
     let n = |v: f64| ((v.clamp(0.0, 1.0) * 65535.0).round() as u16).to_be_bytes();
     frame(MSG_CURSOR, &[&n(x), &n(y), &[visible as u8]])
 }
 
 /// Sizes are in display points; `png` is the cursor picture at any resolution.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn cursor_image_msg(display_width_pt: u16, size: (u16, u16), hotspot: (u16, u16), png: &[u8]) -> Vec<u8> {
     let mut head = Vec::with_capacity(10);
     for v in [display_width_pt, size.0, size.1, hotspot.0, hotspot.1] {
