@@ -73,6 +73,8 @@ class MainActivity : Activity() {
 
         val root = FrameLayout(this)
         root.addView(surfaceView)
+        val cursor = CursorOverlay(this)
+        root.addView(cursor)
         root.addView(status)
         root.addView(
             panel,
@@ -96,8 +98,8 @@ class MainActivity : Activity() {
             touchSlop = ViewConfiguration.get(this).scaledTouchSlop.toFloat(),
         )
         surfaceView.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ -> touch.setViewSize(v.width, v.height) }
-        surfaceView.setOnTouchListener { _, e -> touch.onTouch(e) }
-        surfaceView.setOnGenericMotionListener { _, e -> touch.onHover(e) }
+        surfaceView.setOnTouchListener { _, e -> cursor.onPen(e); touch.onTouch(e) }
+        surfaceView.setOnGenericMotionListener { _, e -> cursor.onPen(e); touch.onHover(e) }
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(h: SurfaceHolder) {}
             override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {}
