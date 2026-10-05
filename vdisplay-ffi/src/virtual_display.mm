@@ -87,8 +87,9 @@ void VDisplay::InitializeDescriptor(NSString *displayName, unsigned int width,
                                     unsigned int height, int ppi) {
   _descriptor = [[CGVirtualDisplayDescriptor alloc] init];
   _descriptor.name = displayName;
-  _descriptor.maxPixelsWide = width;
-  _descriptor.maxPixelsHigh = height;
+  // Room for the scaled Retina modes (up to twice the panel).
+  _descriptor.maxPixelsWide = width * 2;
+  _descriptor.maxPixelsHigh = height * 2;
 
   double ratio = 25.4 / ppi;
   _descriptor.sizeInMillimeters = CGSizeMake(width * ratio, height * ratio);
@@ -111,13 +112,29 @@ void VDisplay::InitializeSettings(unsigned int width, unsigned int height,
                                            height:height
                                       refreshRate:refreshRate];
   if (hiDPI) {
+    // Scaled Retina modes, like a MacBook's "looks like" sizes: drawn at twice the size and
+    // scaled down to the panel by the capture, so text stays sharp at any UI size (a plain
+    // low-resolution mode would be stretched up instead, and blurry).
+    NSMutableArray<CGVirtualDisplayMode *> *modes = [NSMutableArray arrayWithObject:mode];
+    [mode release];
+    static const unsigned int looksLike[] = {1280, 1440, 1600, 1920, 2048};
+    for (unsigned int lw : looksLike) {
+      if (lw <= width / 2 || lw >= width) continue;
+      unsigned int lh = (unsigned int)((double)lw * height / width / 2 + 0.5) * 2;
+      CGVirtualDisplayMode *scaled =
+          [[CGVirtualDisplayMode alloc] initWithWidth:lw * 2
+                                               height:lh * 2
+                                          refreshRate:refreshRate];
+      [modes addObject:scaled];
+      [scaled release];
+    }
     CGVirtualDisplayMode *lowResMode =
         [[CGVirtualDisplayMode alloc] initWithWidth:width / 2
                                              height:height / 2
                                         refreshRate:refreshRate];
-    _settings.modes = @[ mode, lowResMode ];
-    [mode release];
+    [modes addObject:lowResMode];
     [lowResMode release];
+    _settings.modes = modes;
   } else {
     _settings.modes = @[ mode ];
     [mode release];
