@@ -9,24 +9,30 @@ Linux: portal virtual monitor (PipeWire) or X11 region -> GStreamer (NV12)
 Android app: pixels / MediaCodec -> native NV12 front buffer, timed against the panel's scan
 ```
 
-## Requirements
-- Tablet: USB debugging on, authorize the computer, Android 11+ (minSdk 30)
-- Mac (Apple silicon): `brew install android-platform-tools`, Screen Recording permission for your terminal
-- Linux (glibc 2.35+: Ubuntu 22.04, Debian 12, Fedora 36 or newer): `adb` and the GStreamer
-  runtime with the PipeWire plugin; for GPU encoding the VA plugin with your GPU's VA driver, or
-  NVIDIA's nvcodec. Debian/Ubuntu:
-  `sudo apt install adb gstreamer1.0-plugins-{base,good,bad,ugly} gstreamer1.0-pipewire`.
-  Raw USB needs access to the tablet's USB device; the host prints the udev rule to add if it
-  has none (until then it uses adb, which is slower).
+## Get it
+One file per computer, with the tablet app built in. Nothing else to install: if `adb` is
+missing, it downloads Android's platform-tools by itself (or prints the command to install it).
+Download from the [`latest` release](https://github.com/filipton/macos-usb-display/releases/tag/latest)
+(the repository is private: be logged in, or use `gh release download latest -R filipton/macos-usb-display`):
 
-## Get the host
-Ready-made builds (no Rust or development packages needed) are on the `host-latest` release:
+- **macOS (Apple silicon):** `tabdisplay-macos-arm64`
+- **Linux (x86-64; Debian 12, Ubuntu 23.04, Fedora 37 or newer):** `tabdisplay-linux-x86_64`.
+  It carries its own GStreamer; it uses the desktop's PipeWire and your GPU's video driver
+  (VA-API or NVIDIA) for hardware encoding, else encodes on the CPU. The first start unpacks
+  it into `~/.cache/tabdisplay` (a few seconds).
+
 ```
-gh release download host-latest -R filipton/macos-usb-display -p 'tabdisplay-host-linux-x86_64.tar.gz'   # or -linux-aarch64, -macos-arm64
-tar xzf tabdisplay-host-*.tar.gz && ./tabdisplay-host
+chmod +x tabdisplay-*
+xattr -d com.apple.quarantine tabdisplay-macos-arm64   # macOS, if downloaded with a browser
+./tabdisplay-macos-arm64                                # or ./tabdisplay-linux-x86_64
 ```
-Or build it: `cargo run --release -p tabdisplay-host` (Linux also needs
-`libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`).
+
+On the tablet: USB debugging on (Android 11+), allow the computer when asked. On macOS, allow
+Screen Recording for your terminal when asked. On Linux, raw USB needs access to the tablet's
+USB device: if it is missing, the host prints the udev rule to add (until then it uses adb).
+
+To build it yourself: `cargo run --release -p tabdisplay-host` (Linux also needs
+`libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev` and the GStreamer plugins).
 
 ## The tablet app
 The host installs the app over adb when the tablet is plugged in, updates it when it differs
@@ -42,7 +48,7 @@ cd android && ./gradlew assembleRelease
 ```
 
 ## Run
-Start `tabdisplay-host` and plug in the tablet: the host detects it, installs or updates the app, opens it, creates a virtual display matching the
+Start it and plug in the tablet: the host detects it, installs or updates the app, opens it, creates a virtual display matching the
 tablet's screen and streams it.
 
 - **macOS:** arrange the new display under System Settings > Displays.

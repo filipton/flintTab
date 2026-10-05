@@ -1,5 +1,5 @@
 [workspace]
-members = ["host", "vdisplay-ffi"]
+members = ["host", "launcher", "vdisplay-ffi"]
 # Built for Android by the app's Gradle build (cargo ndk), not for this computer.
 exclude = ["android/native"]
 resolver = "3"

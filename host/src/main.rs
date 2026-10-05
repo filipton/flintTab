@@ -73,7 +73,8 @@ pub struct Args {
     /// Disable HiDPI (macOS UI becomes very small on a dense tablet screen)
     #[arg(long)]
     no_hidpi: bool,
-    /// Path of the adb binary
+    /// Path of the adb binary (default: the one on PATH, else Android's platform-tools,
+    /// downloaded once into the cache folder)
     #[arg(long, default_value = "adb")]
     adb: String,
     /// adb serial of the tablet (see `adb devices`). Default: the first real device (an emulator only by serial)
@@ -552,8 +553,11 @@ fn make_host(args: &Args) -> Result<Box<dyn Host>> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
     let mut host = make_host(&args)?;
+    if !args.no_adb {
+        args.adb = app::find_adb(&args.adb);
+    }
 
     let running = Arc::new(AtomicBool::new(true));
     {

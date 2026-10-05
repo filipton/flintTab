@@ -11,6 +11,8 @@ libc = "0.2"
 md5 = "0.7"
 lz4_flex = { version = "0.11", default-features = false }
 rusb = { version = "0.9", features = ["vendored"] }
+ureq = "3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 vdisplay-ffi = { path = "../vdisplay-ffi" }
 
 [target.'cfg(target_os = "macos")'.dependencies]

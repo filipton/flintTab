@@ -70,6 +70,19 @@ pub struct LinuxHost {
 impl LinuxHost {
     pub fn new(args: &Args) -> Result<Self> {
         gst::init().context("GStreamer is not installed")?;
+        // Started by the release launcher with its bundled libraries on the search path: the
+        // loader already has it (for GStreamer's plugins too), and programs we run (adb, ...)
+        // should get the system's.
+        if let Some(orig) = std::env::var_os("TD_ORIG_LD_LIBRARY_PATH") {
+            unsafe {
+                if orig.is_empty() {
+                    std::env::remove_var("LD_LIBRARY_PATH");
+                } else {
+                    std::env::set_var("LD_LIBRARY_PATH", orig);
+                }
+                std::env::remove_var("TD_ORIG_LD_LIBRARY_PATH");
+            }
+        }
         let x11_region = match &args.x11_region {
             Some(s) => {
                 let v: Vec<u32> = s.split(',').map(|p| p.trim().parse()).collect::<Result<_, _>>()?;

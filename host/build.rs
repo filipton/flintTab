@@ -4,6 +4,7 @@ use std::process::Command;
 // dependency's build script never reach our binary, so add them here (works from any directory,
 // unlike a .cargo/config.toml).
 fn main() {
+    embed_apk();
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
@@ -18,5 +19,19 @@ fn main() {
         ] {
             println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{lib}");
         }
+    }
+}
+
+/// Release builds carry the tablet app (TABDISPLAY_APK=path), so the host is one file; others
+/// find it on disk or download it (src/app.rs).
+fn embed_apk() {
+    println!("cargo:rerun-if-env-changed=TABDISPLAY_APK");
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("embedded.apk");
+    match std::env::var("TABDISPLAY_APK") {
+        Ok(apk) => {
+            println!("cargo:rerun-if-changed={apk}");
+            std::fs::copy(&apk, &out).expect("TABDISPLAY_APK: cannot read the APK");
+        }
+        Err(_) => std::fs::write(&out, b"").unwrap(),
     }
 }

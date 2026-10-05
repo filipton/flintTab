@@ -1,0 +1,134 @@
+name: Release
+
+# One file per platform, the tablet app built in: download, run, nothing to install.
+on:
+  push:
+    branches: [main]
+    paths: ["host/**", "launcher/**", "vdisplay-ffi/**", "android/**", "tools/**", "Cargo.toml", "Cargo.lock", ".github/workflows/release.yml"]
+  pull_request:
+    paths: ["host/**", "launcher/**", "vdisplay-ffi/**", "android/**", "tools/**", "Cargo.toml", "Cargo.lock", ".github/workflows/release.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - run: cargo install cargo-ndk --locked
+      - run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - working-directory: android
+        run: ./gradlew --no-daemon assembleRelease
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: android/app/build/outputs/apk/release/app-release.apk
+
+  macos:
+    needs: apk
+    # ScreenCaptureKit's bindings use the macOS 26 SDK (Xcode 26).
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk
+      - run: cargo test --release -p tabdisplay-host
+      - run: TABDISPLAY_APK=$PWD/app-release.apk cargo build --release -p tabdisplay-host
+      - run: cp target/release/tabdisplay-host tabdisplay-macos-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tabdisplay-macos-arm64
+          path: tabdisplay-macos-arm64
+
+  linux:
+    needs: apk
+    runs-on: ubuntu-latest
+    # The oldest system it runs on (glibc, GStreamer): Debian 12; Ubuntu 23.04+, Fedora 37+ too.
+    container: debian:bookworm
+    steps:
+      - name: Build tools and the GStreamer to bundle
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git build-essential pkg-config zstd python3 \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-pipewire gstreamer1.0-x gstreamer1.0-pulseaudio
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk
+      - run: cargo test --release -p tabdisplay-host
+      - run: TABDISPLAY_APK=$PWD/app-release.apk cargo build --release -p tabdisplay-host
+      - run: tools/bundle-linux.sh target/release/tabdisplay-host payload.tar.zst
+      - run: TD_PAYLOAD=$PWD/payload.tar.zst cargo build --release -p tabdisplay-launcher
+      - run: cp target/release/tabdisplay tabdisplay-linux-x86_64
+      - name: Smoke test (test pattern, stand-in tablet)
+        run: |
+          ./tabdisplay-linux-x86_64 --no-adb --test-source --fps 60 > host.log 2>&1 &
+          sleep 5
+          W=1280 H=800 TILES=1 timeout 20 python3 tools/fake_tablet.py | tee fake.log
+          kill -INT %1 || true
+          cat host.log
+          grep -q "all unpacked" fake.log && grep -q "keyframes_at=\[" fake.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tabdisplay-linux-x86_64
+          path: tabdisplay-linux-x86_64
+
+  # The finished file on clean systems without GStreamer: it must bring everything it needs.
+  other-distros:
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["archlinux:latest", "ubuntu:24.04", "fedora:latest"]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    steps:
+      - name: Python for the stand-in tablet
+        run: |
+          if command -v pacman; then pacman -Sy --noconfirm python
+          elif command -v dnf; then dnf install -y python3
+          else apt-get update && apt-get install -y python3; fi
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tabdisplay-linux-x86_64
+      - run: |
+          chmod +x tabdisplay-linux-x86_64
+          ./tabdisplay-linux-x86_64 --no-adb --test-source --fps 60 > host.log 2>&1 &
+          sleep 5
+          W=1280 H=800 TILES=1 timeout 20 python3 tools/fake_tablet.py | tee fake.log
+          kill -INT %1 || true
+          cat host.log
+          grep -q "all unpacked" fake.log && grep -q "keyframes_at=\[" fake.log
+
+  publish:
+    needs: [macos, linux, other-distros]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tabdisplay-*
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          chmod +x tabdisplay-*
+          gh release view latest >/dev/null 2>&1 || gh release create latest --prerelease --target "$GITHUB_SHA" \
+            --title "TabDisplay (latest)" --notes "Built from main. Download the file for your computer and run it; see the README."
+          gh release upload latest tabdisplay-macos-arm64 tabdisplay-linux-x86_64 --clobber

@@ -1,0 +1,13 @@
+[package]
+name = "tabdisplay-launcher"
+version = "0.1.0"
+edition = "2024"
+description = "The Linux release: one file carrying the host and the GStreamer it needs"
+
+[[bin]]
+name = "tabdisplay"
+path = "src/main.rs"
+
+[dependencies]
+ruzstd = "0.8"
+tar = "0.4"
