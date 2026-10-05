@@ -259,7 +259,8 @@ impl LinuxHost {
 /// Properties an element does not have (they vary between GStreamer versions) are skipped.
 fn encoders(cfg: &StreamConfig) -> Vec<(&'static str, &'static str, Vec<(&'static str, String)>)> {
     let kbps = (cfg.bitrate * 1000).to_string();
-    let gop = (cfg.fps * 20).to_string();
+    // A keyframe every ~10 s when nothing asks for one; 1024 is the most VA's encoders take.
+    let gop = (cfg.fps * 10).min(1024).to_string();
     // coded picture buffer of ~2 frames: frame sizes stay even, no bursts on the wire
     let cpb_kbit = (cfg.bitrate * 1000 * 2 / cfg.fps).to_string();
     let cpu = "videoconvert n-threads=4 ! video/x-raw,format=NV12";
@@ -340,10 +341,29 @@ fn encoders(cfg: &StreamConfig) -> Vec<(&'static str, &'static str, Vec<(&'stati
 /// versions, so anything this element does not understand is skipped with a note.
 fn set_if_supported(el: &gst::Element, name: &str, value: &str) {
     let Some(pspec) = el.find_property(name) else { return };
+    // Out of range panics in set_property: check first (ranges differ between encoders).
     match gst::glib::Value::deserialize(value, pspec.value_type()) {
-        Ok(v) => el.set_property(name, v),
-        Err(_) => eprintln!("note: {} does not accept {name}={value}", el.name()),
+        Ok(v) if in_range(&pspec, &v) => el.set_property(name, v),
+        _ => eprintln!("note: {} does not accept {name}={value}", el.name()),
     }
+}
+
+/// Whether an integer property's value is within the element's range.
+fn in_range(pspec: &gst::glib::ParamSpec, v: &gst::glib::Value) -> bool {
+    use gst::glib::{ParamSpecInt, ParamSpecInt64, ParamSpecUInt, ParamSpecUInt64};
+    if let Some(p) = pspec.downcast_ref::<ParamSpecUInt>() {
+        return v.get::<u32>().is_ok_and(|x| (p.minimum()..=p.maximum()).contains(&x));
+    }
+    if let Some(p) = pspec.downcast_ref::<ParamSpecInt>() {
+        return v.get::<i32>().is_ok_and(|x| (p.minimum()..=p.maximum()).contains(&x));
+    }
+    if let Some(p) = pspec.downcast_ref::<ParamSpecUInt64>() {
+        return v.get::<u64>().is_ok_and(|x| (p.minimum()..=p.maximum()).contains(&x));
+    }
+    if let Some(p) = pspec.downcast_ref::<ParamSpecInt64>() {
+        return v.get::<i64>().is_ok_and(|x| (p.minimum()..=p.maximum()).contains(&x));
+    }
+    true
 }
 
 /// A captured frame: a GStreamer buffer of NV12 pixels.
@@ -786,5 +806,21 @@ impl Input for X11Input {
             let _ = self.conn.xtest_fake_input(BUTTON_RELEASE_EVENT, b, 0, self.root, 0, 0, 0);
         }
         let _ = self.conn.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gstreamer::prelude::*;
+
+    /// Values outside an element's range are skipped, not a panic (VA's key-int-max tops out at 1024).
+    #[test]
+    fn out_of_range_property_is_skipped() {
+        gstreamer::init().unwrap();
+        let Ok(enc) = gstreamer::ElementFactory::make("x264enc").build() else { return };
+        super::set_if_supported(&enc, "qp-max", "1000"); // range 0-63
+        super::set_if_supported(&enc, "key-int-max", "1800");
+        assert_eq!(enc.property::<u32>("key-int-max"), 1800);
+        assert_ne!(enc.property::<u32>("qp-max"), 1000);
     }
 }
