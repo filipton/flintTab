@@ -46,14 +46,17 @@ class HostCursor(private val view: SurfaceView) {
     }
 
     /** MSG_CURSOR_IMAGE payload. Called on the network thread. */
-    @Synchronized
     fun setImage(msg: ByteArray) {
         val img = parseImage(msg) ?: return
-        displayWidthPt = img.displayWidthPt
-        sizePt = img.sizePt
-        hotPt = img.hotPt
-        image = img.bitmap
-        note("image ${msg.size - 10} B -> ${image?.width}x${image?.height}, pt $displayWidthPt ${sizePt.toList()}")
+        setImage(img.bitmap, img.displayWidthPt, img.sizePt, img.hotPt)
+    }
+
+    @Synchronized
+    fun setImage(bitmap: Bitmap?, displayWidthPt: Int, sizePt: IntArray, hotPt: IntArray) {
+        this.displayWidthPt = displayWidthPt
+        this.sizePt = sizePt
+        this.hotPt = hotPt
+        image = bitmap
         releaseLayer() // rebuilt at the new size on the next move
         if (visible) move(lastX, lastY, true)
     }
@@ -103,7 +106,7 @@ class HostCursor(private val view: SurfaceView) {
         } finally {
             surface.release()
         }
-        SurfaceControl.Transaction().setLayer(sc, 1).apply()
+        SurfaceControl.Transaction().setLayer(sc, 2).apply() // above the screen layer
         layer = sc
         parent = p
         note("layer ${w}x$h")

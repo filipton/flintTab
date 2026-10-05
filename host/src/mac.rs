@@ -112,7 +112,8 @@ impl Host for MacHost {
     ) -> Result<Stream> {
         let StreamConfig { width: w, height: h, fps, bitrate, .. } = *cfg;
         let timing = cfg.timing.clone();
-        let use_tiles = cfg.tiles;
+        // Debugging: TD_TILES=none sends everything through H.264.
+        let use_tiles = cfg.tiles && std::env::var("TD_TILES").map_or(true, |v| v != "none");
         let display_id = self.display(args, w, h, fps)?;
         let gate = Arc::new(Gate::<Frame>::new());
 
@@ -148,6 +149,10 @@ impl Host for MacHost {
                 // Areas last sent through H.264 since the idle repeats last ran: only those need
                 // re-sharpening (tiles are exact), and none at all after pure typing.
                 let mut lossy: Option<[f64; 4]> = None;
+                // Tiles went out since the last H.264 frame: the encoder's reference no longer
+                // matches the screen, and a P-frame copying "unchanged" blocks from it would
+                // put stale pictures (old text, old bar positions) on the tablet.
+                let mut stale_reference = false;
                 let mut repeats = 0;
                 unsafe {
                     libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
@@ -177,6 +182,7 @@ impl Host for MacHost {
                         let now = timing.now();
                         if let Some(msgs) = use_tiles.then(|| crate::tiles::build_all(&f.buf, &rects, now)).flatten() {
                             gate.sent_batch(msgs.len());
+                            stale_reference = true;
                             for (i, msg) in msgs.into_iter().enumerate() {
                                 let pts = now + i as u64;
                                 timing.encode_started(pts, f.composited, Some(f.delivered), false);
@@ -193,7 +199,8 @@ impl Host for MacHost {
                     submitted.store(now, Ordering::Relaxed);
                     timing.encode_started(now, f.composited, Some(f.delivered), job.repeat);
                     *sending.lock().unwrap() = rect.map_or(protocol::ALL, |r| normalize(r, w, h));
-                    encoder.encode(f.buf.as_ptr(), now, job.keyframe);
+                    let keyframe = job.keyframe || std::mem::take(&mut stale_reference);
+                    encoder.encode(f.buf.as_ptr(), now, keyframe);
                 }
             })
         };

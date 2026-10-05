@@ -31,6 +31,24 @@ class MainActivity : Activity() {
     private val hidePanel = Runnable { panel.visibility = View.GONE }
     @Volatile private var refreshHz = 60
 
+    /** Experiment (variant F): redraw the (transparent) window every frame while streaming. */
+    private var keepAwake = false
+    @Volatile private var streaming = false
+    private val keepAlive by lazy {
+        object : View(this) {
+            private val paint = android.graphics.Paint()
+            private var tick = false
+            override fun onDraw(c: android.graphics.Canvas) {
+                if (!keepAwake || !streaming) return
+                // One pixel at alpha 0 or 1/255: invisible, but a new frame with full damage.
+                tick = !tick
+                paint.color = if (tick) 0x01000000 else 0
+                c.drawRect(0f, 0f, 1f, 1f, paint)
+                postInvalidateOnAnimation()
+            }
+        }
+    }
+
     /**
      * The panel's modes change at runtime (battery saver, motion smoothness: the host lifts
      * those caps after the app may already be open), so pick again whenever the display changes.
@@ -67,6 +85,17 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         refreshHz = pickFastestDisplayMode()
+        if (intent.getBooleanExtra("yuvprobe", false)) { // PROBE
+            val HB = android.hardware.HardwareBuffer::class.java
+            for ((name, usage) in listOf(
+                "overlay+cpu" to (android.hardware.HardwareBuffer.USAGE_COMPOSER_OVERLAY or android.hardware.HardwareBuffer.USAGE_CPU_WRITE_RARELY),
+                "overlay+cpu+gpu" to (android.hardware.HardwareBuffer.USAGE_COMPOSER_OVERLAY or android.hardware.HardwareBuffer.USAGE_CPU_WRITE_RARELY or android.hardware.HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE),
+            )) {
+                val ok = android.hardware.HardwareBuffer.isSupported(2304, 1440, android.hardware.HardwareBuffer.YCBCR_420_888, 1, usage)
+                android.util.Log.i("tabdisplay", "yuv probe $name supported=$ok ${HB.simpleName}")
+                if (ok) android.hardware.HardwareBuffer.create(2304, 1440, android.hardware.HardwareBuffer.YCBCR_420_888, 1, usage).use { Native.probeYuv(it) }
+            }
+        }
         getSystemService(android.hardware.display.DisplayManager::class.java)
             .registerDisplayListener(displayListener, android.os.Handler(mainLooper))
 
@@ -105,6 +134,8 @@ class MainActivity : Activity() {
         // On by default where the hardware allows it: skips the compositor's queue (~17 ms at
         // 90 Hz) at the cost of possible tearing. Switching rebuilds the activity.
         val frontSupported = FrontRenderer.supported()
+        // For measuring: `am start ... --ez front false` sets the switch.
+        if (intent.hasExtra("front")) prefs.edit().putBoolean("front", intent.getBooleanExtra("front", true)).commit()
         latencySwitch = Switch(this).apply {
             text = "Lowest latency (may tear)  "
             setTextColor(Color.WHITE)
@@ -128,6 +159,7 @@ class MainActivity : Activity() {
 
         val root = FrameLayout(this)
         root.addView(surfaceView)
+        root.addView(keepAlive)
         val cursor = CursorOverlay(this)
         root.addView(cursor)
         root.addView(status)
@@ -147,8 +179,20 @@ class MainActivity : Activity() {
             val changed = { pts: Long -> session?.takeChangedArea(pts) }
             val shown = { pts: Long, nanos: Long -> session?.frameShown(pts, nanos); Unit }
             // The CPU writes into the scanned-out buffer where the hardware allows it; else the GPU does.
-            front = if (CpuFront.supported()) CpuRenderer(surfaceView, changed, shown) else FrontRenderer(surfaceView, changed, shown)
-            android.util.Log.i("tabdisplay", "renderer: ${front!!::class.simpleName}")
+            // Experiment: `--ei variant` 1 = CPU, 2 = CPU with a GPU-allocated buffer, 3 = GL.
+            val variant = intent.getIntExtra("variant", 0)
+            CpuFront.gpuUsage = variant == 2
+            CpuFront.singleBuffer = variant in 1..6
+            CpuFront.noFrontFlag = variant == 4 || variant == 8
+            CpuFront.noDamage = variant == 5 || variant == 6
+            keepAwake = variant == 6
+            front = when {
+                variant == 3 -> FrontRenderer(surfaceView, changed, shown)
+                variant in 1..8 && CpuFront.supported() -> CpuRenderer(surfaceView, changed, shown).also { it.useFrontBuffer = true }
+                SwapChain.supported() -> CpuRenderer(surfaceView, changed, shown)
+                else -> null // the plain video path
+            }
+            android.util.Log.i("tabdisplay", "renderer: ${front?.let { it::class.simpleName } ?: "video"}")
             // Debugging: `adb shell am broadcast -a dev.tabdisplay.DUMP` saves what the panel shows.
             registerReceiver(object : android.content.BroadcastReceiver() {
                 override fun onReceive(c: android.content.Context, i: android.content.Intent) {
@@ -229,7 +273,13 @@ class MainActivity : Activity() {
                     .setPackage(packageName), android.app.PendingIntent.FLAG_IMMUTABLE)
                 getSystemService(android.hardware.usb.UsbManager::class.java).requestPermission(acc, pi)
             },
-            onState = { connected -> runOnUiThread { status.visibility = if (connected) View.GONE else View.VISIBLE } },
+            onState = { connected ->
+                runOnUiThread {
+                    status.visibility = if (connected) View.GONE else View.VISIBLE
+                    streaming = connected
+                    keepAlive.invalidate()
+                }
+            },
             onCursor = front?.let { it::moveCursor } ?: hostCursor::move,
             onCursorImage = front?.let { f -> { msg: ByteArray -> HostCursor.parseImage(msg)?.let { f.setCursorImage(it.bitmap, it.displayWidthPt, it.sizePt, it.hotPt) } } }
                 ?: hostCursor::setImage,

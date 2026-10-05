@@ -2,6 +2,7 @@
 
 mod front;
 mod neon;
+mod yuv;
 
 use jni_sys::{JNIEnv, jbyteArray, jclass, jint, jlong, jobject};
 
@@ -132,5 +133,143 @@ pub unsafe extern "system" fn Java_dev_tabdisplay_Native_frontDump(env: *mut JNI
     let p = direct(env, out) as *mut u32;
     if !p.is_null() {
         f.dump(unsafe { std::slice::from_raw_parts_mut(p, f.vw * f.vh) });
+    }
+}
+
+/// Shows everything written since the last call, timed against the panel's scan.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_frontPresent(_env: *mut JNIEnv, _c: jclass, h: jlong) -> jni_sys::jboolean {
+    let f = unsafe { &mut *(h as *mut front::Front) };
+    f.present_pending() as jni_sys::jboolean
+}
+
+/// The panel's scan timing: a vsync (System.nanoTime clock) and the refresh period, both ns.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_frontVsync(_env: *mut JNIEnv, _c: jclass, h: jlong, vsync: jlong, period: jlong) {
+    let f = unsafe { &mut *(h as *mut front::Front) };
+    f.set_vsync(vsync, period);
+}
+
+/// Copies what the panel scans out (the front buffer itself), in view orientation (debugging).
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_frontDumpScanout(env: *mut JNIEnv, _c: jclass, h: jlong, out: jobject) -> jni_sys::jboolean {
+    let f = unsafe { &*(h as *const front::Front) };
+    let p = direct(env, out) as *mut u32;
+    if p.is_null() {
+        return 0;
+    }
+    f.dump_front(unsafe { std::slice::from_raw_parts_mut(p, f.vw * f.vh) }) as jni_sys::jboolean
+}
+
+/// A frame was shown (for the smoothness log).
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_frontCountFrame(_env: *mut JNIEnv, _c: jclass, h: jlong) {
+    let f = unsafe { &mut *(h as *mut front::Front) };
+    f.count_frame();
+}
+
+/// Adds the second front buffer the layer flips to every refresh.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_frontAddTwin(env: *mut JNIEnv, _c: jclass, h: jlong, hb: jobject) -> jni_sys::jboolean {
+    let f = unsafe { &mut *(h as *mut front::Front) };
+    unsafe { f.add_twin(env, hb) as jni_sys::jboolean }
+}
+
+/// Adds a swap-chain buffer; returns its index (-1 on failure).
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_frontAddChainBuffer(env: *mut JNIEnv, _c: jclass, h: jlong, hb: jobject) -> jint {
+    let f = unsafe { &mut *(h as *mut front::Front) };
+    unsafe { f.add_chain_buffer(env, hb) }
+}
+
+/// Brings swap-chain buffer `i` up to date (it must not be on screen).
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_frontRenderChain(_env: *mut JNIEnv, _c: jclass, h: jlong, i: jint) -> jni_sys::jboolean {
+    let f = unsafe { &mut *(h as *mut front::Front) };
+    f.render_chain(i.max(0) as usize) as jni_sys::jboolean
+}
+
+/// Debugging: how a YUV HardwareBuffer is laid out for CPU writes (logged).
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_probeYuv(env: *mut JNIEnv, _c: jclass, hb: jobject) {
+    unsafe {
+        let b = front::AHardwareBuffer_fromHardwareBuffer(env, hb);
+        let mut d = front::Desc::default();
+        front::AHardwareBuffer_describe(b, &mut d);
+        let mut planes: front::Planes = std::mem::zeroed();
+        let st = front::AHardwareBuffer_lockPlanes(b, 2 << 4, -1, std::ptr::null(), &mut planes);
+        let p = &planes.planes;
+        front::log(&format!(
+            "yuv probe: {}x{} format {:#x} usage {:#x} stride {} | lock {} planes {} | y {:p} px {} row {} | cb {:p} px {} row {} | cr {:p} px {} row {}",
+            d.width, d.height, d.format, d.usage, d.stride, st, planes.count,
+            p[0].data, p[0].pixel_stride, p[0].row_stride, p[1].data, p[1].pixel_stride, p[1].row_stride, p[2].data, p[2].pixel_stride, p[2].row_stride
+        ));
+        if st == 0 {
+            front::AHardwareBuffer_unlock(b, std::ptr::null_mut());
+        }
+    }
+}
+
+/// An NV12 screen of `w` x `h` (landscape) pixels; returns its handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvCreate(_env: *mut JNIEnv, _c: jclass, w: jint, h: jint) -> jlong {
+    Box::into_raw(Box::new(yuv::Screen::new(w.max(2) as usize & !1, h.max(2) as usize & !1))) as jlong
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvRelease(_env: *mut JNIEnv, _c: jclass, h: jlong) {
+    if h != 0 {
+        unsafe { drop(Box::from_raw(h as *mut yuv::Screen)) };
+    }
+}
+
+/// Adds a swap-chain buffer (NV12/NV21 HardwareBuffer of the screen's size); returns its index.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvAddBuffer(env: *mut JNIEnv, _c: jclass, h: jlong, hb: jobject) -> jint {
+    let s = unsafe { &mut *(h as *mut yuv::Screen) };
+    unsafe { s.add_buffer(env, hb) }
+}
+
+/// Copies screen rectangle [x0, x1) x [y0, y1) from a YUV 4:2:0 picture in direct buffers
+/// (pixel (0, 0) of which is screen pixel (ox, oy)).
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvUpdate(
+    env: *mut JNIEnv, _c: jclass, h: jlong,
+    y: jobject, y_stride: jint, u: jobject, v: jobject, uv_stride: jint, uv_step: jint,
+    ox: jint, oy: jint, x0: jint, y0: jint, x1: jint, y1: jint,
+) {
+    let s = unsafe { &mut *(h as *mut yuv::Screen) };
+    let src = front::Yuv {
+        y: direct(env, y),
+        y_stride: y_stride as usize,
+        u: direct(env, u),
+        v: direct(env, v),
+        uv_stride: uv_stride as usize,
+        uv_step: uv_step as usize,
+        ox: ox as usize,
+        oy: oy as usize,
+    };
+    if src.y.is_null() || src.u.is_null() || src.v.is_null() {
+        return;
+    }
+    let c = |v: jint| v.max(0) as usize;
+    s.update(&src, front::Rect { x0: c(x0), y0: c(y0), x1: c(x1), y1: c(y1) });
+}
+
+/// Brings swap-chain buffer `i` (not on screen) up to date.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvRender(_env: *mut JNIEnv, _c: jclass, h: jlong, i: jint) -> jni_sys::jboolean {
+    let s = unsafe { &mut *(h as *mut yuv::Screen) };
+    s.render(i.max(0) as usize) as jni_sys::jboolean
+}
+
+/// The picture as RGBA into the direct buffer `out` (debugging).
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvDump(env: *mut JNIEnv, _c: jclass, h: jlong, out: jobject) {
+    let s = unsafe { &*(h as *const yuv::Screen) };
+    let p = direct(env, out) as *mut u32;
+    let (w, hh) = s.size();
+    if !p.is_null() {
+        s.dump(unsafe { std::slice::from_raw_parts_mut(p, w * hh) });
     }
 }

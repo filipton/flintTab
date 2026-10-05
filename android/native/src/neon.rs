@@ -56,8 +56,11 @@ pub fn scalar(y: u8, u: u8, v: u8) -> u32 {
 #[inline(always)]
 pub unsafe fn r90_4x4(src: *const u32, vw: usize, dst: *mut u32, stride: usize, bw: usize, x0: usize, x1: usize, y0: usize, y1: usize) {
     unsafe {
-        let mut y = y0;
-        while y < y1 {
+        // Rows from the bottom up: buffer columns then ascend, so each buffer row is written
+        // front to back (write-combined memory merges ascending stores best).
+        let mut y = y1;
+        while y > y0 {
+            y -= 4;
             let mut x = x0;
             while x < x1 {
                 let s = src.add(y * vw + x);
@@ -81,7 +84,6 @@ pub unsafe fn r90_4x4(src: *const u32, vw: usize, dst: *mut u32, stride: usize, 
                 vst1q_u32(dst.add((x + 3) * stride + bx), rev(c3));
                 x += 4;
             }
-            y += 4;
         }
     }
 }

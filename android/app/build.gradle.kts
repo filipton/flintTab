@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "dev.tabdisplay"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "dev.tabdisplay"

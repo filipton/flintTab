@@ -402,10 +402,9 @@ fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBoo
 
     let (width, height) = pick_size(args, hello.width, hello.height);
     let tablet_fps = if hello.max_fps == 0 { 60 } else { hello.max_fps };
-    // A tablet that takes tiles draws straight into its scanned-out buffer, whatever its own
-    // refresh rate: then the virtual display runs at 120 Hz, so a change waits at most 8 ms
-    // for the Mac to composite it instead of 11-17 ms.
-    let fps = args.fps.unwrap_or(if hello.tiles { tablet_fps.max(120) } else { tablet_fps }).clamp(30, 120);
+    // The panel's own rate: one Mac frame per panel refresh. A faster virtual display composites
+    // changes sooner, but frames then land 1 or 2 to a refresh and motion stutters.
+    let fps = args.fps.unwrap_or(tablet_fps).clamp(30, 120);
     let bitrate = args.bitrate.unwrap_or(if fps > 60 { 40 } else { 25 });
     println!(
         "tablet screen {}x{} ({} Hz) -> virtual display {width}x{height}@{fps}, {bitrate} Mbit/s",

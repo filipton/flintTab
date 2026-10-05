@@ -162,7 +162,9 @@ pub const MAX_BYTES: usize = 192 * 1024;
 /// this frame instead: too large an area, or too many bytes in total.
 pub fn build_all(buf: &CVPixelBuffer, rects: &[Rect], pts: u64) -> Option<Vec<Vec<u8>>> {
     let (fw, fh) = (buf.width() as f64, buf.height() as f64);
-    if rects.iter().map(|r| size(*r)).sum::<f64>() > MAX_AREA * fw * fh {
+    // Debugging: TD_TILES=all sends every change as tiles.
+    let all = std::env::var("TD_TILES").is_ok_and(|v| v == "all");
+    if !all && rects.iter().map(|r| size(*r)).sum::<f64>() > MAX_AREA * fw * fh {
         return None;
     }
     let mut out = Vec::with_capacity(rects.len());
@@ -170,7 +172,7 @@ pub fn build_all(buf: &CVPixelBuffer, rects: &[Rect], pts: u64) -> Option<Vec<Ve
     for (i, r) in rects.iter().enumerate() {
         let m = build(buf, *r, pts + i as u64)?;
         bytes += m.len();
-        if bytes > MAX_BYTES {
+        if !all && bytes > MAX_BYTES {
             return None;
         }
         out.push(m);
