@@ -71,6 +71,9 @@ pub struct Args {
     /// Path of the adb binary
     #[arg(long, default_value = "adb")]
     adb: String,
+    /// adb serial of the tablet (see `adb devices`). Default: the first real device, emulators skipped
+    #[arg(long, short = 's')]
+    serial: Option<String>,
     /// Do not start the tablet app automatically
     #[arg(long)]
     no_launch: bool,
@@ -119,43 +122,71 @@ fn pick_size(args: &Args, dev_w: u32, dev_h: u32) -> (u32, u32) {
     (even(w), even(h))
 }
 
+/// The device to talk to: `wanted` if it is attached, else the first real device
+/// (emulators skipped), else the only device.
+fn pick_device(adb: &str, wanted: Option<&str>) -> Option<String> {
+    let out = Command::new(adb).arg("devices").stderr(Stdio::null()).output().ok()?;
+    let ready: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let serial = it.next()?;
+            (it.next() == Some("device")).then(|| serial.to_owned())
+        })
+        .collect();
+    match wanted {
+        Some(w) => ready.into_iter().find(|s| s == w),
+        None => match ready.iter().find(|s| !s.starts_with("emulator-")) {
+            Some(s) => Some(s.clone()),
+            None if ready.len() == 1 => ready.into_iter().next(),
+            None => None,
+        },
+    }
+}
+
 /// Keeps `adb reverse` alive (it is dropped on unplug), and on connect installs or
 /// updates the app and opens it.
 fn spawn_adb_watcher(args: &Args, busy: Arc<AtomicBool>) {
     let adb = args.adb.clone();
+    let wanted = args.serial.clone();
     let port = args.port;
     let launch = !args.no_launch;
     let install = !args.no_install;
     let apk = args.apk.clone();
     thread::spawn(move || {
-        let mut was_ok = false;
+        let mut connected: Option<String> = None;
         loop {
             if !busy.load(Ordering::Relaxed) {
                 let spec = format!("tcp:{port}");
-                let ok = Command::new(&adb)
-                    .args(["reverse", &spec, &spec])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if ok && !was_ok {
-                    println!("tablet detected over USB");
+                let device = pick_device(&adb, wanted.as_deref()).filter(|serial| {
+                    Command::new(&adb)
+                        .args(["-s", serial, "reverse", &spec, &spec])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false)
+                });
+                if let Some(serial) = device.as_deref()
+                    && connected.as_deref() != Some(serial)
+                {
+                    println!("tablet detected over USB ({serial})");
                     if install {
                         match app::find_apk(apk.as_deref()) {
-                            Some(path) => app::ensure_installed(&adb, &path),
+                            Some(path) => app::ensure_installed(&adb, serial, &path),
                             None => eprintln!("no tablet app to install; pass --apk or build android/"),
                         }
                     }
                     if launch {
                         let _ = Command::new(&adb)
-                            .args(["shell", "am", "start", "-n", APP_ACTIVITY])
+                            .args(["-s", serial, "shell", "am", "start", "-n", APP_ACTIVITY])
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
                             .status();
                     }
                 }
-                was_ok = ok;
+                connected = device;
             }
             thread::sleep(Duration::from_secs(2));
         }

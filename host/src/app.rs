@@ -86,21 +86,21 @@ fn download() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-fn adb_output(adb: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(adb).args(args).stderr(Stdio::null()).output().ok()?;
+fn adb_output(adb: &str, serial: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(adb).args(["-s", serial]).args(args).stderr(Stdio::null()).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Installs `apk` unless the tablet already has exactly this build.
-pub fn ensure_installed(adb: &str, apk: &Path) {
+pub fn ensure_installed(adb: &str, serial: &str, apk: &Path) {
     let Ok(bytes) = std::fs::read(apk) else {
         eprintln!("cannot read {}", apk.display());
         return;
     };
     let want = format!("{:x}", md5::compute(&bytes));
-    let have = adb_output(adb, &["shell", "pm", "path", PACKAGE])
+    let have = adb_output(adb, serial, &["shell", "pm", "path", PACKAGE])
         .and_then(|o| o.lines().find_map(|l| l.trim().strip_prefix("package:").map(str::to_owned)))
-        .and_then(|path| adb_output(adb, &["shell", "md5sum", &path]))
+        .and_then(|path| adb_output(adb, serial, &["shell", "md5sum", &path]))
         .and_then(|o| o.split_whitespace().next().map(str::to_owned));
     if have.as_deref() == Some(want.as_str()) {
         return;
@@ -111,7 +111,7 @@ pub fn ensure_installed(adb: &str, apk: &Path) {
         apk.display()
     );
     let apk_arg = apk.to_string_lossy();
-    let install = || adb_output(adb, &["install", "-r", "-d", &apk_arg]).is_some();
+    let install = || adb_output(adb, serial, &["install", "-r", "-d", &apk_arg]).is_some();
     if install() {
         println!("tablet app installed");
         return;
@@ -119,11 +119,11 @@ pub fn ensure_installed(adb: &str, apk: &Path) {
     // Usually a build signed with a different key (another computer's debug key).
     if have.is_some() {
         println!("reinstalling the tablet app (signed with a different key)");
-        let _ = adb_output(adb, &["uninstall", PACKAGE]);
+        let _ = adb_output(adb, serial, &["uninstall", PACKAGE]);
         if install() {
             println!("tablet app installed");
             return;
         }
     }
-    eprintln!("installing the tablet app failed; try `{adb} install -r {apk_arg}` to see why");
+    eprintln!("installing the tablet app failed; try `{adb} -s {serial} install -r {apk_arg}` to see why");
 }

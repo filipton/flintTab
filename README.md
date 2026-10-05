@@ -61,7 +61,7 @@ Only system audio is captured; the host mutes nothing on the computer.
 
 The stream runs at the tablet's refresh rate (up to 120 Hz) when its decoder can keep up.
 
-Options: `--fps N --bitrate MBPS --keep-display SECS --max-width 2560 --no-launch --apk PATH --no-install --width W --height H`;
+Options: `--fps N --bitrate MBPS --keep-display SECS --max-width 2560 --serial SERIAL --no-launch --apk PATH --no-install --width W --height H`;
 macOS: `--ppi 220 --no-hidpi --cursor-in-video`; Linux: `--encoder NAME --portal-monitor --x11-region X,Y`.
 
 ## How it keeps latency low
