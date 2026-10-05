@@ -306,7 +306,7 @@ class Session(
                         val d = decoder
                         if (d != null && !needKeyframe) {
                             front?.queueVideo(pts)
-                            val ok = !d.failed && try { d.feed(frameBuf, n, pts); true } catch (_: Exception) { false }
+                            val ok = !d.failed && try { d.feed(frameBuf, n, pts) } catch (_: Exception) { false }
                             frameTimes[pts]?.set(2, nowUs())
                             if (!ok) {
                                 // Decoder died (e.g. a codec error): rebuild it and ask the host for
@@ -584,15 +584,22 @@ private class Decoder(
     }
 
     /** [pts] is the host's timestamp; it only travels through the codec for latency stats. */
-    fun feed(au: ByteArray, size: Int, pts: Long) {
-        while (open && !failed) {
+    /**
+     * False if the decoder took no input for 250 ms (its outputs are all held, or it hung):
+     * the caller rebuilds it rather than blocking the connection's reading thread.
+     */
+    fun feed(au: ByteArray, size: Int, pts: Long): Boolean {
+        val deadline = System.nanoTime() + 250_000_000L
+        while (open && !failed && System.nanoTime() < deadline) {
             val i = freeInputs.poll(10, TimeUnit.MILLISECONDS) ?: continue
             val buf = codec.getInputBuffer(i)!!
             buf.clear()
             buf.put(au, 0, size)
             codec.queueInputBuffer(i, 0, size, pts, 0)
-            return
+            return true
         }
+        if (open && !failed) android.util.Log.i("tabdisplay", "decoder stalled for 250 ms: rebuilding it")
+        return false
     }
 
     fun close() {
