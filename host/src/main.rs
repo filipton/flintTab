@@ -103,6 +103,9 @@ pub struct Args {
     /// Linux: stream a GStreamer test pattern instead of a screen (for testing without a desktop)
     #[arg(long, hide = true)]
     test_source: bool,
+    /// Linux: capture this PipeWire node directly instead of asking the portal (for testing)
+    #[arg(long, hide = true)]
+    pipewire_node: Option<u32>,
     /// macOS: draw the mouse cursor into the video instead of sending it separately
     /// (the separate cursor is drawn by the tablet and moves with much less delay)
     #[arg(long)]

@@ -34,6 +34,9 @@ use crate::{
 enum Source {
     /// Moving test pattern, for testing without a desktop session.
     Test,
+    /// A PipeWire node on the default daemon, without the portal (testing against a compositor's
+    /// own screencast API).
+    Node(u32),
     /// An X11 screen region (e.g. an output added with xrandr or evdi).
     X11 { x: u32, y: u32 },
     /// A PipeWire stream handed out by the ScreenCast portal.
@@ -63,6 +66,7 @@ pub struct LinuxHost {
     idle_since: Option<Instant>,
     encoder: Option<String>,
     test_source: bool,
+    pipewire_node: Option<u32>,
     x11_region: Option<(u32, u32)>,
     portal_monitor: bool,
 }
@@ -99,6 +103,7 @@ impl LinuxHost {
             idle_since: None,
             encoder: args.encoder.clone(),
             test_source: args.test_source,
+            pipewire_node: args.pipewire_node,
             x11_region,
             portal_monitor: args.portal_monitor,
         })
@@ -191,7 +196,7 @@ impl LinuxHost {
 
     fn input(&self, cfg: &StreamConfig) -> Option<Box<dyn Input>> {
         match self.source.as_ref()? {
-            Source::Test => None,
+            Source::Test | Source::Node(_) => None,
             Source::X11 { x, y } => match X11Input::new(*x, *y, cfg.width, cfg.height) {
                 Ok(i) => Some(Box::new(i)),
                 Err(e) => {
@@ -220,6 +225,8 @@ impl LinuxHost {
         if self.source.is_none() {
             self.source = Some(if self.test_source {
                 Source::Test
+            } else if let Some(n) = self.pipewire_node {
+                Source::Node(n)
             } else if let Some((x, y)) = self.x11_region {
                 Source::X11 { x, y }
             } else {
@@ -229,6 +236,9 @@ impl LinuxHost {
         Ok(match self.source.as_ref().unwrap() {
             Source::Test => format!(
                 "videotestsrc is-live=true pattern=ball ! video/x-raw,width={w},height={h},framerate={fps}/1"
+            ),
+            Source::Node(n) => format!(
+                "pipewiresrc path={n} do-timestamp=true ! video/x-raw,max-framerate={fps}/1 ! videoscale ! video/x-raw,width={w},height={h}"
             ),
             Source::X11 { x, y } => format!(
                 "ximagesrc use-damage=false show-pointer=true startx={x} starty={y} endx={} endy={} \
