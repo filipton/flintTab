@@ -16,7 +16,7 @@ use std::{
     os::fd::{AsRawFd, OwnedFd},
     path::PathBuf,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
@@ -69,6 +69,8 @@ pub struct LinuxHost {
     pipewire_node: Option<u32>,
     x11_region: Option<(u32, u32)>,
     portal_monitor: bool,
+    /// The capture failed (e.g. the screencast went away): the next session starts a new one.
+    capture_failed: Arc<AtomicBool>,
 }
 
 impl LinuxHost {
@@ -106,6 +108,7 @@ impl LinuxHost {
             pipewire_node: args.pipewire_node,
             x11_region,
             portal_monitor: args.portal_monitor,
+            capture_failed: Default::default(),
         })
     }
 
@@ -427,7 +430,7 @@ impl Drop for Running {
 
 /// Reports what goes wrong in the capture after it started (it fails quietly otherwise: a black
 /// tablet), and says so when no picture has come at all a few seconds in.
-fn watch_capture(p: &gst::Pipeline, frames: Arc<AtomicUsize>) {
+fn watch_capture(p: &gst::Pipeline, frames: Arc<AtomicUsize>, failed: Arc<AtomicBool>) {
     let bus = p.bus().unwrap();
     let pipeline = p.downgrade();
     let started = Instant::now();
@@ -437,7 +440,10 @@ fn watch_capture(p: &gst::Pipeline, frames: Arc<AtomicUsize>) {
             if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(250)) {
                 let src = msg.src().map(|s| s.name().to_string()).unwrap_or_default();
                 match msg.view() {
-                    gst::MessageView::Error(e) => eprintln!("screen capture failed ({src}): {} ({:?})", e.error(), e.debug()),
+                    gst::MessageView::Error(e) => {
+                        eprintln!("screen capture failed ({src}): {} ({:?})", e.error(), e.debug());
+                        failed.store(true, Ordering::Relaxed);
+                    }
                     gst::MessageView::Warning(w) => eprintln!("screen capture warning ({src}): {}", w.error()),
                     _ => {}
                 }
@@ -501,16 +507,24 @@ fn start_audio(audio_on: Arc<AtomicBool>, tx: mpsc::Sender<Vec<u8>>) -> Result<g
     Ok(p)
 }
 
-/// Frames handed to the encoder and not out of it yet: (pts, changed area), oldest first.
-type Pending = Arc<(Mutex<VecDeque<(u64, [u16; 4])>>, Condvar)>;
+/// Frames inside the encoder: their pts (session µs) and changed area.
+type Pending = Arc<Mutex<std::collections::HashMap<u64, [u16; 4]>>>;
 
-/// A running H.264 encoder fed by the host (appsrc), not by the capture pipeline: the frame
-/// thread decides per frame whether it is encoded at all (small changes go out as tiles).
+/// A running H.264 encoder the host feeds itself (the frame thread decides per frame whether
+/// it is encoded at all: small changes go out as tiles). Frames are pushed through it on the
+/// frame thread, so with an encoder that outputs at once the frame is on its way when the push
+/// returns; one that holds frames back (lookahead, reordering) is drained so it does not.
 struct Encoder {
     pipeline: gst::Pipeline,
-    src: gst_app::AppSrc,
-    enc: gst::Element,
+    src: gst::Pad,
     pending: Pending,
+}
+
+/// The running time of `buf` in `sample`'s segment, in µs: the pts it was pushed with
+/// (encoders may shift pts, x264 by 1000 h, and the segment with it).
+fn running_us(sample: &gst::Sample, buf: &gst::BufferRef) -> Option<u64> {
+    let seg = sample.segment()?.downcast_ref::<gst::ClockTime>()?;
+    Some(seg.to_running_time(buf.pts()?)?.useconds())
 }
 
 impl Encoder {
@@ -530,91 +544,9 @@ impl Encoder {
             if wanted.is_some_and(|e| e != name) || gst::ElementFactory::find(name).is_none() {
                 continue;
             }
-            let desc = format!(
-                "appsrc name=src is-live=true format=time do-timestamp=false \
-                 caps=video/x-raw,format=NV12,width={w},height={h},framerate={fps}/1 \
-                 ! {pre} ! {name} name=enc \
-                 ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au \
-                 ! appsink name=sink sync=false"
-            );
-            let pipeline = match gst::parse::launch(&desc) {
-                Ok(p) => p.downcast::<gst::Pipeline>().unwrap(),
+            match Self::try_start(name, pre, &props, (w, h, fps), frames, tx) {
+                Ok(e) => return Ok((e, name)),
                 Err(e) => {
-                    last_err = anyhow!("{name}: {e}");
-                    continue;
-                }
-            };
-            let enc = pipeline.by_name("enc").unwrap();
-            for (k, v) in &props {
-                set_if_supported(&enc, k, v);
-            }
-            let src = pipeline.by_name("src").unwrap().downcast::<gst_app::AppSrc>().unwrap();
-            let sink = pipeline.by_name("sink").unwrap().downcast::<gst_app::AppSink>().unwrap();
-            let pending: Pending = Default::default();
-            let (probe_tx, probe_rx) = mpsc::sync_channel::<()>(1);
-            let (f, tx, p) = (frames.clone(), tx.clone(), pending.clone());
-            let mut first = true;
-            sink.set_callbacks(
-                gst_app::AppSinkCallbacks::builder()
-                    .new_sample(move |s| {
-                        let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                        let buf = sample.buffer().ok_or(gst::FlowError::Error)?;
-                        let map = buf.map_readable().map_err(|_| gst::FlowError::Error)?;
-                        let next = {
-                            let mut q = p.0.lock().unwrap();
-                            let n = q.pop_front();
-                            p.1.notify_all();
-                            n
-                        };
-                        // The test frame: the encoder works.
-                        let Some((pts, area)) = next else {
-                            let _ = probe_tx.try_send(());
-                            return Ok(gst::FlowSuccess::Ok);
-                        };
-                        let patched = sps::patch_annexb(&map);
-                        if first && patched.is_none() {
-                            return Ok(gst::FlowSuccess::Ok); // wait for the first SPS/IDR
-                        }
-                        first = false;
-                        f.encoded(&tx, pts, area, patched.as_deref().unwrap_or(&map));
-                        Ok(gst::FlowSuccess::Ok)
-                    })
-                    .build(),
-            );
-            // Fed by us, so it may only finish starting once data arrives: the test frame
-            // shows whether it works.
-            let tested = pipeline.set_state(gst::State::Playing).map_err(anyhow::Error::from).and_then(|_| {
-                // One black frame: many encoders only fail once they see data.
-                let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::Nv12, w, h).build()?;
-                let mut b = gst::Buffer::with_size(info.size())?;
-                {
-                    let b = b.get_mut().unwrap();
-                    let mut m = b.map_writable()?;
-                    let luma = (w * h) as usize;
-                    m[..luma].fill(16);
-                    m[luma..].fill(128);
-                    drop(m);
-                    b.set_pts(gst::ClockTime::ZERO);
-                }
-                src.push_buffer(b)?;
-                let bus = pipeline.bus().unwrap();
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while Instant::now() < deadline {
-                    if probe_rx.recv_timeout(Duration::from_millis(50)).is_ok() {
-                        return Ok(());
-                    }
-                    if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error])
-                        && let gst::MessageView::Error(e) = msg.view()
-                    {
-                        bail!("{} ({:?})", e.error(), e.debug());
-                    }
-                }
-                bail!("no output for a test frame")
-            });
-            match tested {
-                Ok(()) => return Ok((Self { pipeline, src, enc, pending }, name)),
-                Err(e) => {
-                    let _ = pipeline.set_state(gst::State::Null);
                     eprintln!("{name} failed: {e:#}");
                     last_err = e.context(name);
                 }
@@ -623,28 +555,156 @@ impl Encoder {
         Err(last_err)
     }
 
-    /// Hands `f` to the encoder as `pts`. Waits while two frames are still inside it, so a
-    /// slow encoder does not queue up latency (the frame thread then picks the newest frame).
+    fn try_start(
+        name: &str,
+        pre: &str,
+        props: &[(&str, String)],
+        (w, h, fps): (u32, u32, u32),
+        frames: &Arc<Frames<GstFrame>>,
+        tx: &mpsc::Sender<Vec<u8>>,
+    ) -> Result<Self> {
+        let bin = gst::parse::bin_from_description(
+            &format!(
+                "{pre} ! {name} name=enc \
+                 ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au \
+                 ! appsink name=sink sync=false"
+            ),
+            true,
+        )?;
+        let enc = bin.by_name("enc").unwrap();
+        for (k, v) in props {
+            set_if_supported(&enc, k, v);
+        }
+        // Debugging: TD_ENC_PROPS="name=value ..." on top (e.g. to make x264 hold frames back
+        // the way some hardware encoders can).
+        for kv in std::env::var("TD_ENC_PROPS").unwrap_or_default().split_whitespace() {
+            if let Some((k, v)) = kv.split_once('=') {
+                set_if_supported(&enc, k, v);
+            }
+        }
+        let pipeline = gst::Pipeline::new();
+        pipeline.add(&bin)?;
+        let sink = bin.by_name("sink").unwrap().downcast::<gst_app::AppSink>().unwrap();
+        let pending: Pending = Default::default();
+        let (probe_tx, probe_rx) = mpsc::sync_channel::<()>(1);
+        let (f, tx, p) = (frames.clone(), tx.clone(), pending.clone());
+        let mut first = true;
+        sink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |s| {
+                    let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let buf = sample.buffer().ok_or(gst::FlowError::Error)?;
+                    let map = buf.map_readable().map_err(|_| gst::FlowError::Error)?;
+                    let pts = running_us(&sample, buf).unwrap_or(0);
+                    let Some(area) = p.lock().unwrap().remove(&pts) else {
+                        // The test frame (pts 0): the encoder works.
+                        if pts == 0 {
+                            let _ = probe_tx.try_send(());
+                        }
+                        return Ok(gst::FlowSuccess::Ok);
+                    };
+                    let patched = sps::patch_annexb(&map);
+                    if first && patched.is_none() {
+                        return Ok(gst::FlowSuccess::Ok); // wait for the first SPS/IDR
+                    }
+                    first = false;
+                    f.encoded(&tx, pts, area, patched.as_deref().unwrap_or(&map));
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+        let src = gst::Pad::builder(gst::PadDirection::Src).name("frames").build();
+        src.link(&bin.static_pad("sink").ok_or_else(|| anyhow!("encoder has no input"))?)?;
+        pipeline.set_state(gst::State::Playing)?;
+        src.set_active(true)?;
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "NV12")
+            .field("width", w as i32)
+            .field("height", h as i32)
+            .field("framerate", gst::Fraction::new(fps as i32, 1))
+            .build();
+        src.push_event(gst::event::StreamStart::new("tabdisplay"));
+        src.push_event(gst::event::Caps::new(&caps));
+        src.push_event(gst::event::Segment::new(&gst::FormattedSegment::<gst::ClockTime>::new()));
+        let encoder = Self { pipeline, src, pending };
+
+        // One black frame: many encoders only fail once they see data.
+        let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::Nv12, w, h).build()?;
+        let mut b = gst::Buffer::with_size(info.size())?;
+        {
+            let b = b.get_mut().unwrap();
+            let mut m = b.map_writable()?;
+            let luma = (w * h) as usize;
+            m[..luma].fill(16);
+            m[luma..].fill(128);
+            drop(m);
+            b.set_pts(gst::ClockTime::ZERO);
+        }
+        let pushed = encoder.src.push(b);
+        encoder.drain();
+        if probe_rx.recv_timeout(Duration::from_secs(3)).is_ok() {
+            watch_errors(&encoder.pipeline, "encoder");
+            return Ok(encoder);
+        }
+        let bus = encoder.pipeline.bus().unwrap();
+        let why = bus
+            .pop_filtered(&[gst::MessageType::Error])
+            .and_then(|m| match m.view() {
+                gst::MessageView::Error(e) => Some(format!("{} ({:?})", e.error(), e.debug())),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("no output for a test frame ({pushed:?})"));
+        let _ = encoder.pipeline.set_state(gst::State::Null);
+        bail!(why)
+    }
+
+    /// Has the encoder finish every frame it holds (a drain query: it keeps going after).
+    fn drain(&self) {
+        let mut q = gst::query::Drain::new();
+        self.src.peer_query(&mut q);
+    }
+
+    /// Encodes `f` as `pts`; its output goes out from the sink callback.
     fn encode(&self, f: &Frame<GstFrame>, pts: u64, area: [u16; 4], keyframe: bool) {
         {
-            let (q, cv) = &*self.pending;
-            let mut q = q.lock().unwrap();
-            let deadline = Instant::now() + Duration::from_millis(100);
-            while q.len() >= 2 && Instant::now() < deadline {
-                q = cv.wait_timeout(q, Duration::from_millis(10)).unwrap().0;
-            }
-            if q.len() >= 2 {
-                q.clear(); // the encoder lost frames: start over
-            }
-            q.push_back((pts, area));
+            let mut p = self.pending.lock().unwrap();
+            p.retain(|&t, _| t + 2_000_000 > pts); // frames an encoder dropped
+            p.insert(pts, area);
         }
-        if keyframe && let Some(pad) = self.enc.static_pad("src") {
-            pad.send_event(gstreamer_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build());
+        if keyframe {
+            self.src.push_event(gstreamer_video::DownstreamForceKeyUnitEvent::builder().all_headers(true).build());
         }
         let mut b = f.buf.buf.copy(); // shares the pixels
         b.make_mut().set_pts(gst::ClockTime::from_useconds(pts));
-        let _ = self.src.push_buffer(b);
+        if let Err(e) = self.src.push(b) {
+            static TOLD: AtomicBool = AtomicBool::new(false);
+            if !TOLD.swap(true, Ordering::Relaxed) {
+                eprintln!("encoder refused a frame: {e:?}");
+            }
+        }
+        // Still inside: an encoder that holds frames back. Have it finish them now.
+        if self.pending.lock().unwrap().contains_key(&pts) {
+            self.drain();
+        }
     }
+}
+
+/// Prints what goes wrong in a pipeline after it started (otherwise nobody would see it).
+fn watch_errors(p: &gst::Pipeline, what: &'static str) {
+    let bus = p.bus().unwrap();
+    let pipeline = p.downgrade();
+    std::thread::spawn(move || {
+        while pipeline.upgrade().is_some() {
+            if let Some(msg) = bus.timed_pop_filtered(gst::ClockTime::from_mseconds(250), &[gst::MessageType::Error, gst::MessageType::Warning]) {
+                let src = msg.src().map(|s| s.name().to_string()).unwrap_or_default();
+                match msg.view() {
+                    gst::MessageView::Error(e) => eprintln!("{what} failed ({src}): {} ({:?})", e.error(), e.debug()),
+                    gst::MessageView::Warning(w) => eprintln!("{what} warning ({src}): {}", w.error()),
+                    _ => {}
+                }
+            }
+        }
+    });
 }
 
 impl Host for LinuxHost {
@@ -656,6 +716,10 @@ impl Host for LinuxHost {
         tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<Stream> {
         self.idle_since = None;
+        if self.capture_failed.swap(false, Ordering::Relaxed) {
+            println!("starting a new screencast (the last one failed)");
+            self.shutdown();
+        }
         let StreamConfig { width: w, height: h, .. } = *cfg;
         let timing = cfg.timing.clone();
         // Debugging: TD_TILES=none sends everything through H.264.
@@ -768,7 +832,7 @@ impl Host for LinuxHost {
         };
         let mut running = Running { capture, gate: gate.clone(), frame_thread, others: Vec::new() };
         wait_playing(&running.capture)?;
-        watch_capture(&running.capture, captured.clone());
+        watch_capture(&running.capture, captured.clone(), self.capture_failed.clone());
         match start_audio(audio_on, tx) {
             Ok(a) => running.others.push(a),
             Err(e) => eprintln!("audio unavailable: {e:#}"),
