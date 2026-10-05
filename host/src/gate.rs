@@ -11,7 +11,7 @@
 //!   the final state if that frame was skipped by flow control (scrcpy does the same with
 //!   `KEY_REPEAT_PREVIOUS_FRAME_AFTER`).
 
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 
 use std::{
     sync::{Condvar, Mutex},

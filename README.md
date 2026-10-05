@@ -1,21 +1,32 @@
 # TabDisplay – Android tablet as a USB secondary display for macOS and Linux
 
 ```
-macOS: virtual display -> ScreenCaptureKit (NV12 IOSurface + system audio)
-       -> VideoToolbox H.264 in-process (zero-copy, low-latency rate control)
-Linux: portal virtual monitor (PipeWire) or X11 region -> GStreamer
-       -> VA-API / NVENC / Quick Sync H.264 (x264 fallback)
-                 -> TCP 127.0.0.1:27183 -> adb reverse (USB)
-Android app: MediaCodec low-latency decode -> SurfaceView, PCM -> AudioTrack (low-latency)
+macOS: virtual display -> ScreenCaptureKit (NV12 + system audio)
+Linux: portal virtual monitor (PipeWire) or X11 region -> GStreamer (NV12)
+   -> changed 16x16 blocks: small changes as LZ4 pixels, the rest as H.264
+      (VideoToolbox / VA-API, NVENC, Quick Sync, x264)
+   -> raw USB (Android Open Accessory), adb as fallback
+Android app: pixels / MediaCodec -> native NV12 front buffer, timed against the panel's scan
 ```
 
 ## Requirements
 - Tablet: USB debugging on, authorize the computer, Android 11+ (minSdk 30)
-- Mac: Rust, `brew install android-platform-tools`, Screen Recording permission for your terminal
-- Linux: Rust, `adb`, GStreamer 1.22+ with plugins base/good/bad (and ugly for x264), the
-  PipeWire GStreamer plugin, and for GPU encoding the VA (`gstreamer1.0-plugins-bad` +
-  `intel-media-va-driver`/Mesa VA) or NVIDIA nvcodec plugins. Debian/Ubuntu:
-  `sudo apt install libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-{good,bad,ugly} gstreamer1.0-pipewire adb`
+- Mac (Apple silicon): `brew install android-platform-tools`, Screen Recording permission for your terminal
+- Linux (glibc 2.35+: Ubuntu 22.04, Debian 12, Fedora 36 or newer): `adb` and the GStreamer
+  runtime with the PipeWire plugin; for GPU encoding the VA plugin with your GPU's VA driver, or
+  NVIDIA's nvcodec. Debian/Ubuntu:
+  `sudo apt install adb gstreamer1.0-plugins-{base,good,bad,ugly} gstreamer1.0-pipewire`.
+  Raw USB needs access to the tablet's USB device; the host prints the udev rule to add if it
+  has none (until then it uses adb, which is slower).
+
+## Get the host
+Ready-made builds (no Rust or development packages needed) are on the `host-latest` release:
+```
+gh release download host-latest -R filipton/macos-usb-display -p 'tabdisplay-host-linux-x86_64.tar.gz'   # or -linux-aarch64, -macos-arm64
+tar xzf tabdisplay-host-*.tar.gz && ./tabdisplay-host
+```
+Or build it: `cargo run --release -p tabdisplay-host` (Linux also needs
+`libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev`).
 
 ## The tablet app
 The host installs the app over adb when the tablet is plugged in, updates it when it differs
@@ -31,10 +42,7 @@ cd android && ./gradlew assembleRelease
 ```
 
 ## Run
-```
-cargo run --release -p tabdisplay-host
-```
-Plug in the tablet: the host detects it, installs or updates the app, opens it, creates a virtual display matching the
+Start `tabdisplay-host` and plug in the tablet: the host detects it, installs or updates the app, opens it, creates a virtual display matching the
 tablet's screen and streams it.
 
 - **macOS:** arrange the new display under System Settings > Displays.

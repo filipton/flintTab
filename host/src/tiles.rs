@@ -6,9 +6,15 @@
 //! and the tablet draws them straight away. Bigger changes still go through H.264, which needs
 //! far fewer bytes than the USB link could move in the same time.
 
-use screencapturekit::CVPixelBuffer;
-
 use crate::protocol;
+
+/// Read access to an NV12 frame (plane 0: Y, plane 1: interleaved CbCr at half height).
+pub trait Picture {
+    /// Size in pixels.
+    fn size(&self) -> (usize, usize);
+    /// Row `row` of plane `plane`, at least as wide as the frame.
+    fn row(&self, plane: usize, row: usize) -> Option<&[u8]>;
+}
 
 /// Changed areas kept apart (the menu bar clock and a window far below it are two tiles, not
 /// one box over half the screen); more get merged.
@@ -81,12 +87,8 @@ impl Shadow {
     /// The 16x16 blocks inside `rects` that differ from the last frame (merged into a few
     /// rectangles), remembering this frame's pixels there. `None` if the frame is not NV12;
     /// everything counts as changed on the first frame or after a size change.
-    pub fn changed(&mut self, buf: &CVPixelBuffer, rects: &[Rect]) -> Option<Vec<Rect>> {
-        let lock = buf.lock_read_only().ok()?;
-        if lock.plane_count() != 2 {
-            return None;
-        }
-        let (w, h) = (lock.width_of_plane(0), lock.height_of_plane(0));
+    pub fn changed(&mut self, pic: &impl Picture, rects: &[Rect]) -> Option<Vec<Rect>> {
+        let (w, h) = pic.size();
         let fresh = (w, h) != (self.w, self.h);
         if fresh {
             self.y = vec![0; w * h];
@@ -108,7 +110,7 @@ impl Shadow {
                 // One flag per block column in this block row.
                 let mut diff = vec![fresh; (bx1 - bx0).div_ceil(BLOCK)];
                 for row in by..by + bh {
-                    let src = lock.plane_row(0, row)?;
+                    let src = pic.row(0, row)?;
                     let dst = &mut self.y[row * w..row * w + w];
                     for (i, d) in diff.iter_mut().enumerate() {
                         let x = bx0 + i * BLOCK;
@@ -120,7 +122,7 @@ impl Shadow {
                     }
                 }
                 for row in by / 2..(by + bh) / 2 {
-                    let src = lock.plane_row(1, row)?;
+                    let src = pic.row(1, row)?;
                     let dst = &mut self.uv[row * w..row * w + w];
                     for (i, d) in diff.iter_mut().enumerate() {
                         let x = bx0 + i * BLOCK;
@@ -160,8 +162,9 @@ pub const MAX_BYTES: usize = 192 * 1024;
 
 /// All of `rects` as tiles (pts `pts`, `pts + 1`, ...), or `None` if the codec should take
 /// this frame instead: too large an area, or too many bytes in total.
-pub fn build_all(buf: &CVPixelBuffer, rects: &[Rect], pts: u64) -> Option<Vec<Vec<u8>>> {
-    let (fw, fh) = (buf.width() as f64, buf.height() as f64);
+pub fn build_all(pic: &impl Picture, rects: &[Rect], pts: u64) -> Option<Vec<Vec<u8>>> {
+    let (fw, fh) = pic.size();
+    let (fw, fh) = (fw as f64, fh as f64);
     // Debugging: TD_TILES=all sends every change as tiles.
     let all = std::env::var("TD_TILES").is_ok_and(|v| v == "all");
     if !all && rects.iter().map(|r| size(*r)).sum::<f64>() > MAX_AREA * fw * fh {
@@ -170,7 +173,7 @@ pub fn build_all(buf: &CVPixelBuffer, rects: &[Rect], pts: u64) -> Option<Vec<Ve
     let mut out = Vec::with_capacity(rects.len());
     let mut bytes = 0;
     for (i, r) in rects.iter().enumerate() {
-        let m = build(buf, *r, pts + i as u64)?;
+        let m = build(pic, *r, pts + i as u64)?;
         bytes += m.len();
         if !all && bytes > MAX_BYTES {
             return None;
@@ -182,12 +185,8 @@ pub fn build_all(buf: &CVPixelBuffer, rects: &[Rect], pts: u64) -> Option<Vec<Ve
 
 /// The changed area `r` (x0, y0, x1, y1 in pixels) of an NV12 frame as a MSG_TILE, or `None`
 /// if it compresses too poorly to beat the codec. Widened to even coordinates (4:2:0 chroma).
-pub fn build(buf: &CVPixelBuffer, r: Rect, pts: u64) -> Option<Vec<u8>> {
-    let lock = buf.lock_read_only().ok()?;
-    if lock.plane_count() != 2 {
-        return None;
-    }
-    let (fw, fh) = (lock.width_of_plane(0), lock.height_of_plane(0));
+pub fn build(pic: &impl Picture, r: Rect, pts: u64) -> Option<Vec<u8>> {
+    let (fw, fh) = pic.size();
     let even_down = |v: f64, max: usize| ((v.max(0.0) as usize) & !1).min(max);
     let even_up = |v: f64, max: usize| ((v.ceil().max(0.0) as usize + 1) & !1).min(max);
     let (x0, y0) = (even_down(r[0], fw), even_down(r[1], fh));
@@ -198,13 +197,12 @@ pub fn build(buf: &CVPixelBuffer, r: Rect, pts: u64) -> Option<Vec<u8>> {
     let (w, h) = (x1 - x0, y1 - y0);
     let mut y = Vec::with_capacity(w * h);
     for row in y0..y1 {
-        y.extend_from_slice(&lock.plane_row(0, row)?[x0..x1]);
+        y.extend_from_slice(&pic.row(0, row)?[x0..x1]);
     }
     let mut uv = Vec::with_capacity(w * h / 2);
     for row in y0 / 2..y1 / 2 {
-        uv.extend_from_slice(&lock.plane_row(1, row)?[x0..x1]); // interleaved Cb Cr, 2 bytes per 2 pixels
+        uv.extend_from_slice(&pic.row(1, row)?[x0..x1]); // interleaved Cb Cr, 2 bytes per 2 pixels
     }
-    drop(lock);
     let yc = lz4_flex::block::compress(&y);
     let uvc = lz4_flex::block::compress(&uv);
     if yc.len() + uvc.len() > MAX_BYTES {

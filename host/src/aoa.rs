@@ -40,8 +40,39 @@ pub struct Link {
 
 fn serial_of<T: UsbContext>(dev: &rusb::Device<T>) -> Option<String> {
     let desc = dev.device_descriptor().ok()?;
-    let h = dev.open().ok()?;
+    let h = open_dev(dev)?;
     h.read_serial_number_string_ascii(&desc).ok()
+}
+
+/// An Android device with USB debugging on (it has an adb interface); no need to open it.
+fn has_adb<T: UsbContext>(dev: &rusb::Device<T>) -> bool {
+    dev.active_config_descriptor().is_ok_and(|c| {
+        c.interfaces().any(|i| {
+            i.descriptors().any(|d| (d.class_code(), d.sub_class_code(), d.protocol_code()) == (0xff, 0x42, 0x01))
+        })
+    })
+}
+
+/// Opens a USB device; on Linux without permission, says once how to grant it.
+fn open_dev<T: UsbContext>(dev: &rusb::Device<T>) -> Option<DeviceHandle<T>> {
+    match dev.open() {
+        Ok(h) => Some(h),
+        Err(rusb::Error::Access) => {
+            static TOLD: AtomicBool = AtomicBool::new(false);
+            if cfg!(target_os = "linux") && !TOLD.swap(true, Ordering::Relaxed) {
+                let vendor = dev.device_descriptor().map(|d| format!("{:04x}", d.vendor_id())).unwrap_or_default();
+                eprintln!(
+                    "raw USB: no permission to open the tablet, staying on adb (slower). To allow it:\n  \
+                     echo 'SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"{vendor}\", TAG+=\"uaccess\"\n\
+                     SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"18d1\", ATTR{{idProduct}}==\"2d0?\", TAG+=\"uaccess\"' \\\n    \
+                     | sudo tee /etc/udev/rules.d/70-tabdisplay.rules && sudo udevadm control --reload && sudo udevadm trigger\n  \
+                     then unplug and replug the tablet."
+                );
+            }
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 /// Switches the device with this adb serial to accessory mode (it re-enumerates).
@@ -52,10 +83,10 @@ fn switch(ctx: &Context, serial: &str) -> bool {
         if desc.vendor_id() == GOOGLE && ACCESSORY.contains(&desc.product_id()) {
             continue;
         }
-        if serial_of(&dev).as_deref() != Some(serial) {
+        if !has_adb(&dev) || serial_of(&dev).as_deref() != Some(serial) {
             continue;
         }
-        let Ok(h) = dev.open() else { return false };
+        let Some(h) = open_dev(&dev) else { return false };
         let mut v = [0u8; 2];
         let t = Duration::from_secs(1);
         let in_vendor = rusb::request_type(Direction::In, rusb::RequestType::Vendor, rusb::Recipient::Device);
@@ -117,7 +148,7 @@ pub fn open(serial: &str) -> Option<Link> {
         let (i_, o) = (bulk(Direction::In)?, bulk(Direction::Out)?);
         Some((d.interface_number(), i_.address(), o.address(), o.max_packet_size() as usize))
     })?;
-    let handle = dev.open().ok()?;
+    let handle = open_dev(&dev)?;
     handle.claim_interface(iface).ok()?;
     Some(Link { handle: Arc::new(handle), ep_in, ep_out, max_packet, next: Default::default() })
 }

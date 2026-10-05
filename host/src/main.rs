@@ -10,6 +10,7 @@ mod app;
 mod capture;
 #[cfg(target_os = "macos")]
 mod cursor;
+mod frames;
 mod gate;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -18,7 +19,6 @@ mod mac;
 mod protocol;
 mod sps;
 mod tablet;
-#[cfg(target_os = "macos")]
 mod tiles;
 mod timing;
 #[cfg(target_os = "macos")]

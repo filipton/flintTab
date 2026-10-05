@@ -10,18 +10,25 @@ use ashpd::desktop::{
 };
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_app as gst_app;
+use gstreamer_video::prelude::*;
 use std::{
+    collections::VecDeque,
     os::fd::{AsRawFd, OwnedFd},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
 };
 
-use crate::{Args, Button, Control, Host, Input, Pointer, Stream, StreamConfig, gate::MAX_IN_FLIGHT, protocol, sps};
+use crate::{
+    Args, Button, Host, Input, Pointer, Stream, StreamConfig,
+    frames::{Buffer, Frame, Frames},
+    protocol, sps,
+    tiles::Picture,
+};
 
 /// What gets captured.
 enum Source {
@@ -224,11 +231,9 @@ impl LinuxHost {
                 // GNOME creates the virtual monitor at whatever size and rate we negotiate,
                 // so asking for the tablet's size through videoscale (passthrough when it
                 // matches) sizes it exactly; KDE picks the size in its dialog and then
-                // videoscale really scales. keepalive-time resends the last frame while the
-                // screen is idle, so the encoder keeps sharpening it and a frame skipped by
-                // flow control still lands.
+                // videoscale really scales. PipeWire only sends frames when something changed.
                 format!(
-                    "pipewiresrc fd={raw} path={} do-timestamp=true keepalive-time=100 \
+                    "pipewiresrc fd={raw} path={} do-timestamp=true \
                      ! video/x-raw,max-framerate={fps}/1 ! videoscale ! video/x-raw,width={w},height={h}",
                     p.node
                 )
@@ -328,29 +333,50 @@ fn set_if_supported(el: &gst::Element, name: &str, value: &str) {
     }
 }
 
-/// Flow control + keyframe requests for one running pipeline.
-struct Flow {
-    in_flight: AtomicUsize,
-    sink: gst_app::AppSink,
+/// A captured frame: a GStreamer buffer of NV12 pixels.
+#[derive(Clone)]
+struct GstFrame {
+    buf: gst::Buffer,
+    info: Arc<gstreamer_video::VideoInfo>,
 }
 
-impl Control for Flow {
-    fn ack(&self) {
-        let _ = self.in_flight.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+impl Buffer for GstFrame {
+    type Pic<'a> = GstPic<'a>;
+    fn picture(&self) -> Option<GstPic<'_>> {
+        let f = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(self.buf.as_ref(), &self.info).ok()?;
+        (f.format() == gstreamer_video::VideoFormat::Nv12).then_some(GstPic(f))
     }
-    fn request_keyframe(&self) {
-        let ev = gstreamer_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
-        self.sink.send_event(ev);
-    }
-    fn close(&self) {}
 }
 
-/// Stops the pipelines when the session ends.
-struct Running(Vec<gst::Pipeline>);
+struct GstPic<'a>(gstreamer_video::VideoFrameRef<&'a gst::BufferRef>);
+
+impl Picture for GstPic<'_> {
+    fn size(&self) -> (usize, usize) {
+        (self.0.width() as usize, self.0.height() as usize)
+    }
+    fn row(&self, plane: usize, row: usize) -> Option<&[u8]> {
+        let data = self.0.plane_data(plane as u32).ok()?;
+        let stride = *self.0.plane_stride().get(plane)? as usize;
+        data.get(row * stride..row * stride + self.0.width() as usize)
+    }
+}
+
+/// Stops capture first (no more frames), then the frame thread, then the encoder and audio.
+struct Running {
+    capture: gst::Pipeline,
+    gate: Arc<crate::gate::Gate<Frame<GstFrame>>>,
+    frame_thread: Option<std::thread::JoinHandle<()>>,
+    others: Vec<gst::Pipeline>,
+}
 
 impl Drop for Running {
     fn drop(&mut self) {
-        for p in &self.0 {
+        let _ = self.capture.set_state(gst::State::Null);
+        self.gate.close();
+        if let Some(t) = self.frame_thread.take() {
+            let _ = t.join();
+        }
+        for p in &self.others {
             let _ = p.set_state(gst::State::Null);
         }
     }
@@ -405,6 +431,152 @@ fn start_audio(audio_on: Arc<AtomicBool>, tx: mpsc::Sender<Vec<u8>>) -> Result<g
     Ok(p)
 }
 
+/// Frames handed to the encoder and not out of it yet: (pts, changed area), oldest first.
+type Pending = Arc<(Mutex<VecDeque<(u64, [u16; 4])>>, Condvar)>;
+
+/// A running H.264 encoder fed by the host (appsrc), not by the capture pipeline: the frame
+/// thread decides per frame whether it is encoded at all (small changes go out as tiles).
+struct Encoder {
+    pipeline: gst::Pipeline,
+    src: gst_app::AppSrc,
+    enc: gst::Element,
+    pending: Pending,
+}
+
+impl Encoder {
+    /// The first candidate that starts and encodes a test frame.
+    fn start(
+        wanted: Option<&str>,
+        cfg: &StreamConfig,
+        frames: &Arc<Frames<GstFrame>>,
+        tx: &mpsc::Sender<Vec<u8>>,
+    ) -> Result<(Self, &'static str)> {
+        let mut last_err = match wanted {
+            Some(e) => anyhow!("encoder {e} is not available (see gst-inspect-1.0 {e})"),
+            None => anyhow!("no H.264 encoder found (install gstreamer1.0-plugins-bad and -ugly)"),
+        };
+        let StreamConfig { width: w, height: h, fps, .. } = *cfg;
+        for (name, pre, props) in encoders(cfg) {
+            if wanted.is_some_and(|e| e != name) || gst::ElementFactory::find(name).is_none() {
+                continue;
+            }
+            let desc = format!(
+                "appsrc name=src is-live=true format=time do-timestamp=false \
+                 caps=video/x-raw,format=NV12,width={w},height={h},framerate={fps}/1 \
+                 ! {pre} ! {name} name=enc \
+                 ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au \
+                 ! appsink name=sink sync=false"
+            );
+            let pipeline = match gst::parse::launch(&desc) {
+                Ok(p) => p.downcast::<gst::Pipeline>().unwrap(),
+                Err(e) => {
+                    last_err = anyhow!("{name}: {e}");
+                    continue;
+                }
+            };
+            let enc = pipeline.by_name("enc").unwrap();
+            for (k, v) in &props {
+                set_if_supported(&enc, k, v);
+            }
+            let src = pipeline.by_name("src").unwrap().downcast::<gst_app::AppSrc>().unwrap();
+            let sink = pipeline.by_name("sink").unwrap().downcast::<gst_app::AppSink>().unwrap();
+            let pending: Pending = Default::default();
+            let (probe_tx, probe_rx) = mpsc::sync_channel::<()>(1);
+            let (f, tx, p) = (frames.clone(), tx.clone(), pending.clone());
+            let mut first = true;
+            sink.set_callbacks(
+                gst_app::AppSinkCallbacks::builder()
+                    .new_sample(move |s| {
+                        let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                        let buf = sample.buffer().ok_or(gst::FlowError::Error)?;
+                        let map = buf.map_readable().map_err(|_| gst::FlowError::Error)?;
+                        let next = {
+                            let mut q = p.0.lock().unwrap();
+                            let n = q.pop_front();
+                            p.1.notify_all();
+                            n
+                        };
+                        // The test frame: the encoder works.
+                        let Some((pts, area)) = next else {
+                            let _ = probe_tx.try_send(());
+                            return Ok(gst::FlowSuccess::Ok);
+                        };
+                        let patched = sps::patch_annexb(&map);
+                        if first && patched.is_none() {
+                            return Ok(gst::FlowSuccess::Ok); // wait for the first SPS/IDR
+                        }
+                        first = false;
+                        f.encoded(&tx, pts, area, patched.as_deref().unwrap_or(&map));
+                        Ok(gst::FlowSuccess::Ok)
+                    })
+                    .build(),
+            );
+            // Fed by us, so it may only finish starting once data arrives: the test frame
+            // shows whether it works.
+            let tested = pipeline.set_state(gst::State::Playing).map_err(anyhow::Error::from).and_then(|_| {
+                // One black frame: many encoders only fail once they see data.
+                let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::Nv12, w, h).build()?;
+                let mut b = gst::Buffer::with_size(info.size())?;
+                {
+                    let b = b.get_mut().unwrap();
+                    let mut m = b.map_writable()?;
+                    let luma = (w * h) as usize;
+                    m[..luma].fill(16);
+                    m[luma..].fill(128);
+                    drop(m);
+                    b.set_pts(gst::ClockTime::ZERO);
+                }
+                src.push_buffer(b)?;
+                let bus = pipeline.bus().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    if probe_rx.recv_timeout(Duration::from_millis(50)).is_ok() {
+                        return Ok(());
+                    }
+                    if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error])
+                        && let gst::MessageView::Error(e) = msg.view()
+                    {
+                        bail!("{} ({:?})", e.error(), e.debug());
+                    }
+                }
+                bail!("no output for a test frame")
+            });
+            match tested {
+                Ok(()) => return Ok((Self { pipeline, src, enc, pending }, name)),
+                Err(e) => {
+                    let _ = pipeline.set_state(gst::State::Null);
+                    eprintln!("{name} failed: {e:#}");
+                    last_err = e.context(name);
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Hands `f` to the encoder as `pts`. Waits while two frames are still inside it, so a
+    /// slow encoder does not queue up latency (the frame thread then picks the newest frame).
+    fn encode(&self, f: &Frame<GstFrame>, pts: u64, area: [u16; 4], keyframe: bool) {
+        {
+            let (q, cv) = &*self.pending;
+            let mut q = q.lock().unwrap();
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while q.len() >= 2 && Instant::now() < deadline {
+                q = cv.wait_timeout(q, Duration::from_millis(10)).unwrap().0;
+            }
+            if q.len() >= 2 {
+                q.clear(); // the encoder lost frames: start over
+            }
+            q.push_back((pts, area));
+        }
+        if keyframe && let Some(pad) = self.enc.static_pad("src") {
+            pad.send_event(gstreamer_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build());
+        }
+        let mut b = f.buf.buf.copy(); // shares the pixels
+        b.make_mut().set_pts(gst::ClockTime::from_useconds(pts));
+        let _ = self.src.push_buffer(b);
+    }
+}
+
 impl Host for LinuxHost {
     fn start(
         &mut self,
@@ -414,106 +586,74 @@ impl Host for LinuxHost {
         tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<Stream> {
         self.idle_since = None;
-        let mut last_err = match &self.encoder {
-            Some(e) => anyhow!("encoder {e} is not available (see gst-inspect-1.0 {e})"),
-            None => anyhow!("no H.264 encoder found (install gstreamer1.0-plugins-bad and -ugly)"),
-        };
-        let candidates = encoders(cfg);
-        for (name, pre, props) in candidates {
-            if self.encoder.as_deref().is_some_and(|e| e != name) || gst::ElementFactory::find(name).is_none() {
-                continue;
-            }
-            let src = self.source_desc(cfg)?;
-            let desc = format!(
-                "{src} ! queue name=q leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 \
-                 ! {pre} ! {name} name=enc \
-                 ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au \
-                 ! appsink name=sink sync=false"
-            );
-            let p = match gst::parse::launch(&desc) {
-                Ok(p) => p.downcast::<gst::Pipeline>().unwrap(),
-                Err(e) => {
-                    last_err = anyhow!("{name}: {e}");
-                    continue;
-                }
-            };
-            let enc = p.by_name("enc").unwrap();
-            for (k, v) in &props {
-                set_if_supported(&enc, k, v);
-            }
-            let sink = p.by_name("sink").unwrap().downcast::<gst_app::AppSink>().unwrap();
-            let flow = Arc::new(Flow { in_flight: AtomicUsize::new(0), sink: sink.clone() });
+        let StreamConfig { width: w, height: h, .. } = *cfg;
+        let timing = cfg.timing.clone();
+        // Debugging: TD_TILES=none sends everything through H.264.
+        let use_tiles = cfg.tiles && std::env::var("TD_TILES").map_or(true, |v| v != "none");
+        let frames = Frames::<GstFrame>::new(timing.clone(), w, h);
+        let (encoder, name) = Encoder::start(self.encoder.as_deref(), cfg, &frames, &tx)?;
+        println!("encoding with {name}");
 
-            // Flow control: drop frames before conversion/encoding while the tablet is behind.
-            // P-frames only reference what was actually encoded, so this is always safe.
-            let q_src = p.by_name("q").unwrap().static_pad("src").unwrap();
-            let f = flow.clone();
-            q_src.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-                if f.in_flight.load(Ordering::Relaxed) >= MAX_IN_FLIGHT {
-                    gst::PadProbeReturn::Drop
-                } else {
-                    gst::PadProbeReturn::Ok
-                }
-            });
-
-            let started = cfg.epoch;
-            let f = flow.clone();
-            let tx_video = tx.clone();
-            let first = Arc::new(Mutex::new(true));
+        // Capture: NV12 frames of the tablet's size, the newest one handed to the frame thread.
+        let src = self.source_desc(cfg)?;
+        let capture = gst::parse::launch(&format!(
+            "{src} ! videoconvert n-threads=4 ! video/x-raw,format=NV12,width={w},height={h} \
+             ! appsink name=raw sync=false max-buffers=1 drop=true"
+        ))?
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let sink = capture.by_name("raw").unwrap().downcast::<gst_app::AppSink>().unwrap();
+        {
+            let frames = frames.clone();
+            let mut info: Option<(gst::Caps, Arc<gstreamer_video::VideoInfo>)> = None;
             sink.set_callbacks(
                 gst_app::AppSinkCallbacks::builder()
                     .new_sample(move |s| {
                         let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                        let buf = sample.buffer().ok_or(gst::FlowError::Error)?;
-                        let map = buf.map_readable().map_err(|_| gst::FlowError::Error)?;
-                        let patched = sps::patch_annexb(&map);
-                        let au: &[u8] = patched.as_deref().unwrap_or(&map);
-                        {
-                            let mut first = first.lock().unwrap();
-                            if *first && patched.is_none() {
-                                return Ok(gst::FlowSuccess::Ok); // wait for the first SPS/IDR
-                            }
-                            *first = false;
+                        let caps = sample.caps().ok_or(gst::FlowError::Error)?;
+                        if info.as_ref().is_none_or(|(c, _)| c.as_ref() != caps) {
+                            let i = gstreamer_video::VideoInfo::from_caps(caps).map_err(|_| gst::FlowError::Error)?;
+                            info = Some((caps.to_owned(), Arc::new(i)));
                         }
-                        f.in_flight.fetch_add(1, Ordering::Relaxed);
-                        // Stamp the frame with its capture time: how long ago the source
-                        // timestamped it, per the pipeline clock, back-dated on our session clock.
-                        let now = started.elapsed().as_micros() as u64;
-                        // (pts -> running time through the segment: encoders shift pts, x264 by 1000 h)
+                        let buf = sample.buffer_owned().ok_or(gst::FlowError::Error)?;
+                        // How long ago the source timestamped it, per the pipeline clock.
                         let running = sample
                             .segment()
                             .and_then(|seg| seg.downcast_ref::<gst::ClockTime>())
                             .zip(buf.pts())
                             .and_then(|(seg, pts)| seg.to_running_time(pts));
-                        let age_us = match (s.clock(), s.base_time(), running) {
-                            (Some(c), Some(base), Some(rt)) => c.time().saturating_sub(base).saturating_sub(rt).useconds(),
-                            _ => 0,
+                        let composited = match (s.clock(), s.base_time(), running) {
+                            (Some(c), Some(base), Some(rt)) => {
+                                let age = c.time().saturating_sub(base).saturating_sub(rt);
+                                Some(timing.ago(Duration::from_nanos(age.nseconds())))
+                            }
+                            _ => None,
                         };
-                        tx_video.send(protocol::video_msg(now.saturating_sub(age_us), protocol::ALL, au)).ok();
+                        let info = info.as_ref().unwrap().1.clone();
+                        frames.push(GstFrame { buf, info }, composited, None);
                         Ok(gst::FlowSuccess::Ok)
                     })
                     .build(),
             );
-
-            match wait_playing(&p) {
-                Ok(()) => {
-                    println!("encoding with {name}");
-                    let mut pipelines = vec![p];
-                    match start_audio(audio_on.clone(), tx.clone()) {
-                        Ok(a) => pipelines.push(a),
-                        Err(e) => eprintln!("audio unavailable: {e:#}"),
-                    }
-                    let input = self.input(cfg);
-                    return Ok(Stream { control: flow, input, guard: Box::new(Running(pipelines)) });
-                }
-                Err(e) => {
-                    let _ = p.set_state(gst::State::Null);
-                    eprintln!("{name} failed: {e:#}");
-                    last_err = e.context(name);
-                }
-            }
         }
-        Err(last_err)
+        let gate = frames.gate.clone();
+        let frame_thread = {
+            let frames = frames.clone();
+            let tx = tx.clone();
+            let enc = encoder;
+            Some(std::thread::spawn(move || {
+                frames.run(use_tiles, tx, |f, pts, area, keyframe| enc.encode(f, pts, area, keyframe));
+                let _ = enc.pipeline.set_state(gst::State::Null);
+            }))
+        };
+        let mut running = Running { capture, gate: gate.clone(), frame_thread, others: Vec::new() };
+        wait_playing(&running.capture)?;
+        match start_audio(audio_on, tx) {
+            Ok(a) => running.others.push(a),
+            Err(e) => eprintln!("audio unavailable: {e:#}"),
+        }
+        let input = self.input(cfg);
+        Ok(Stream { control: gate, input, guard: Box::new(running) })
     }
 
     fn release(&mut self) {

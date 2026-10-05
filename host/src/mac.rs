@@ -12,17 +12,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Args, Button, Control, Host, Input, Pointer, Stream, StreamConfig, capture, cursor, gate::Gate, protocol, vt};
+use crate::{
+    Args, Button, Host, Input, Pointer, Stream, StreamConfig, capture, cursor,
+    frames::{Buffer, Frame, Frames},
+    gate::Gate,
+    protocol,
+    tiles::Picture,
+    vt,
+};
+use screencapturekit::cv::CVPixelBufferLockGuard;
 use std::ffi::c_void;
-
-/// A pixel rectangle as 0..=65535 fractions of the frame, rounded outwards.
-fn normalize(r: [f64; 4], w: u32, h: u32) -> [u16; 4] {
-    let n = |v: f64, size: u32, up: bool| {
-        let f = (v / size as f64 * 65535.0).clamp(0.0, 65535.0);
-        (if up { f.ceil() } else { f.floor() }) as u16
-    };
-    [n(r[0], w, false), n(r[1], h, false), n(r[2], w, true), n(r[3], h, true)]
-}
 
 /// Owns the virtual display and keeps it alive for a while after the tablet goes away,
 /// so a quick reconnect reuses it and macOS does not shuffle windows back to the main screen.
@@ -55,23 +54,22 @@ impl MacHost {
     }
 }
 
-/// A captured frame and when it was composited / handed to us (session clock, µs).
-#[derive(Clone)]
-struct Frame {
-    buf: CVPixelBuffer,
-    composited: Option<u64>,
-    delivered: u64,
+impl Buffer for CVPixelBuffer {
+    type Pic<'a> = MacPic<'a>;
+    fn picture(&self) -> Option<MacPic<'_>> {
+        let lock = self.lock_read_only().ok()?;
+        (lock.plane_count() == 2).then_some(MacPic(lock))
+    }
 }
 
-impl Control for Gate<Frame> {
-    fn ack(&self) {
-        Gate::ack(self)
+pub struct MacPic<'a>(CVPixelBufferLockGuard<'a>);
+
+impl Picture for MacPic<'_> {
+    fn size(&self) -> (usize, usize) {
+        (self.0.width_of_plane(0), self.0.height_of_plane(0))
     }
-    fn request_keyframe(&self) {
-        Gate::request_keyframe(self)
-    }
-    fn close(&self) {
-        Gate::close(self)
+    fn row(&self, plane: usize, row: usize) -> Option<&[u8]> {
+        self.0.plane_row(plane, row)
     }
 }
 
@@ -81,7 +79,7 @@ struct Running {
     test_window: Option<std::process::Child>,
     capture: Option<capture::Capture>,
     cursor: Option<cursor::CursorSender>,
-    gate: Arc<Gate<Frame>>,
+    gate: Arc<Gate<Frame<CVPixelBuffer>>>,
     encode_thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -115,93 +113,30 @@ impl Host for MacHost {
         // Debugging: TD_TILES=none sends everything through H.264.
         let use_tiles = cfg.tiles && std::env::var("TD_TILES").map_or(true, |v| v != "none");
         let display_id = self.display(args, w, h, fps)?;
-        let gate = Arc::new(Gate::<Frame>::new());
+        let frames = Frames::<CVPixelBuffer>::new(timing.clone(), w, h);
+        let gate = frames.gate.clone();
 
-        // When the frame being encoded was handed to the encoder; encoding is synchronous,
-        // so the output callback reads it back as the frame's timestamp.
-        let submitted = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        // Area changed since the last encoded frame (pixels: x0, y0, x1, y1), including frames
-        // flow control skipped; and the one sent with the frame being encoded.
-        let changed = Arc::new(std::sync::Mutex::new(Vec::<crate::tiles::Rect>::new()));
-        let sending = Arc::new(std::sync::Mutex::new(protocol::ALL));
+        // The frame being encoded (pts, changed area): encoding is synchronous, so the output
+        // callback reads it back.
+        let sending = Arc::new(std::sync::Mutex::new((0u64, protocol::ALL)));
         let encoder = {
             let tx = tx.clone();
-            let gate = gate.clone();
-            let submitted = submitted.clone();
+            let frames = frames.clone();
             let sending = sending.clone();
-            let timing = timing.clone();
             vt::VtEncoder::new(w, h, fps, bitrate, move |au, _| {
-                gate.sent();
-                let pts = submitted.load(Ordering::Relaxed);
-                timing.encoded(pts, au.len());
-                tx.send(protocol::video_msg(pts, *sending.lock().unwrap(), &au)).ok();
+                let (pts, area) = *sending.lock().unwrap();
+                frames.encoded(&tx, pts, area, &au);
             })?
         };
         // encoder: takes the newest captured frame whenever the tablet can take another one
         let encode_thread = {
-            let gate = gate.clone();
-            let timing = timing.clone();
-            let changed = changed.clone();
+            let frames = frames.clone();
             let tx = tx.clone();
             thread::spawn(move || {
-                let mut first = true;
-                let mut shadow = crate::tiles::Shadow::new();
-                // Areas last sent through H.264 since the idle repeats last ran: only those need
-                // re-sharpening (tiles are exact), and none at all after pure typing.
-                let mut lossy: Option<[f64; 4]> = None;
-                // Tiles went out since the last H.264 frame: the encoder's reference no longer
-                // matches the screen, and a P-frame copying "unchanged" blocks from it would
-                // put stale pictures (old text, old bar positions) on the tablet.
-                let mut stale_reference = false;
-                let mut repeats = 0;
-                unsafe {
-                    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-                }
-                while let Some(job) = gate.next() {
-                    let f = &job.frame;
-                    let reported = std::mem::take(&mut *changed.lock().unwrap());
-                    // What really changed inside what macOS reported (repeats re-send the same frame).
-                    let rects = if job.repeat { reported } else { shadow.changed(&f.buf, &reported).unwrap_or(reported) };
-                    let area = crate::tiles::bounds(&rects);
-                    let full = job.keyframe || first;
-                    let rect = if full {
-                        None
-                    } else if job.repeat {
-                        repeats += 1;
-                        let r = lossy;
-                        if repeats >= crate::gate::MAX_REPEATS {
-                            lossy = None;
-                        }
-                        let Some(r) = r else { continue };
-                        Some(r)
-                    } else {
-                        repeats = 0;
-                        // Nothing changed at all (e.g. only the cursor, which is not in the video).
-                        let Some(a) = area else { continue };
-                        // Small change: the exact pixels, no codec.
-                        let now = timing.now();
-                        if let Some(msgs) = use_tiles.then(|| crate::tiles::build_all(&f.buf, &rects, now)).flatten() {
-                            gate.sent_batch(msgs.len());
-                            stale_reference = true;
-                            for (i, msg) in msgs.into_iter().enumerate() {
-                                let pts = now + i as u64;
-                                timing.encode_started(pts, f.composited, Some(f.delivered), false);
-                                timing.encoded(pts, msg.len());
-                                tx.send(msg).ok();
-                            }
-                            continue;
-                        }
-                        lossy = Some(lossy.map_or(a, |l| [l[0].min(a[0]), l[1].min(a[1]), l[2].max(a[2]), l[3].max(a[3])]));
-                        Some(a)
-                    };
-                    first = false;
-                    let now = timing.now();
-                    submitted.store(now, Ordering::Relaxed);
-                    timing.encode_started(now, f.composited, Some(f.delivered), job.repeat);
-                    *sending.lock().unwrap() = rect.map_or(protocol::ALL, |r| normalize(r, w, h));
-                    let keyframe = job.keyframe || std::mem::take(&mut stale_reference);
-                    encoder.encode(f.buf.as_ptr(), now, keyframe);
-                }
+                frames.run(use_tiles, tx, |f, pts, area, keyframe| {
+                    *sending.lock().unwrap() = (pts, area);
+                    encoder.encode(f.buf.as_ptr(), pts, keyframe);
+                })
             })
         };
         let mut running = Running { test_window: None, capture: None, cursor: None, gate: gate.clone(), encode_thread: Some(encode_thread) };
@@ -210,23 +145,15 @@ impl Host for MacHost {
         if !args.cursor_in_video {
             running.cursor = Some(cursor::CursorSender::start(display_id, tx.clone()));
         }
-        let capture_gate = gate.clone();
         running.capture = Some(capture::Capture::start(
             display_id,
             w,
             h,
             fps,
             args.cursor_in_video,
-            move |buf, age, dirty| {
-                let mut c = changed.lock().unwrap();
-                for r in dirty.unwrap_or_else(|| vec![[0.0, 0.0, w as f64, h as f64]]) {
-                    crate::tiles::add(&mut c, r);
-                }
-                drop(c);
-                let delivered = timing.now();
-                timing.captured();
-                let composited = age.map(|a| timing.ago(a));
-                capture_gate.push(Frame { buf, composited, delivered })
+            {
+                let frames = frames.clone();
+                move |buf, age, dirty| frames.push(buf, age.map(|a| timing.ago(a)), dirty)
             },
             move |pcm| {
                 if audio_on.load(Ordering::Relaxed) {
