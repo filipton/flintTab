@@ -12,6 +12,8 @@ md5 = "0.7"
 vdisplay-ffi = { path = "../vdisplay-ffi" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+lz4_flex = { version = "0.11", default-features = false }
+rusb = { version = "0.9", features = ["vendored"] }
 core-foundation = "0.10"
 objc = "0.2"
 screencapturekit = { version = "1.5.0", features = ["macos_26_0"] }

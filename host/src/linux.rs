@@ -489,7 +489,7 @@ impl Host for LinuxHost {
                             (Some(c), Some(base), Some(rt)) => c.time().saturating_sub(base).saturating_sub(rt).useconds(),
                             _ => 0,
                         };
-                        tx_video.send(protocol::video_msg(now.saturating_sub(age_us), au)).ok();
+                        tx_video.send(protocol::video_msg(now.saturating_sub(age_us), protocol::ALL, au)).ok();
                         Ok(gst::FlowSuccess::Ok)
                     })
                     .build(),

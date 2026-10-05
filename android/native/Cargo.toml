@@ -1,0 +1,19 @@
+[package]
+name = "tabdisplay-native"
+version = "0.1.0"
+edition = "2024"
+
+# Hot paths of the tablet app, called over JNI.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+jni-sys = "0.3"
+lz4_flex = { version = "0.11", default-features = false }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

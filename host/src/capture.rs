@@ -12,7 +12,16 @@ use std::{sync::Mutex, thread, time::Duration};
 
 use crate::protocol::{AUDIO_CHANNELS, AUDIO_RATE};
 
-type VideoSink = Box<dyn FnMut(CVPixelBuffer) + Send>;
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut u32) -> i32;
+}
+
+/// What changed in a frame: rectangles x0, y0, x1, y1 in pixels, or `None` if unknown
+/// (treat as everything).
+pub type Dirty = Option<Vec<[f64; 4]>>;
+
+type VideoSink = Box<dyn FnMut(CVPixelBuffer, Option<Duration>, Dirty) + Send>;
 type AudioSink = Box<dyn FnMut(&[u8]) + Send>;
 
 struct VideoHandler {
@@ -27,8 +36,21 @@ impl SCStreamOutput for VideoHandler {
     fn did_output_sample_buffer(&self, sample: CMSampleBuffer, _t: SCStreamOutputType) {
         // Status-only samples (idle/blank frames) carry no image.
         let Some(pixel_buffer) = sample.image_buffer() else { return };
+        // How long ago the compositor finished this frame (display time is mach absolute time).
+        let age = sample.display_time().map(|shown| {
+            let mut tb = [0u32; 2]; // numer, denom
+            let now = unsafe {
+                mach_timebase_info(tb.as_mut_ptr());
+                mach_absolute_time()
+            };
+            Duration::from_nanos(now.saturating_sub(shown) * tb[0] as u64 / tb[1].max(1) as u64)
+        });
+        // The areas that changed since the previous frame.
+        let dirty = sample.dirty_rects().map(|rects| {
+            rects.iter().filter(|r| r.width > 0.0 && r.height > 0.0).map(|r| [r.x, r.y, r.x + r.width, r.y + r.height]).collect()
+        });
         // Zero-copy: the IOSurface-backed NV12 buffer (retained) goes straight to the encoder.
-        (self.sink.lock().unwrap())(pixel_buffer);
+        (self.sink.lock().unwrap())(pixel_buffer, age, dirty);
     }
 }
 
@@ -84,7 +106,7 @@ impl Capture {
         height: u32,
         fps: u32,
         shows_cursor: bool,
-        video: impl FnMut(CVPixelBuffer) + Send + 'static,
+        video: impl FnMut(CVPixelBuffer, Option<Duration>, Dirty) + Send + 'static,
         audio: impl FnMut(&[u8]) + Send + 'static,
     ) -> Result<Self> {
         // The virtual display needs a moment before ScreenCaptureKit lists it.

@@ -8,12 +8,21 @@ import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.Process
 import android.view.Surface
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.io.Closeable
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
+import android.hardware.usb.UsbManager
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -27,16 +36,29 @@ class Session(
     private val port: Int,
     private val screenW: Int,
     private val screenH: Int,
-    private val maxFps: Int,
+    /** Highest frame rate to ask for; read at every connection (the panel's modes can change). */
+    private val maxFps: () -> Int,
+    /** The panel's highest refresh rate; the video surface asks for it whatever the stream's rate. */
+    private val panelHz: () -> Int,
     private val surfaceProvider: () -> Surface?,
+    /** The surface is a GL texture drawn by [FrontRenderer], which reports when frames are shown. */
+    private val toTexture: Boolean = false,
     private val onState: (connected: Boolean) -> Unit,
     /** The computer's mouse: x, y as 0..65535 across the display, and whether it is on it. */
     private val onCursor: (x: Int, y: Int, visible: Boolean) -> Unit = { _, _, _ -> },
     /** MSG_CURSOR_IMAGE payload. */
     private val onCursorImage: (ByteArray) -> Unit = {},
+    /** Where frames are drawn when [toTexture]: told the stream size, every video frame (before
+     *  it is decoded, to keep the order) and every tile. */
+    private val front: Renderer? = null,
+    /** For the USB accessory link; null: adb's TCP forward only. */
+    private val usb: UsbManager? = null,
+    /** Asks the user once to let the app use the accessory (when not opened through it). */
+    private val askUsbPermission: (android.hardware.usb.UsbAccessory) -> Unit = {},
 ) {
     @Volatile private var running = true
-    @Volatile private var socket: Socket? = null
+    @Volatile private var socket: Closeable? = null
+    private var askedUsb = false
     @Volatile private var out: DataOutputStream? = null
     @Volatile private var audioWanted = false
     @Volatile private var audio: AudioPlayer? = null
@@ -72,6 +94,13 @@ class Session(
         }
     }
 
+    private val ackMsg = byteArrayOf(KIND_ACK.toByte(), 0)
+
+    /** Right from the reading thread: the host holds back frames until the ack is in. */
+    private fun ack(output: DataOutputStream) {
+        synchronized(output) { output.write(ackMsg); output.flush() }
+    }
+
     private fun sendControl(kind: Int, value: Int) {
         if (out != null) outbox.add(byteArrayOf(kind.toByte(), value.toByte()))
     }
@@ -83,13 +112,39 @@ class Session(
             (x shr 8).toByte(), x.toByte(), (y shr 8).toByte(), y.toByte()))
     }
 
-    /** Tells the host a frame is on its way to the screen, so it can print end-to-end latency. */
-    private fun sendShown(pts: Long) {
-        if (out == null) return
-        val b = ByteArray(10)
-        b[0] = KIND_SHOWN.toByte()
-        for (i in 0 until 8) b[2 + i] = (pts shr (56 - 8 * i)).toByte()
+    /**
+     * Per-frame timestamps (µs, this device's clock) for the host's latency breakdown:
+     * recv_start, recv_end, queued, decoded. Keyed by the host's pts.
+     */
+    private val frameTimes = ConcurrentHashMap<Long, LongArray>()
+
+    private fun nowUs() = System.nanoTime() / 1000
+
+    /** Changed area of each frame in flight, by pts: x0, y0, x1, y1 as 0..65535. */
+    private val changedAreas = ConcurrentHashMap<Long, IntArray>()
+
+    /** The area frame [pts] changed (and forgets it); null if unknown. */
+    fun takeChangedArea(pts: Long): IntArray? = changedAreas.remove(pts)
+
+    private fun onDecoded(pts: Long) {
+        frameTimes[pts]?.set(3, nowUs())
+    }
+
+    /** The frame reached the panel: send all its timestamps to the host. */
+    fun frameShown(pts: Long, nanos: Long) {
+        val t = frameTimes.remove(pts) ?: return
+        frameTimes.keys.removeIf { it < pts } // skipped frames never render
+        if (out == null || t[3] == 0L) return
+        val b = ByteArray(2 + 8 * 6)
+        b[0] = KIND_TIMING.toByte()
+        putLong(b, 2, pts)
+        for (i in 0 until 4) putLong(b, 10 + 8 * i, t[i])
+        putLong(b, 42, nanos / 1000)
         outbox.add(b)
+    }
+
+    private fun putLong(b: ByteArray, at: Int, v: Long) {
+        for (i in 0 until 8) b[at + i] = (v shr (56 - 8 * i)).toByte()
     }
 
     /** Two-finger scroll, finger movement in pixels. */
@@ -114,21 +169,64 @@ class Session(
         }
     }
 
-    private fun runOnce(surface: Surface) {
+    /** A link to the host: [Closeable] ends it and unblocks reads. */
+    private class Link(val input: InputStream, val output: OutputStream, val close: Closeable, val via: String)
+
+    /**
+     * The USB accessory when the host switched the tablet to one (raw bulk transfers, ~0.3 ms
+     * round trips instead of adb's ~4 ms), else adb's forward to 127.0.0.1.
+     */
+    private fun connect(): Link {
+        val acc = usb?.accessoryList?.firstOrNull { it.manufacturer == "tabdisplay" }
+        if (acc != null) {
+            if (usb.hasPermission(acc)) {
+                val fd = usb.openAccessory(acc)
+                if (fd != null) {
+                    // The accessory driver hands out at most 16 KB per read.
+                    return Link(FileInputStream(fd.fileDescriptor).buffered(1 shl 14), FileOutputStream(fd.fileDescriptor), fd, "USB accessory")
+                }
+            } else if (!askedUsb) {
+                askedUsb = true
+                askUsbPermission(acc)
+            }
+        }
         val s = Socket()
         s.tcpNoDelay = true
         s.connect(InetSocketAddress("127.0.0.1", port), 1000)
-        socket = s
-        val input = DataInputStream(s.getInputStream().buffered(1 shl 16))
-        val output = DataOutputStream(s.getOutputStream())
+        return Link(s.getInputStream().buffered(1 shl 16), s.getOutputStream(), s, "adb")
+    }
 
-        // handshake: magic, version, screen size, refresh rate
+    private fun newDecoder(surface: Surface, w: Int, h: Int, fps: Int): Decoder {
+        val r = front
+        return if (r != null && r.wantsImages) {
+            Decoder(null, w, h, fps, toTexture, ::onDecoded, ::frameShown) { pts, img, done -> r.frameDecoded(pts, img, done) }
+        } else {
+            Decoder(surface, w, h, fps, toTexture, ::onDecoded, ::frameShown)
+        }
+    }
+
+    private fun runOnce(surface: Surface) {
+        val link = connect()
+        val s = link.close
+        socket = s
+        android.util.Log.i("tabdisplay", "connecting over ${link.via}")
+        val input = DataInputStream(link.input)
+        val output = DataOutputStream(link.output)
+
+        // handshake: magic, version, screen size, refresh rate, features. One write, so over USB
+        // it is one transfer: the host resynchronises on a transfer that starts with the magic.
+        val hello = java.io.ByteArrayOutputStream().also {
+            DataOutputStream(it).apply {
+                write("TDSP".toByteArray())
+                writeByte(VERSION)
+                writeInt(screenW)
+                writeInt(screenH)
+                writeInt(maxFps())
+                writeByte(if (front != null) FEATURE_TILES else 0)
+            }
+        }.toByteArray()
         synchronized(output) {
-            output.write("TDSP".toByteArray())
-            output.writeByte(VERSION)
-            output.writeInt(screenW)
-            output.writeInt(screenH)
-            output.writeInt(maxFps)
+            output.write(hello)
             output.flush()
         }
         outbox.clear() // nothing from an earlier connection
@@ -141,6 +239,7 @@ class Session(
         try {
             while (running) {
                 val kind = input.readUnsignedByte()
+                val arrived = nowUs()
                 val len = input.readInt()
                 when (kind) {
                     MSG_CONFIG -> {
@@ -150,8 +249,9 @@ class Session(
                         audio?.close()
                         config = intArrayOf(w, h, fps)
                         // Let the display switch to a refresh rate that fits the stream.
-                        setStreamFrameRate(surface, fps)
-                        decoder = Decoder(surface, w, h, ::sendShown)
+                        setStreamFrameRate(surface, maxOf(fps, panelHz()))
+                        front?.configure(w, h)
+                        decoder = newDecoder(surface, w, h, fps)
                         needKeyframe = false
                         audio = AudioPlayer(rate, ch).also { it.setEnabled(audioWanted) }
                         // host starts with audio off; tell it what the switch currently says
@@ -160,25 +260,35 @@ class Session(
                     }
                     MSG_VIDEO -> {
                         val pts = input.readLong() // host clock; echoed back once shown, for latency stats
-                        val n = len - 8
+                        // What changed since the previous frame (0..65535 across it): all the
+                        // front renderer has to redraw.
+                        val changed = IntArray(4) { input.readUnsignedShort() }
+                        val n = len - 16
+                        if (changedAreas.size > 256) changedAreas.clear()
+                        changedAreas[pts] = changed
                         if (n > frameBuf.size) frameBuf = ByteArray(n * 2)
                         input.readFully(frameBuf, 0, n)
+                        val received = nowUs()
+                        if (frameTimes.size > 256) frameTimes.clear() // no render callbacks on this device
+                        frameTimes[pts] = longArrayOf(arrived, received, 0, 0)
                         if (needKeyframe && isKeyframe(frameBuf, n)) needKeyframe = false
                         val d = decoder
                         if (d != null && !needKeyframe) {
+                            front?.queueVideo(pts)
                             val ok = !d.failed && try { d.feed(frameBuf, n, pts); true } catch (_: Exception) { false }
+                            frameTimes[pts]?.set(2, nowUs())
                             if (!ok) {
                                 // Decoder died (e.g. a codec error): rebuild it and ask the host for
                                 // a keyframe instead of tearing the whole connection down.
                                 d.close()
                                 val c = config!!
-                                decoder = Decoder(surface, c[0], c[1], ::sendShown)
+                                decoder = newDecoder(surface, c[0], c[1], c[2])
                                 needKeyframe = true
                                 sendControl(KIND_IDR, 0)
                             }
                         }
                         // Flow control: the host keeps at most a couple of frames unacknowledged.
-                        sendControl(KIND_ACK, 0)
+                        ack(output)
                     }
                     MSG_AUDIO -> {
                         val data = ByteArray(len)
@@ -190,6 +300,33 @@ class Session(
                         val visible = input.readUnsignedByte() != 0
                         input.skipBytes(len - 5)
                         onCursor(x, y, visible)
+                    }
+                    MSG_TILE -> {
+                        val pts = input.readLong()
+                        val x = input.readUnsignedShort(); val y = input.readUnsignedShort()
+                        val w = input.readUnsignedShort(); val h = input.readUnsignedShort()
+                        val lumaLen = input.readInt()
+                        val n = len - 20
+                        if (n > frameBuf.size) frameBuf = ByteArray(n * 2)
+                        input.readFully(frameBuf, 0, n)
+                        val received = nowUs()
+                        val luma = Native.buffer(w * h)
+                        val chroma = Native.buffer(w * h / 2)
+                        Native.lz4Into(frameBuf, 0, lumaLen, luma)
+                        Native.lz4Into(frameBuf, lumaLen, n - lumaLen, chroma)
+                        val unpacked = nowUs()
+                        frameTimes[pts] = longArrayOf(arrived, received, unpacked, unpacked)
+                        front?.queueTile(pts, x, y, w, h, luma, chroma)
+                        ack(output)
+                    }
+                    MSG_PING -> {
+                        // Answered right here, not through the outbox, so the round trip stays short.
+                        val b = ByteArray(18)
+                        b[0] = KIND_PONG.toByte()
+                        putLong(b, 2, input.readLong())
+                        putLong(b, 10, arrived)
+                        input.skipBytes(len - 8)
+                        synchronized(output) { output.write(b); output.flush() }
                     }
                     MSG_CURSOR_IMAGE -> {
                         val data = ByteArray(len)
@@ -210,16 +347,20 @@ class Session(
     }
 
     companion object {
-        const val VERSION = 2
+        const val VERSION = 3
         const val MSG_CONFIG = 1
         const val MSG_VIDEO = 2
         const val MSG_AUDIO = 3
         const val MSG_CURSOR = 4
         const val MSG_CURSOR_IMAGE = 5
+        const val MSG_PING = 6
+        const val MSG_TILE = 7
+        const val FEATURE_TILES = 1
         const val KIND_AUDIO = 1
         const val KIND_ACK = 2
         const val KIND_IDR = 3
-        const val KIND_SHOWN = 6
+        const val KIND_TIMING = 6
+        const val KIND_PONG = 7
     }
 }
 
@@ -258,8 +399,17 @@ fun maxDecodableFps(width: Int, height: Int, refreshHz: Int): Int {
     val caps = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
         .filter { !it.isEncoder && it.supportedTypes.contains(MediaFormat.MIMETYPE_VIDEO_AVC) }
         .map { it.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities }
+    // Vendors list performance points only for standard sizes (e.g. 1080p@240, 4K@60), so a
+    // tablet size at 90/120 Hz often matches none even when the decoder has plenty of headroom.
+    // Also accept the same macroblock rate at 1080p.
+    val blocks = ((width + 15) / 16) * ((height + 15) / 16)
+    val fhdBlocks = 120 * 68
     for (fps in listOf(refreshHz, 120, 90, 60).filter { it <= refreshHz }.distinct()) {
-        if (caps.any { it.areSizeAndRateSupported(width, height, fps.toDouble()) }) return fps
+        val fhdFps = Math.ceil(fps.toDouble() * blocks / fhdBlocks)
+        if (caps.any {
+                it.areSizeAndRateSupported(width, height, fps.toDouble()) ||
+                    (it.isSizeSupported(width, height) && it.areSizeAndRateSupported(1920, 1080, fhdFps))
+            }) return fps
     }
     return 60
 }
@@ -279,12 +429,8 @@ private fun pickDecoder(): MediaCodecInfo? {
  * Low-latency MediaFormat options, most aggressive first; the first set the codec accepts is
  * used. Keys and fallbacks follow Moonlight's MediaCodecHelper.setDecoderLowLatencyOptions.
  */
-private fun lowLatencyOptions(info: MediaCodecInfo?): List<Map<String, Int>> {
+private fun lowLatencyOptions(info: MediaCodecInfo?, fps: Int): List<Map<String, Int>> {
     val name = info?.name?.lowercase() ?: ""
-    if (info != null && info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)) {
-        return listOf(mapOf(MediaFormat.KEY_LOW_LATENCY to 1), emptyMap())
-    }
     val qcom = name.startsWith("omx.qcom") || name.startsWith("c2.qti")
     val vendor = when {
         qcom -> mapOf(
@@ -301,77 +447,114 @@ private fun lowLatencyOptions(info: MediaCodecInfo?): List<Map<String, Int>> {
     }
     // MediaTek and Amlogic read this from their modified ACodec.
     val mtk = if (name.contains("mtk") || name.contains("amlogic")) mapOf("vdec-lowlatency" to 1) else emptyMap()
-    // Qualcomm: run the decoder at full clocks. Others: real-time priority.
-    val clocks = if (qcom) mapOf(MediaFormat.KEY_OPERATING_RATE to Short.MAX_VALUE.toInt())
-    else mapOf(MediaFormat.KEY_PRIORITY to 0)
-    val base = mapOf(MediaFormat.KEY_LOW_LATENCY to 1) + clocks
-    return listOf(base + vendor + mtk, base + vendor, base, emptyMap())
+    // Real-time priority, and full clocks: without an operating rate some decoders scale their
+    // clock for ordinary playback and take a large part of a frame interval per frame.
+    val rt = mapOf(MediaFormat.KEY_LOW_LATENCY to 1, MediaFormat.KEY_PRIORITY to 0)
+    val rates = listOf(Short.MAX_VALUE.toInt(), 1000, 480, 240, fps * 2, fps)
+    val sets = rates.map { rt + mapOf(MediaFormat.KEY_OPERATING_RATE to it) + vendor + mtk } +
+        listOf(rt + vendor + mtk, rt + vendor, rt, emptyMap())
+    return sets.distinct()
 }
 
-/** H.264 decoder configured for minimum latency, rendering straight to the surface. */
-private class Decoder(surface: Surface, width: Int, height: Int, private val onShown: (Long) -> Unit) {
+/**
+ * H.264 decoder configured for minimum latency, rendering straight to the surface.
+ * Runs in async mode: the codec hands over each input and output buffer the moment it is
+ * free, so no thread sits in a polling dequeue between a frame's arrival and its display.
+ */
+private class Decoder(
+    surface: Surface?,
+    width: Int,
+    height: Int,
+    fps: Int,
+    private val toTexture: Boolean,
+    private val onDecoded: (pts: Long) -> Unit,
+    private val onRendered: (pts: Long, nanos: Long) -> Unit,
+    /** Without a surface: each decoded frame as an Image, and how to give its buffer back. */
+    private val onImage: ((pts: Long, image: android.media.Image, done: () -> Unit) -> Unit)? = null,
+) {
     private val codec: MediaCodec
     @Volatile private var open = true
-    /** Set when the codec threw on the output side; the owner then rebuilds it. */
+    /** Set when the codec reported an error; the owner then rebuilds it. */
     @Volatile var failed = false
         private set
-    private val drain: Thread
+    private val freeInputs = LinkedBlockingQueue<Int>()
+    private val callbacks = HandlerThread("decoder", Process.THREAD_PRIORITY_URGENT_DISPLAY).apply { start() }
 
     init {
         val info = pickDecoder()
         codec = if (info != null) MediaCodec.createByCodecName(info.name)
         else MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        var configured = false
-        for (opts in lowLatencyOptions(info)) {
+        val handler = Handler(callbacks.looper)
+        val callback = object : MediaCodec.Callback() {
+            override fun onInputBufferAvailable(c: MediaCodec, index: Int) {
+                freeInputs.add(index)
+            }
+
+            override fun onOutputBufferAvailable(c: MediaCodec, index: Int, bi: MediaCodec.BufferInfo) {
+                if (!open) return
+                val pts = bi.presentationTimeUs
+                onDecoded(pts)
+                val sink = onImage
+                if (sink != null) {
+                    // CPU path: the codec's own linear YUV image (a surface would get the
+                    // decoder's tiled/compressed layout, which only the GPU can read).
+                    val img = try { c.getOutputImage(index) } catch (_: Exception) { null }
+                    if (img == null) {
+                        try { c.releaseOutputBuffer(index, false) } catch (_: Exception) {}
+                        return
+                    }
+                    sink(pts, img) {
+                        try { img.close(); c.releaseOutputBuffer(index, false) } catch (_: Exception) {}
+                    }
+                    return
+                }
+                try {
+                    // Show at the next vsync; if a newer frame targets the same vsync, the
+                    // compositor drops this one (Moonlight's min-latency mode).
+                    if (toTexture) c.releaseOutputBuffer(index, true)
+                    else c.releaseOutputBuffer(index, System.nanoTime())
+                } catch (_: Exception) {
+                    failed = true
+                }
+            }
+
+            override fun onError(c: MediaCodec, e: MediaCodec.CodecException) {
+                failed = true
+            }
+
+            override fun onOutputFormatChanged(c: MediaCodec, format: MediaFormat) {}
+        }
+        var started = false
+        // Some decoders take any option in configure() and only refuse it in start() (Exynos
+        // cannot reserve real-time resources for too high an operating rate), so try both.
+        for (opts in lowLatencyOptions(info, fps)) {
             val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
             for ((k, v) in opts) fmt.setInteger(k, v)
             try {
+                codec.setCallback(callback, handler)
                 codec.configure(fmt, surface, null, 0)
-                configured = true
+                // When each frame reached the screen (the front renderer reports that itself).
+                if (!toTexture) codec.setOnFrameRenderedListener({ _, pts, nanos -> onRendered(pts, nanos) }, handler)
+                codec.start()
+                started = true
+                android.util.Log.i("tabdisplay", "decoder ${codec.name} started with $opts")
                 break
             } catch (_: Exception) {
                 codec.reset()
+                freeInputs.clear()
             }
         }
-        if (!configured) {
+        if (!started) {
             codec.release()
+            callbacks.quitSafely()
             throw IllegalStateException("no H.264 decoder configuration accepted")
-        }
-        codec.start()
-
-        drain = thread(name = "decoder-out", isDaemon = true) {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
-            val bi = MediaCodec.BufferInfo()
-            while (open) {
-                try {
-                    var idx = codec.dequeueOutputBuffer(bi, 10_000)
-                    if (idx < 0) continue
-                    var pts = bi.presentationTimeUs
-                    // If newer frames are already waiting, skip the older ones.
-                    while (true) {
-                        val next = codec.dequeueOutputBuffer(bi, 0)
-                        if (next < 0) break
-                        codec.releaseOutputBuffer(idx, false)
-                        idx = next
-                        pts = bi.presentationTimeUs
-                    }
-                    // Show at the next vsync; if a newer frame targets the same vsync, the
-                    // compositor drops this one (Moonlight's min-latency mode).
-                    codec.releaseOutputBuffer(idx, System.nanoTime())
-                    onShown(pts)
-                } catch (_: Exception) {
-                    if (open) failed = true
-                    return@thread
-                }
-            }
         }
     }
 
     /** [pts] is the host's timestamp; it only travels through the codec for latency stats. */
     fun feed(au: ByteArray, size: Int, pts: Long) {
-        while (open) {
-            val i = codec.dequeueInputBuffer(10_000)
-            if (i < 0) continue
+        while (open && !failed) {
+            val i = freeInputs.poll(10, TimeUnit.MILLISECONDS) ?: continue
             val buf = codec.getInputBuffer(i)!!
             buf.clear()
             buf.put(au, 0, size)
@@ -382,9 +565,9 @@ private class Decoder(surface: Surface, width: Int, height: Int, private val onS
 
     fun close() {
         open = false
-        drain.join(500)
         try { codec.stop() } catch (_: Exception) {}
         codec.release()
+        callbacks.quitSafely()
     }
 }
 

@@ -19,8 +19,8 @@ use std::{
 
 use crate::protocol;
 
-/// How often the position is read. 4 ms is under half a frame even at 120 Hz.
-const POLL: Duration = Duration::from_millis(4);
+/// How often the position is read: the poll is a few µs, and every ms of it is cursor latency.
+const POLL: Duration = Duration::from_millis(1);
 /// How often the cursor's shape is checked (arrow, I-beam, resize, ...).
 const SHAPE_EVERY: Duration = Duration::from_millis(50);
 

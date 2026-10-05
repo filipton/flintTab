@@ -42,9 +42,8 @@ pub fn find_apk(explicit: Option<&Path>) -> Option<PathBuf> {
     local.or_else(download)
 }
 
-/// Downloads the published APK: with curl when the repository is public (only when the
-/// server has a newer one), else with the GitHub CLI, which can read a private repository.
-fn download() -> Option<PathBuf> {
+/// The host's cache folder (created if missing).
+pub fn cache_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -53,6 +52,13 @@ fn download() -> Option<PathBuf> {
         })?
         .join("tabdisplay");
     std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Downloads the published APK: with curl when the repository is public (only when the
+/// server has a newer one), else with the GitHub CLI, which can read a private repository.
+fn download() -> Option<PathBuf> {
+    let dir = cache_dir()?;
     let path = dir.join(format!("tabdisplay-v{}.apk", protocol::VERSION));
     let part = dir.join("download.part");
     let mut cmd = Command::new("curl");

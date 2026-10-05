@@ -20,6 +20,13 @@ jobs:
           distribution: temurin
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
+      # Native hot paths (android/native): Rust for Android via cargo-ndk.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - run: cargo install cargo-ndk --locked
+      - name: Point cargo-ndk at the runner's NDK
+        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
       - name: Build
         working-directory: android
         run: ./gradlew --no-daemon assembleRelease

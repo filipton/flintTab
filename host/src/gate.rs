@@ -27,6 +27,8 @@ struct State<T> {
     fresh: bool,
     want_key: bool,
     in_flight: usize,
+    /// Acks still to come for the extra messages of multi-message frames.
+    spare_acks: usize,
     closed: bool,
     last_encode: Instant,
     repeats: u32,
@@ -40,6 +42,8 @@ pub struct Gate<T> {
 pub struct Job<T> {
     pub frame: T,
     pub keyframe: bool,
+    /// An idle re-encode of a frame that was already sent.
+    pub repeat: bool,
 }
 
 impl<T: Clone> Gate<T> {
@@ -50,6 +54,7 @@ impl<T: Clone> Gate<T> {
                 fresh: false,
                 want_key: false,
                 in_flight: 0,
+                spare_acks: 0,
                 closed: false,
                 last_encode: Instant::now(),
                 repeats: MAX_REPEATS,
@@ -76,9 +81,23 @@ impl<T: Clone> Gate<T> {
         self.update(|s| s.in_flight += 1);
     }
 
+    /// One frame went out as `n` messages (tiles); the tablet acks each, it counts once.
+    pub fn sent_batch(&self, n: usize) {
+        self.update(|s| {
+            s.in_flight += 1;
+            s.spare_acks += n.saturating_sub(1);
+        });
+    }
+
     /// The tablet took a frame off the wire.
     pub fn ack(&self) {
-        self.update(|s| s.in_flight = s.in_flight.saturating_sub(1));
+        self.update(|s| {
+            if s.spare_acks > 0 {
+                s.spare_acks -= 1;
+            } else {
+                s.in_flight = s.in_flight.saturating_sub(1);
+            }
+        });
     }
 
     /// The tablet's decoder restarted and needs a keyframe.
@@ -101,6 +120,7 @@ impl<T: Clone> Gate<T> {
             let repeat_at = s.last_encode + REPEAT_AFTER;
             let repeat_due = s.repeats < MAX_REPEATS && now >= repeat_at;
             if s.latest.is_some() && s.in_flight < MAX_IN_FLIGHT && (s.fresh || s.want_key || repeat_due) {
+                let repeat = !s.fresh;
                 if s.fresh {
                     s.repeats = 0;
                 } else if !s.want_key {
@@ -109,7 +129,7 @@ impl<T: Clone> Gate<T> {
                 s.fresh = false;
                 let keyframe = std::mem::take(&mut s.want_key);
                 s.last_encode = now;
-                return Some(Job { frame: s.latest.clone().unwrap(), keyframe });
+                return Some(Job { frame: s.latest.clone().unwrap(), keyframe, repeat });
             }
             s = if s.repeats < MAX_REPEATS && s.in_flight < MAX_IN_FLIGHT && now < repeat_at {
                 self.cv.wait_timeout(s, repeat_at - now).unwrap().0

@@ -9,7 +9,7 @@ import os
 W,H,FPS = int(os.environ.get("W",1280)),int(os.environ.get("H",800)),60
 s = socket.create_connection(("127.0.0.1", 27183))
 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-s.sendall(b"TDSP" + bytes([2]) + struct.pack(">III", W, H, FPS))
+s.sendall(b"TDSP" + bytes([3]) + struct.pack(">III", W, H, FPS) + bytes([0]))  # no tiles: video only
 f = s.makefile("rb")
 def rd(n):
     b = f.read(n)
@@ -32,9 +32,12 @@ try:
     while True:
         kind = rd(1)[0]; ln = struct.unpack(">I", rd(4))[0]; body = rd(ln)
         if kind == 1: print("config", struct.unpack(">IIII", body[:16]), body[16]); continue
+        if kind == 6:  # ping: answer at once (host time, our time) for the host's clock sync
+            s.sendall(bytes([7,0]) + body[:8] + struct.pack(">Q", time.monotonic_ns() // 1000)); continue
         if kind != 2: continue
-        au = body[8:]; now = time.time()-t0
-        s.sendall(bytes([6,0]) + body[:8])  # "shown" right away: the host prints its side of the latency
+        au = body[16:]; now = time.time()-t0  # after pts and the changed area
+        t = time.monotonic_ns() // 1000  # "shown" right away: the host prints its side of the latency
+        s.sendall(bytes([6,0]) + body[:8] + struct.pack(">QQQQQ", t, t, t, t, t))
         nals = [au[i+3] & 0x1f for i in range(len(au)-3) if au[i:i+3]==b"\0\0\1"]
         log.append((now, 5 in nals, len(au))); stream += au
         with lock:

@@ -24,7 +24,8 @@ to the host or in the current folder, a local build in `android/app/build/output
 otherwise the build GitHub Actions publishes for this protocol version (downloaded to the cache
 folder with curl, or with the GitHub CLI while the repository is private). `--no-install` turns this off.
 
-To build it yourself (needs JDK 17 and the Android SDK, e.g. from Android Studio):
+To build it yourself (needs JDK 17, the Android SDK and NDK, e.g. from Android Studio, and
+Rust with `rustup target add aarch64-linux-android` and `cargo install cargo-ndk`):
 ```
 cd android && ./gradlew assembleRelease
 ```
@@ -61,34 +62,39 @@ Only system audio is captured; the host mutes nothing on the computer.
 
 The stream runs at the tablet's refresh rate (up to 120 Hz) when its decoder can keep up.
 
-Options: `--fps N --bitrate MBPS --keep-display SECS --max-width 2560 --serial SERIAL --no-launch --apk PATH --no-install --width W --height H`;
+Options: `--fps N --bitrate MBPS --keep-display SECS --max-width 2560 --serial SERIAL --no-aoa --keep-tablet-settings --no-launch --apk PATH --no-install --width W --height H`;
 macOS: `--ppi 220 --no-hidpi --cursor-in-video`; Linux: `--encoder NAME --portal-monitor --x11-region X,Y`.
 
 ## How it keeps latency low
-- **The mouse skips the video (macOS).** The host reads the Mac's cursor position every 4 ms
-  and sends it, with the cursor's shape, ahead of the video. The tablet draws it on its own
-  compositor layer and just moves that layer, so the pointer reaches the tablet's screen at the
-  next vsync instead of after capture, encode and decode. The cursor is left out of the video;
-  `--cursor-in-video` puts it back there. On Linux the cursor is still part of the video.
-- **Newest frame wins.** Capture only replaces a single slot the encoder reads from, so nothing
-  queues up between the screen and the encoder.
-- **Frame acks.** The tablet acknowledges every frame; the host keeps at most 2 unacknowledged.
-  adb's own relay buffers would otherwise hide a slow link until latency had piled up.
-- **Zero-delay decode.** The H.264 SPS is patched with `max_num_reorder_frames=0` /
-  `max_dec_frame_buffering` (as Moonlight does), so Android decoders output each frame at once.
-  The decoder gets Moonlight's per-vendor low-latency options and frames are released for the
-  next vsync, newest first.
-- **Idle sharpening.** When the screen stops changing, the last frame is re-encoded (every
-  100 ms, like scrcpy's repeat-frame) so text sharpens after scrolling and the final state
-  always arrives.
-- **Recovery.** If the tablet's decoder fails it is rebuilt and asks the host for a keyframe; the
-  connection and the virtual display stay up. The virtual display also survives a disconnect
-  for `--keep-display` seconds (default 15) so windows stay put.
+Measured on a Galaxy Tab S10 FE and an M4 Pro: about 5-6 ms (median) from the Mac
+compositing a change to the change being in the tablet's scanned-out buffer, plus the panel's
+own scan (up to one refresh).
+
+- **Raw USB, no adb relay.** The host switches the tablet to an Android Open Accessory (the
+  protocol wired Android Auto uses) and talks to the app over USB bulk endpoints: ~0.3 ms round
+  trips instead of adb's ~4 ms. adb stays available next to it. The first time, the tablet asks
+  to allow the app to use the accessory (tick "always"). `--no-aoa` stays on adb.
+- **Changed pixels, not video, for small changes.** The host finds which 16x16 blocks really
+  changed and sends those as LZ4-compressed pixels: no encoder, no decoder (each costs ~7-9 ms
+  per frame on this hardware). Large changes (scrolling, video) still go through H.264.
+- **Drawn straight into the scanned-out buffer.** On tablets whose display hardware can scan out
+  a CPU-written buffer, native code (Rust, NEON) converts updates and draws the cursor directly
+  into it: no GPU and no compositor queue (~17 ms at 90 Hz otherwise). Elsewhere the GPU does
+  the same front-buffered drawing. Fast changes may tear; "Lowest latency" in the tablet's
+  settings panel turns this off.
+- **The tablet's own caps are lifted while streaming.** Battery saver and "Motion smoothness:
+  Standard" both cap the panel at 60 Hz and slow the decoder; the host turns them off over adb
+  and restores them on exit (`--keep-tablet-settings` leaves them alone).
+- **The mouse skips the video (macOS).** The cursor position is polled every 1 ms and sent ahead
+  of the video; the tablet draws it as a sprite.
+- **Newest frame wins**, **frame acks** (at most 2 frames unacknowledged), **zero-delay H.264**
+  (SPS patched like Moonlight) with the decoder at full clock, and **idle sharpening** (repeats
+  only areas last sent lossily).
 
 ## Measuring latency
-While streaming, the host prints the end-to-end latency every 5 seconds: from capture (Linux)
-or the hand-off to the encoder (macOS) until the tablet releases the decoded frame to its screen.
-Add up to one vsync on the tablet (8 ms at 120 Hz, 17 ms at 60 Hz) for the panel itself.
+While streaming, the host prints where each update's time went every 5 seconds (median/p95):
+capture, waiting for the encoder, encode, send, USB, the tablet's decoder input, decode, and
+drawing, plus the total. Tablet timestamps are mapped onto the Mac's clock with a ping/pong.
 
 ## Testing without a tablet
 ```

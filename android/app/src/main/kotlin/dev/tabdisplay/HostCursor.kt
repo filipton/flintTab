@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.util.Log
 import android.view.Surface
 import android.view.SurfaceControl
 import android.view.SurfaceView
@@ -26,16 +27,33 @@ class HostCursor(private val view: SurfaceView) {
     private var hotPt = intArrayOf(0, 0)
     private var scale = 1f // tablet pixels per host display point
     private var lastX = 0; private var lastY = 0; private var visible = false
+    private var lastNote = ""
+
+    private fun note(s: String) {
+        if (s != lastNote) { Log.i("tabdisplay", "cursor: $s"); lastNote = s }
+    }
+
+    class Image(val bitmap: Bitmap?, val displayWidthPt: Int, val sizePt: IntArray, val hotPt: IntArray)
+
+    companion object {
+        /** Parses a MSG_CURSOR_IMAGE payload. */
+        fun parseImage(msg: ByteArray): Image? {
+            if (msg.size < 10) return null
+            fun u16(i: Int) = ((msg[i].toInt() and 0xff) shl 8) or (msg[i + 1].toInt() and 0xff)
+            return Image(BitmapFactory.decodeByteArray(msg, 10, msg.size - 10), u16(0),
+                intArrayOf(u16(2), u16(4)), intArrayOf(u16(6), u16(8)))
+        }
+    }
 
     /** MSG_CURSOR_IMAGE payload. Called on the network thread. */
     @Synchronized
     fun setImage(msg: ByteArray) {
-        if (msg.size < 10) return
-        fun u16(i: Int) = ((msg[i].toInt() and 0xff) shl 8) or (msg[i + 1].toInt() and 0xff)
-        displayWidthPt = u16(0)
-        sizePt = intArrayOf(u16(2), u16(4))
-        hotPt = intArrayOf(u16(6), u16(8))
-        image = BitmapFactory.decodeByteArray(msg, 10, msg.size - 10)
+        val img = parseImage(msg) ?: return
+        displayWidthPt = img.displayWidthPt
+        sizePt = img.sizePt
+        hotPt = img.hotPt
+        image = img.bitmap
+        note("image ${msg.size - 10} B -> ${image?.width}x${image?.height}, pt $displayWidthPt ${sizePt.toList()}")
         releaseLayer() // rebuilt at the new size on the next move
         if (visible) move(lastX, lastY, true)
     }
@@ -61,11 +79,11 @@ class HostCursor(private val view: SurfaceView) {
 
     private fun ensureLayer(): SurfaceControl? {
         val p = view.surfaceControl
-        if (!p.isValid) { releaseLayer(); return null }
+        if (!p.isValid) { note("video surface invalid"); releaseLayer(); return null }
         if (p != parent) releaseLayer()
         layer?.let { return it }
-        val bmp = image ?: return null
-        if (displayWidthPt == 0 || view.width == 0) return null
+        val bmp = image ?: run { note("no image yet"); return null }
+        if (displayWidthPt == 0 || view.width == 0) { note("no size: $displayWidthPt ${view.width}"); return null }
         scale = view.width.toFloat() / displayWidthPt
         val w = (sizePt[0] * scale).roundToInt().coerceAtLeast(1)
         val h = (sizePt[1] * scale).roundToInt().coerceAtLeast(1)
@@ -88,6 +106,7 @@ class HostCursor(private val view: SurfaceView) {
         SurfaceControl.Transaction().setLayer(sc, 1).apply()
         layer = sc
         parent = p
+        note("layer ${w}x$h")
         return sc
     }
 

@@ -4,6 +4,7 @@
 //! connects and reports its screen size, we create a virtual display of that size,
 //! capture it, encode it to H.264 and stream it back over the same socket.
 
+mod aoa;
 mod app;
 #[cfg(target_os = "macos")]
 mod capture;
@@ -16,6 +17,10 @@ mod linux;
 mod mac;
 mod protocol;
 mod sps;
+mod tablet;
+#[cfg(target_os = "macos")]
+mod tiles;
+mod timing;
 #[cfg(target_os = "macos")]
 mod vt;
 
@@ -71,7 +76,7 @@ pub struct Args {
     /// Path of the adb binary
     #[arg(long, default_value = "adb")]
     adb: String,
-    /// adb serial of the tablet (see `adb devices`). Default: the first real device, emulators skipped
+    /// adb serial of the tablet (see `adb devices`). Default: the first real device (an emulator only by serial)
     #[arg(long, short = 's')]
     serial: Option<String>,
     /// Do not start the tablet app automatically
@@ -84,6 +89,13 @@ pub struct Args {
     /// Do not install or update the tablet app
     #[arg(long)]
     no_install: bool,
+    /// Leave the tablet's battery saver and motion smoothness alone (by default they are
+    /// lifted while the host runs, because both cap the panel at 60 Hz, and restored on exit)
+    #[arg(long)]
+    keep_tablet_settings: bool,
+    /// Stay on adb's TCP forward instead of switching the tablet to a raw USB accessory
+    #[arg(long)]
+    no_aoa: bool,
     /// Do not run adb at all (the tablet connects some other way, e.g. a test client)
     #[arg(long, hide = true)]
     no_adb: bool,
@@ -122,8 +134,8 @@ fn pick_size(args: &Args, dev_w: u32, dev_h: u32) -> (u32, u32) {
     (even(w), even(h))
 }
 
-/// The device to talk to: `wanted` if it is attached, else the first real device
-/// (emulators skipped), else the only device.
+/// The device to talk to: `wanted` if it is attached, else the first real device. Emulators
+/// only when asked for by serial (a tablet re-enumerating would otherwise hand over to one).
 fn pick_device(adb: &str, wanted: Option<&str>) -> Option<String> {
     let out = Command::new(adb).arg("devices").stderr(Stdio::null()).output().ok()?;
     let ready: Vec<String> = String::from_utf8_lossy(&out.stdout)
@@ -137,29 +149,35 @@ fn pick_device(adb: &str, wanted: Option<&str>) -> Option<String> {
         .collect();
     match wanted {
         Some(w) => ready.into_iter().find(|s| s == w),
-        None => match ready.iter().find(|s| !s.starts_with("emulator-")) {
-            Some(s) => Some(s.clone()),
-            None if ready.len() == 1 => ready.into_iter().next(),
-            None => None,
-        },
+        None => ready.into_iter().find(|s| !s.starts_with("emulator-")),
     }
 }
 
 /// Keeps `adb reverse` alive (it is dropped on unplug), and on connect installs or
 /// updates the app and opens it.
-fn spawn_adb_watcher(args: &Args, busy: Arc<AtomicBool>) {
+fn spawn_adb_watcher(args: &Args, busy: Arc<AtomicBool>, current: Arc<std::sync::Mutex<Option<String>>>) {
     let adb = args.adb.clone();
     let wanted = args.serial.clone();
     let port = args.port;
     let launch = !args.no_launch;
     let install = !args.no_install;
+    let tweak = !args.keep_tablet_settings;
     let apk = args.apk.clone();
     thread::spawn(move || {
         let mut connected: Option<String> = None;
+        let mut tweaked: Option<String> = None;
         loop {
             if !busy.load(Ordering::Relaxed) {
                 let spec = format!("tcp:{port}");
-                let device = pick_device(&adb, wanted.as_deref()).filter(|serial| {
+                let device = pick_device(&adb, wanted.as_deref());
+                // Before the port forward, so the app cannot connect while the caps still apply.
+                if tweak && device != tweaked {
+                    if let Some(serial) = device.as_deref() {
+                        tablet::apply(&adb, serial);
+                    }
+                    tweaked = device.clone();
+                }
+                let device = device.filter(|serial| {
                     Command::new(&adb)
                         .args(["-s", serial, "reverse", &spec, &spec])
                         .stdout(Stdio::null())
@@ -186,6 +204,7 @@ fn spawn_adb_watcher(args: &Args, busy: Arc<AtomicBool>) {
                             .status();
                     }
                 }
+                *current.lock().unwrap() = device.clone();
                 connected = device;
             }
             thread::sleep(Duration::from_secs(2));
@@ -210,6 +229,10 @@ pub struct StreamConfig {
     pub bitrate: u32,
     /// Session clock: video pts are microseconds since this instant.
     pub epoch: std::time::Instant,
+    /// Per-stage latency on the session clock.
+    pub timing: Arc<timing::Timing>,
+    /// The tablet draws small updates sent as pixels (MSG_TILE).
+    pub tiles: bool,
 }
 
 /// A running capture + encode pipeline; dropping `guard` stops it.
@@ -240,33 +263,6 @@ pub trait Input: Send {
     fn pointer(&mut self, ev: Pointer, x: f64, y: f64, clicks: u32);
     /// Finger movement in display pixels; positive dy = fingers moved down (content follows).
     fn scroll(&mut self, dx: f64, dy: f64);
-}
-
-/// Rolling end-to-end latency (host capture/encode start -> frame on the tablet's screen),
-/// printed every few seconds.
-#[derive(Default)]
-struct LatencyStats {
-    samples: Vec<f64>,
-    since: Option<std::time::Instant>,
-}
-
-impl LatencyStats {
-    fn add(&mut self, ms: f64) {
-        let since = *self.since.get_or_insert_with(std::time::Instant::now);
-        self.samples.push(ms);
-        if since.elapsed() >= Duration::from_secs(5) {
-            self.samples.sort_by(|a, b| a.total_cmp(b));
-            let n = self.samples.len();
-            println!(
-                "latency to the tablet's screen: median {:.1} ms, p95 {:.1} ms, {:.0} frames/s (+ up to one vsync)",
-                self.samples[n / 2],
-                self.samples[(n * 95 / 100).min(n - 1)],
-                n as f64 / since.elapsed().as_secs_f64()
-            );
-            self.samples.clear();
-            self.since = None;
-        }
-    }
 }
 
 /// Turns control messages into `Input` calls and counts multi-clicks.
@@ -331,15 +327,85 @@ pub trait Host {
     fn shutdown(&mut self);
 }
 
-fn run_session(mut sock: TcpStream, args: &Args, host: &mut dyn Host, running: &AtomicBool) -> Result<()> {
-    sock.set_nodelay(true)?;
-    sock.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let hello = protocol::read_hello(&mut sock)?;
-    sock.set_read_timeout(None)?;
+/// A connection to the tablet app: adb's TCP forward, or the USB accessory.
+struct Conn {
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    /// Unblocks the reader and writer for good.
+    close: Box<dyn Fn() + Send>,
+    /// Called once the handshake is in (lifts its timeout).
+    ready: Box<dyn FnOnce() + Send>,
+    via: &'static str,
+}
+
+impl Conn {
+    fn tcp(sock: TcpStream) -> Result<Self> {
+        sock.set_nonblocking(false)?;
+        sock.set_nodelay(true)?;
+        sock.set_read_timeout(Some(Duration::from_secs(5)))?; // for the handshake
+        let closer = sock.try_clone()?;
+        let untimed = sock.try_clone()?;
+        Ok(Self {
+            ready: Box::new(move || {
+                let _ = untimed.set_read_timeout(None);
+            }),
+            reader: Box::new(sock.try_clone()?),
+            writer: Box::new(sock),
+            close: Box::new(move || {
+                let _ = closer.shutdown(Shutdown::Both);
+            }),
+            via: "adb",
+        })
+    }
+}
+
+/// Opens the USB accessory whenever the tablet is attached and no session runs, and hands it
+/// over once the tablet app talks on it (until then a TCP session can start instead).
+fn spawn_aoa(running: Arc<AtomicBool>, busy: Arc<AtomicBool>, current: Arc<std::sync::Mutex<Option<String>>>) -> mpsc::Receiver<Conn> {
+    let (tx, rx) = mpsc::sync_channel(0);
+    thread::spawn(move || {
+        while running.load(Ordering::Relaxed) {
+            let serial = current.lock().unwrap().clone();
+            let link = match serial {
+                Some(s) if !busy.load(Ordering::Relaxed) => aoa::open(&s),
+                _ => None,
+            };
+            let Some(link) = link else {
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            };
+            let mut reader = link.reader();
+            let stop = || !running.load(Ordering::Relaxed) || busy.load(Ordering::Relaxed);
+            if reader.wait(stop).is_err() {
+                continue;
+            }
+            let closed = reader.closer();
+            let conn = Conn { reader: Box::new(reader), writer: Box::new(link.writer()), close: Box::new(move || closed()), ready: Box::new(|| {}), via: "USB accessory" };
+            if tx.send(conn).is_err() {
+                return;
+            }
+            // Wait for that session to end before opening the accessory again.
+            thread::sleep(Duration::from_millis(500));
+            while busy.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    });
+    rx
+}
+
+fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBool) -> Result<()> {
+    let Conn { mut reader, writer, close, ready, via } = conn;
+    let hello = protocol::read_hello(&mut reader)?;
+    ready();
+    println!("tablet connected over {via}");
 
     let (width, height) = pick_size(args, hello.width, hello.height);
     let tablet_fps = if hello.max_fps == 0 { 60 } else { hello.max_fps };
-    let fps = args.fps.unwrap_or(tablet_fps).clamp(30, 120);
+    // A tablet that takes tiles draws straight into its scanned-out buffer, whatever its own
+    // refresh rate: then the virtual display runs at 120 Hz, so a change waits at most 8 ms
+    // for the Mac to composite it instead of 11-17 ms.
+    let fps = args.fps.unwrap_or(if hello.tiles { tablet_fps.max(120) } else { tablet_fps }).clamp(30, 120);
     let bitrate = args.bitrate.unwrap_or(if fps > 60 { 40 } else { 25 });
     println!(
         "tablet screen {}x{} ({} Hz) -> virtual display {width}x{height}@{fps}, {bitrate} Mbit/s",
@@ -351,8 +417,20 @@ fn run_session(mut sock: TcpStream, args: &Args, host: &mut dyn Host, running: &
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     tx.send(protocol::config_msg(width, height, fps)).ok();
 
-    let cfg = StreamConfig { width, height, fps, bitrate, epoch: std::time::Instant::now() };
-    let epoch = cfg.epoch;
+    let epoch = std::time::Instant::now();
+    let timing = Arc::new(timing::Timing::new(epoch));
+    let cfg = StreamConfig { width, height, fps, bitrate, epoch, timing: timing.clone(), tiles: hello.tiles };
+    // Clock sync for the latency breakdown; cheap enough to run all the time.
+    {
+        let tx = tx.clone();
+        let timing = timing.clone();
+        let alive = alive.clone();
+        thread::spawn(move || {
+            while alive.load(Ordering::Relaxed) && tx.send(protocol::ping_msg(timing.now())).is_ok() {
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+    }
     let mut stream = match host.start(args, &cfg, audio_on.clone(), tx) {
         Ok(s) => s,
         Err(e) => {
@@ -363,9 +441,10 @@ fn run_session(mut sock: TcpStream, args: &Args, host: &mut dyn Host, running: &
 
     // writer: the only thread that writes to the socket
     {
-        let mut out = sock.try_clone()?;
+        let mut out = writer;
         let alive = alive.clone();
         let control = stream.control.clone();
+        let timing = timing.clone();
         thread::spawn(move || {
             #[cfg(target_os = "macos")]
             unsafe {
@@ -374,6 +453,10 @@ fn run_session(mut sock: TcpStream, args: &Args, host: &mut dyn Host, running: &
             for msg in rx {
                 if out.write_all(&msg).is_err() {
                     break;
+                }
+                if msg[0] == protocol::MSG_VIDEO || msg[0] == protocol::MSG_TILE {
+                    let pts = u64::from_be_bytes(msg[5..13].try_into().unwrap());
+                    timing.written(pts, msg.len() - protocol::VIDEO_HEADER);
                 }
             }
             alive.store(false, Ordering::Relaxed);
@@ -386,25 +469,32 @@ fn run_session(mut sock: TcpStream, args: &Args, host: &mut dyn Host, running: &
         if input.is_none() {
             println!("touch input is not available with this capture source");
         }
-        let mut inp = sock.try_clone()?;
+        let mut inp = reader;
         let alive = alive.clone();
         let control = stream.control.clone();
+        let timing = timing.clone();
         thread::spawn(move || {
             let mut input = input.map(|input| InputDecoder { input, last_down: None });
             let mut m = [0u8; 2];
-            let mut payload = [0u8; 8];
-            let mut latency = LatencyStats::default();
+            let mut payload = [0u8; 48];
+            let u64_at = |p: &[u8], i: usize| u64::from_be_bytes(p[i..i + 8].try_into().unwrap());
             while inp.read_exact(&mut m).is_ok() {
                 let extra = protocol::control_payload_len(m[0]);
                 if inp.read_exact(&mut payload[..extra]).is_err() {
                     break;
                 }
                 match m[0] {
-                    protocol::KIND_SHOWN => {
-                        let pts = u64::from_be_bytes(payload);
-                        let now = epoch.elapsed().as_micros() as u64;
-                        latency.add(now.saturating_sub(pts) as f64 / 1000.0);
-                    }
+                    protocol::KIND_TIMING => timing.tablet(
+                        u64_at(&payload, 0),
+                        timing::TabletTimes {
+                            recv_start: u64_at(&payload, 8),
+                            recv_end: u64_at(&payload, 16),
+                            queued: u64_at(&payload, 24),
+                            decoded: u64_at(&payload, 32),
+                            shown: u64_at(&payload, 40),
+                        },
+                    ),
+                    protocol::KIND_PONG => timing.pong(u64_at(&payload, 0), u64_at(&payload, 8)),
                     protocol::KIND_POINTER | protocol::KIND_SCROLL => {
                         if let Some(i) = input.as_mut() {
                             i.handle(m[0], m[1], &payload);
@@ -434,7 +524,7 @@ fn run_session(mut sock: TcpStream, args: &Args, host: &mut dyn Host, running: &
 
     stream.control.close();
     drop(stream);
-    let _ = sock.shutdown(Shutdown::Both);
+    close();
     host.release();
     println!("session ended");
     Ok(())
@@ -471,30 +561,41 @@ fn main() -> Result<()> {
     listener.set_nonblocking(true)?;
 
     let busy = Arc::new(AtomicBool::new(false));
+    let current = Arc::new(std::sync::Mutex::new(None));
     if !args.no_adb {
-        spawn_adb_watcher(&args, busy.clone());
+        spawn_adb_watcher(&args, busy.clone(), current.clone());
     }
+    let usb = (!args.no_adb && !args.no_aoa).then(|| spawn_aoa(running.clone(), busy.clone(), current.clone()));
     println!("waiting for the tablet (plug it in with USB debugging on)...");
     let keep = Duration::from_secs(args.keep_display);
 
     while running.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((sock, _)) => {
-                sock.set_nonblocking(false)?;
+        let conn = match usb.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            Some(c) => Some(c),
+            None => match listener.accept() {
+                Ok((sock, _)) => Some(Conn::tcp(sock)?),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+                Err(e) => return Err(e.into()),
+            },
+        };
+        match conn {
+            Some(conn) => {
                 busy.store(true, Ordering::Relaxed);
-                if let Err(e) = run_session(sock, &args, host.as_mut(), &running) {
+                if let Err(e) = run_session(conn, &args, host.as_mut(), &running) {
                     eprintln!("session error: {e:#}");
                 }
                 busy.store(false, Ordering::Relaxed);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            None => {
                 host.expire(keep);
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(e.into()),
         }
     }
     host.shutdown();
+    if !args.no_adb {
+        tablet::restore(&args.adb);
+    }
     Ok(())
 }
 
