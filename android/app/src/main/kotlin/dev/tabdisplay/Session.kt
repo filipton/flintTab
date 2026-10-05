@@ -585,11 +585,11 @@ private class Decoder(
 
     /** [pts] is the host's timestamp; it only travels through the codec for latency stats. */
     /**
-     * False if the decoder took no input for 250 ms (its outputs are all held, or it hung):
+     * False if the decoder took no input for 50 ms (4+ frames; its outputs are all held, or it hung):
      * the caller rebuilds it rather than blocking the connection's reading thread.
      */
     fun feed(au: ByteArray, size: Int, pts: Long): Boolean {
-        val deadline = System.nanoTime() + 250_000_000L
+        val deadline = System.nanoTime() + 50_000_000L
         while (open && !failed && System.nanoTime() < deadline) {
             val i = freeInputs.poll(10, TimeUnit.MILLISECONDS) ?: continue
             val buf = codec.getInputBuffer(i)!!
@@ -598,7 +598,7 @@ private class Decoder(
             codec.queueInputBuffer(i, 0, size, pts, 0)
             return true
         }
-        if (open && !failed) android.util.Log.i("tabdisplay", "decoder stalled for 250 ms: rebuilding it")
+        if (open && !failed) android.util.Log.i("tabdisplay", "decoder stalled for 50 ms: rebuilding it")
         return false
     }
 
