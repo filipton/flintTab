@@ -17,7 +17,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -415,6 +415,33 @@ impl Drop for Running {
     }
 }
 
+/// Reports what goes wrong in the capture after it started (it fails quietly otherwise: a black
+/// tablet), and says so when no picture has come at all a few seconds in.
+fn watch_capture(p: &gst::Pipeline, frames: Arc<AtomicUsize>) {
+    let bus = p.bus().unwrap();
+    let pipeline = p.downgrade();
+    let started = Instant::now();
+    std::thread::spawn(move || {
+        let mut warned = false;
+        while pipeline.upgrade().is_some() {
+            if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(250)) {
+                let src = msg.src().map(|s| s.name().to_string()).unwrap_or_default();
+                match msg.view() {
+                    gst::MessageView::Error(e) => eprintln!("screen capture failed ({src}): {} ({:?})", e.error(), e.debug()),
+                    gst::MessageView::Warning(w) => eprintln!("screen capture warning ({src}): {}", w.error()),
+                    _ => {}
+                }
+            }
+            if !warned && started.elapsed() > Duration::from_secs(3) && frames.load(Ordering::Relaxed) == 0 {
+                warned = true;
+                eprintln!(
+                    "no picture from the screen yet (the tablet stays black): run with GST_DEBUG=3 to see why"
+                );
+            }
+        }
+    });
+}
+
 /// Waits until the pipeline plays, or returns the first error it posts.
 fn wait_playing(p: &gst::Pipeline) -> Result<()> {
     p.set_state(gst::State::Playing)?;
@@ -636,8 +663,10 @@ impl Host for LinuxHost {
         .downcast::<gst::Pipeline>()
         .unwrap();
         let sink = capture.by_name("raw").unwrap().downcast::<gst_app::AppSink>().unwrap();
+        let captured = Arc::new(AtomicUsize::new(0));
         {
             let frames = frames.clone();
+            let captured = captured.clone();
             let mut info: Option<(gst::Caps, Arc<gstreamer_video::VideoInfo>)> = None;
             sink.set_callbacks(
                 gst_app::AppSinkCallbacks::builder()
@@ -663,6 +692,7 @@ impl Host for LinuxHost {
                             _ => None,
                         };
                         let info = info.as_ref().unwrap().1.clone();
+                        captured.fetch_add(1, Ordering::Relaxed);
                         frames.push(GstFrame { buf, info }, composited, None);
                         Ok(gst::FlowSuccess::Ok)
                     })
@@ -681,6 +711,7 @@ impl Host for LinuxHost {
         };
         let mut running = Running { capture, gate: gate.clone(), frame_thread, others: Vec::new() };
         wait_playing(&running.capture)?;
+        watch_capture(&running.capture, captured.clone());
         match start_audio(audio_on, tx) {
             Ok(a) => running.others.push(a),
             Err(e) => eprintln!("audio unavailable: {e:#}"),
@@ -726,7 +757,8 @@ struct PortalInput {
 impl Input for PortalInput {
     fn pointer(&mut self, ev: Pointer, x: f64, y: f64, _clicks: u32) {
         let (r, s) = (&self.remote, &*self.session);
-        let (px, py) = (x * self.size.0, y * self.size.1);
+        // Inside the stream: its right and bottom edges are one past the last pixel.
+        let (px, py) = (x.clamp(0.0, 1.0) * (self.size.0 - 1.0), y.clamp(0.0, 1.0) * (self.size.1 - 1.0));
         let res = self.rt.block_on(async {
             r.notify_pointer_motion_absolute(s, self.node, px, py, Default::default()).await?;
             let button = match ev {
