@@ -122,8 +122,10 @@ pub struct Args {
     portal_monitor: bool,
 }
 
+/// Hardware video decoders work in 16x16 blocks, and some refuse sizes that are not a multiple
+/// of 16 (2560x1682 for a 2800x1840 tablet): round down to one.
 fn even(v: u32) -> u32 {
-    (v.max(2)) & !1
+    (v.max(16)) & !15
 }
 
 fn pick_size(args: &Args, dev_w: u32, dev_h: u32) -> (u32, u32) {
@@ -488,6 +490,19 @@ fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBoo
             let mut payload = [0u8; 48];
             let u64_at = |p: &[u8], i: usize| u64::from_be_bytes(p[i..i + 8].try_into().unwrap());
             while inp.read_exact(&mut m).is_ok() {
+                if m[0] == protocol::KIND_LOG {
+                    let mut len = [0u8; 2];
+                    let mut text = vec![0u8; 0];
+                    if inp.read_exact(&mut len).is_err() {
+                        break;
+                    }
+                    text.resize(u16::from_be_bytes(len) as usize, 0);
+                    if inp.read_exact(&mut text).is_err() {
+                        break;
+                    }
+                    println!("tablet: {}", String::from_utf8_lossy(&text));
+                    continue;
+                }
                 let extra = protocol::control_payload_len(m[0]);
                 if inp.read_exact(&mut payload[..extra]).is_err() {
                     break;

@@ -116,6 +116,11 @@ class Session(
         synchronized(output) { output.write(ackMsg); output.flush() }
     }
 
+    private fun sendLog(line: String) {
+        val text = line.toByteArray(Charsets.UTF_8).let { if (it.size > 2000) it.copyOf(2000) else it }
+        outbox.add(byteArrayOf(KIND_LOG.toByte(), 0, (text.size shr 8).toByte(), text.size.toByte()) + text)
+    }
+
     private fun sendControl(kind: Int, value: Int) {
         if (out != null) outbox.add(byteArrayOf(kind.toByte(), value.toByte()))
     }
@@ -211,14 +216,30 @@ class Session(
         return Link(s.getInputStream().buffered(1 shl 16), s.getOutputStream(), s, "adb")
     }
 
+    /**
+     * How careful the decoder setup is: 0 the hardware decoder with every low-latency option,
+     * 1 the hardware decoder plain, 2 Android's software decoder. A level that does not work on
+     * this device (a decoder failing, or taking frames and giving none back) moves to the next.
+     */
+    var decoderLevel = 0
+
     private fun newDecoder(surface: Surface, w: Int, h: Int, fps: Int): Decoder {
         val r = front
-        return if (r != null && r.wantsImages) {
-            Decoder(null, w, h, fps, toTexture, ::onDecoded, ::frameShown) { pts, img, done -> r.frameDecoded(pts, img, done) }
-        } else {
-            Decoder(surface, w, h, fps, toTexture, ::onDecoded, ::frameShown)
+        while (true) {
+            try {
+                return if (r != null && r.wantsImages) {
+                    Decoder(null, w, h, fps, toTexture, decoderLevel, ::onDecoded, ::frameShown) { pts, img, done -> r.frameDecoded(pts, img, done) }
+                } else {
+                    Decoder(surface, w, h, fps, toTexture, decoderLevel, ::onDecoded, ::frameShown)
+                }
+            } catch (e: Exception) {
+                if (decoderLevel >= 2) throw e
+                TLog.i("decoder setup ${decoderLevel} failed (${e.message}); trying ${decoderLevel + 1}")
+                decoderLevel++
+            }
         }
     }
+
 
     private fun runOnce(surface: Surface) {
         val link = connect()
@@ -246,11 +267,22 @@ class Session(
         }
         outbox.clear() // nothing from an earlier connection
         out = output
+        TLog.connected(::sendLog)
 
         var decoder: Decoder? = null
         var config: IntArray? = null // w, h, fps
         var needKeyframe = false
         var frameBuf = ByteArray(1 shl 20) // reused: no per-frame allocation/GC
+        /** The decoder misbehaved: the next setup, and a keyframe for it. */
+        fun replaceDecoder(d: Decoder, why: String) {
+            d.close()
+            if (decoderLevel < 2) decoderLevel++
+            TLog.i("decoder ${d.name}: $why; switching to setup $decoderLevel")
+            val c = config!!
+            decoder = newDecoder(surface, c[0], c[1], c[2])
+            needKeyframe = true
+            sendControl(KIND_IDR, 0)
+        }
         // The host answers the handshake at once and pings every second: silence means the
         // link is dead (over USB the hello can get lost when the app restarts), so start over.
         val lastRx = java.util.concurrent.atomic.AtomicLong(System.nanoTime())
@@ -308,14 +340,11 @@ class Session(
                             front?.queueVideo(pts)
                             val ok = !d.failed && try { d.feed(frameBuf, n, pts) } catch (_: Exception) { false }
                             frameTimes[pts]?.set(2, nowUs())
-                            if (!ok) {
+                            when {
                                 // Decoder died (e.g. a codec error): rebuild it and ask the host for
                                 // a keyframe instead of tearing the whole connection down.
-                                d.close()
-                                val c = config!!
-                                decoder = newDecoder(surface, c[0], c[1], c[2])
-                                needKeyframe = true
-                                sendControl(KIND_IDR, 0)
+                                !ok -> replaceDecoder(d, d.error ?: "stopped taking frames")
+                                d.silent() -> replaceDecoder(d, "took ${d.inputs} frames and gave none back")
                             }
                         }
                         // Flow control: the host keeps at most a couple of frames unacknowledged.
@@ -368,6 +397,7 @@ class Session(
                 }
             }
         } finally {
+            TLog.disconnected()
             watchdog.interrupt()
             onCursor(0, 0, false)
             decoder?.close()
@@ -379,7 +409,7 @@ class Session(
     }
 
     companion object {
-        const val VERSION = 3
+        const val VERSION = 4
         const val MSG_CONFIG = 1
         const val MSG_VIDEO = 2
         const val MSG_AUDIO = 3
@@ -393,6 +423,8 @@ class Session(
         const val KIND_IDR = 3
         const val KIND_TIMING = 6
         const val KIND_PONG = 7
+        /** u16 length, then that much UTF-8: a log line the host prints. */
+        const val KIND_LOG = 8
     }
 }
 
@@ -461,6 +493,12 @@ private fun pickDecoder(): MediaCodecInfo? {
  * Low-latency MediaFormat options, most aggressive first; the first set the codec accepts is
  * used. Keys and fallbacks follow Moonlight's MediaCodecHelper.setDecoderLowLatencyOptions.
  */
+/** Android's own software H.264 decoder: slower, but works wherever the hardware one does not. */
+private fun pickSoftwareDecoder(): MediaCodecInfo? =
+    MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull {
+        !it.isEncoder && it.isSoftwareOnly && it.supportedTypes.contains(MediaFormat.MIMETYPE_VIDEO_AVC)
+    }
+
 private fun lowLatencyOptions(info: MediaCodecInfo?, fps: Int): List<Map<String, Int>> {
     val name = info?.name?.lowercase() ?: ""
     val qcom = name.startsWith("omx.qcom") || name.startsWith("c2.qti")
@@ -499,6 +537,8 @@ private class Decoder(
     height: Int,
     fps: Int,
     private val toTexture: Boolean,
+    /** Setup level (see Session.newDecoder): 0 low-latency hardware, 1 plain hardware, 2 software. */
+    level: Int,
     private val onDecoded: (pts: Long) -> Unit,
     private val onRendered: (pts: Long, nanos: Long) -> Unit,
     /** Without a surface: each decoded frame as an Image, and how to give its buffer back. */
@@ -510,10 +550,22 @@ private class Decoder(
     @Volatile var failed = false
         private set
     private val freeInputs = LinkedBlockingQueue<Int>()
+    /** How long without a free input means stuck: software decoding is just slow. */
+    private val stuckNanos = if (level >= 2) 1_000_000_000L else 50_000_000L
+    val name: String
+    /** Frames fed and frames out, for the watchdog: a decoder can take everything and give nothing. */
+    @Volatile var inputs = 0
+        private set
+    @Volatile var outputs = 0
+        private set
+    private var firstInputAt = 0L
+    /** What the codec reported when it failed. */
+    @Volatile var error: String? = null
+        private set
     private val callbacks = HandlerThread("decoder", Process.THREAD_PRIORITY_URGENT_DISPLAY).apply { start() }
 
     init {
-        val info = pickDecoder()
+        val info = if (level >= 2) pickSoftwareDecoder() else pickDecoder()
         codec = if (info != null) MediaCodec.createByCodecName(info.name)
         else MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         val handler = Handler(callbacks.looper)
@@ -525,6 +577,7 @@ private class Decoder(
             override fun onOutputBufferAvailable(c: MediaCodec, index: Int, bi: MediaCodec.BufferInfo) {
                 if (!open) return
                 val pts = bi.presentationTimeUs
+                outputs++
                 onDecoded(pts)
                 val sink = onImage
                 if (sink != null) {
@@ -551,6 +604,7 @@ private class Decoder(
             }
 
             override fun onError(c: MediaCodec, e: MediaCodec.CodecException) {
+                error = "codec error ${e.errorCode} (${e.diagnosticInfo})"
                 failed = true
             }
 
@@ -559,7 +613,7 @@ private class Decoder(
         var started = false
         // Some decoders take any option in configure() and only refuse it in start() (Exynos
         // cannot reserve real-time resources for too high an operating rate), so try both.
-        for (opts in lowLatencyOptions(info, fps)) {
+        for (opts in if (level == 0) lowLatencyOptions(info, fps) else listOf(emptyMap())) {
             val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
             for ((k, v) in opts) fmt.setInteger(k, v)
             try {
@@ -569,7 +623,10 @@ private class Decoder(
                 if (!toTexture) codec.setOnFrameRenderedListener({ _, pts, nanos -> onRendered(pts, nanos) }, handler)
                 codec.start()
                 started = true
-                android.util.Log.i("tabdisplay", "decoder ${codec.name} started with $opts")
+                val sized = try {
+                    codec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities.isSizeSupported(width, height)
+                } catch (_: Exception) { true }
+                TLog.i("decoder ${codec.name} (setup $level) started for ${width}x$height${if (sized) "" else " (it says it does not support that size)"} with $opts")
                 break
             } catch (_: Exception) {
                 codec.reset()
@@ -579,9 +636,14 @@ private class Decoder(
         if (!started) {
             codec.release()
             callbacks.quitSafely()
-            throw IllegalStateException("no H.264 decoder configuration accepted")
+            throw IllegalStateException("${codec.name} took no configuration")
         }
+        name = codec.name
     }
+
+    /** It has taken frames for a while and given none back (some decoders hang that way). */
+    fun silent(): Boolean =
+        outputs == 0 && inputs >= 30 && System.nanoTime() - firstInputAt > 2_000_000_000L
 
     /** [pts] is the host's timestamp; it only travels through the codec for latency stats. */
     /**
@@ -589,16 +651,17 @@ private class Decoder(
      * the caller rebuilds it rather than blocking the connection's reading thread.
      */
     fun feed(au: ByteArray, size: Int, pts: Long): Boolean {
-        val deadline = System.nanoTime() + 50_000_000L
+        val deadline = System.nanoTime() + stuckNanos
         while (open && !failed && System.nanoTime() < deadline) {
             val i = freeInputs.poll(10, TimeUnit.MILLISECONDS) ?: continue
             val buf = codec.getInputBuffer(i)!!
             buf.clear()
             buf.put(au, 0, size)
             codec.queueInputBuffer(i, 0, size, pts, 0)
+            if (inputs++ == 0) firstInputAt = System.nanoTime()
             return true
         }
-        if (open && !failed) android.util.Log.i("tabdisplay", "decoder stalled for 50 ms: rebuilding it")
+        if (open && !failed) error = "took no input for ${stuckNanos / 1_000_000} ms"
         return false
     }
 

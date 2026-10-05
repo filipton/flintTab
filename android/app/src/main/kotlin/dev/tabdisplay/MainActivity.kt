@@ -196,7 +196,15 @@ class MainActivity : Activity() {
                     CpuRenderer(surfaceView, changed, shown).also { it.lowestLatency = variant != 9 }
                 else -> null // the plain video path
             }
-            android.util.Log.i("tabdisplay", "renderer: ${front?.let { it::class.simpleName } ?: "video"}")
+            TLog.i(
+                "Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}), " +
+                    "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}: renderer " +
+                    when {
+                        front != null -> front!!::class.simpleName
+                        android.os.Build.VERSION.SDK_INT < 33 -> "plain video (the fast paths need Android 13)"
+                        else -> "plain video (the display cannot scan out CPU-written buffers)"
+                    }
+            )
             // Debugging: `adb shell am broadcast -a dev.tabdisplay.DUMP` saves what the panel shows.
             registerReceiver(object : android.content.BroadcastReceiver() {
                 override fun onReceive(c: android.content.Context, i: android.content.Intent) {
@@ -288,6 +296,8 @@ class MainActivity : Activity() {
             onCursorImage = front?.let { f -> { msg: ByteArray -> HostCursor.parseImage(msg)?.let { f.setCursorImage(it.bitmap, it.displayWidthPt, it.sizePt, it.hotPt) } } }
                 ?: hostCursor::setImage,
         ).also { it.setAudio(audioSwitch.isChecked) }
+        // Debugging: `--ei decoder N` starts at decoder setup N (1 plain, 2 software).
+        session?.decoderLevel = intent.getIntExtra("decoder", 0)
     }
 
     override fun onDestroy() {

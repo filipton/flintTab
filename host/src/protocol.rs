@@ -12,6 +12,7 @@
 //!              KIND_SCROLL value 0, then i16 dx, i16 dy (stream pixels, finger direction)
 //!              KIND_TIMING value 0, then u64 pts_us of a video frame the tablet showed, and
 //!                its u64 recv_start, recv_end, queued, decoded, shown times (tablet clock, µs)
+//!              KIND_LOG value 0, then u16 length and that much UTF-8 (the tablet's log)
 //!              KIND_PONG value 0, then u64 the ping's time (host clock), u64 when the tablet
 //!                read it (tablet clock), so the host can map tablet times onto its own clock
 //! Host -> tablet, a stream of frames: u8 kind, u32 len, payload
@@ -36,7 +37,7 @@
 use std::io::{self, Read};
 
 pub const MAGIC: &[u8; 4] = b"TDSP";
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 
 pub const MSG_CONFIG: u8 = 1;
 pub const MSG_VIDEO: u8 = 2;
@@ -57,6 +58,8 @@ pub const KIND_POINTER: u8 = 4;
 pub const KIND_SCROLL: u8 = 5;
 pub const KIND_TIMING: u8 = 6;
 pub const KIND_PONG: u8 = 7;
+/// u16 length, then that much UTF-8: a line from the tablet's log, printed by the host.
+pub const KIND_LOG: u8 = 8;
 
 pub const POINTER_MOVE: u8 = 0; // no button held (pen hover, cursor placement)
 pub const POINTER_LEFT_DOWN: u8 = 1;

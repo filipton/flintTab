@@ -211,12 +211,15 @@ impl LinkReader {
             self.fill()?;
         }
         // An app that lost its host retries every few seconds, each time with a new handshake
-        // that waits in the pipe: take the newest. Nothing else comes before the host answers.
+        // that waits in the pipe: take the newest, and what the app sent after it (its log).
         let mut more = vec![0; self.buf.len()];
         while let Ok(n) = self.handle.read_bulk(self.ep, &mut more, Duration::from_millis(30)) {
             if more[..n].starts_with(crate::protocol::MAGIC) {
                 self.buf[..n].copy_from_slice(&more[..n]);
                 (self.pos, self.len) = (0, n);
+            } else if self.len + n <= self.buf.len() {
+                self.buf[self.len..self.len + n].copy_from_slice(&more[..n]);
+                self.len += n;
             }
         }
         self.in_session = true;
