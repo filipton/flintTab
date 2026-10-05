@@ -326,7 +326,10 @@ class CpuRenderer(
                         }
                         // Lost (the decoder skipped it): decoding takes ~8-13 ms, so 50 ms is plenty,
                         // and what is queued behind it does not wait longer.
-                        frames.keys.any { it > u.pts } || System.nanoTime() - u.queuedAt > 50_000_000L -> updates.poll()
+                        frames.keys.any { it > u.pts } || System.nanoTime() - u.queuedAt > 50_000_000L -> {
+                            android.util.Log.i("tabdisplay", "video frame never decoded, skipped after ${(System.nanoTime() - u.queuedAt) / 1_000_000} ms")
+                            updates.poll()
+                        }
                         else -> {
                             handler.postDelayed(::process, 10) // in case it never comes
                             return
