@@ -6,3 +6,4 @@ local.properties
 *.apk
 .idea
 android/app/src/main/jniLibs
+dist

@@ -34,6 +34,11 @@ USB device: if it is missing, the host prints the udev rule to add (until then i
 To build it yourself: `cargo run --release -p tabdisplay-host` (Linux also needs
 `libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev` and the GStreamer plugins).
 
+## Building the files
+On a Mac with Xcode 26, the Android SDK and Docker: `tools/build.sh` builds both files, the tablet
+app inside, into `dist/` (the Linux one in Docker, then tested on clean Ubuntu and Arch). Nothing
+is versioned or uploaded; copy `dist/tabdisplay-linux-x86_64` to a Linux computer and run it.
+
 ## Releasing
 On a Mac with Xcode 26, the Android SDK, Docker and `gh`: `tools/release.sh 0.3.1`. It moves every
 version to 0.3.1, turns the commits since the last release into its CHANGELOG.md section (shown to
