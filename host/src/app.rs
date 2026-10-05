@@ -5,18 +5,13 @@ use std::{
     process::{Command, Stdio},
 };
 
-use crate::protocol;
-
 const PACKAGE: &str = "dev.tabdisplay";
 const APK_NAME: &str = "tabdisplay.apk";
 const REPO: &str = "filipton/macos-usb-display";
 
-/// Published by .github/workflows/android.yml, one release per protocol version.
+/// Attached to every release by tools/release.sh.
 fn release_url() -> String {
-    format!(
-        "https://github.com/{REPO}/releases/download/apk-v{}/{APK_NAME}",
-        protocol::VERSION
-    )
+    format!("https://github.com/{REPO}/releases/latest/download/{APK_NAME}")
 }
 
 /// The APK to install: `--apk`, then `tabdisplay.apk` next to the host or in the current
@@ -75,7 +70,7 @@ pub fn cache_dir() -> Option<PathBuf> {
 /// server has a newer one), else with the GitHub CLI, which can read a private repository.
 fn download() -> Option<PathBuf> {
     let dir = cache_dir()?;
-    let path = dir.join(format!("tabdisplay-v{}.apk", protocol::VERSION));
+    let path = dir.join("tabdisplay-latest.apk");
     let part = dir.join("download.part");
     let mut cmd = Command::new("curl");
     cmd.args(["-fsSL", "--max-time", "120", "-o"]).arg(&part);
@@ -85,7 +80,7 @@ fn download() -> Option<PathBuf> {
     cmd.arg(release_url()).stderr(Stdio::null());
     let ok = cmd.status().map(|s| s.success()).unwrap_or(false)
         || Command::new("gh")
-            .args(["release", "download", &format!("apk-v{}", protocol::VERSION), "--repo", REPO])
+            .args(["release", "download", "--repo", REPO])
             .args(["--pattern", APK_NAME, "--clobber", "--output"])
             .arg(&part)
             .stdout(Stdio::null())

@@ -44,7 +44,7 @@ use std::{
 const APP_ACTIVITY: &str = "dev.tabdisplay/.MainActivity";
 
 #[derive(Parser)]
-#[command(about = "Use an Android tablet as a USB secondary display for macOS")]
+#[command(version, about = "Use an Android tablet as a USB secondary display (macOS, Linux)")]
 pub struct Args {
     /// TCP port used between host and tablet (via `adb reverse`)
     #[arg(long, default_value_t = 27183)]

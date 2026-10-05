@@ -12,8 +12,8 @@ Android app: pixels / MediaCodec -> native NV12 front buffer, timed against the 
 ## Get it
 One file per computer, with the tablet app built in. Nothing else to install: if `adb` is
 missing, it downloads Android's platform-tools by itself (or prints the command to install it).
-Download from the [`latest` release](https://github.com/filipton/macos-usb-display/releases/tag/latest)
-(the repository is private: be logged in, or use `gh release download latest -R filipton/macos-usb-display`):
+Download from the [latest release](https://github.com/filipton/macos-usb-display/releases/latest)
+(the repository is private: be logged in, or use `gh release download -R filipton/macos-usb-display -p 'tabdisplay-*'`):
 
 - **macOS (Apple silicon):** `tabdisplay-macos-arm64`
 - **Linux (x86-64; Debian 12, Ubuntu 23.04, Fedora 37 or newer):** `tabdisplay-linux-x86_64`.
@@ -33,6 +33,13 @@ USB device: if it is missing, the host prints the udev rule to add (until then i
 
 To build it yourself: `cargo run --release -p tabdisplay-host` (Linux also needs
 `libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev` and the GStreamer plugins).
+
+## Releasing
+On a Mac with Xcode 26, the Android SDK, Docker and `gh`: `tools/release.sh 0.3.1`. It moves every
+version to 0.3.1, turns the commits since the last release into its CHANGELOG.md section (shown to
+accept or edit), builds both files with the tablet app in them (Linux in Docker, then run on clean
+Ubuntu and Arch), tags, pushes and creates the GitHub release. `--build` only builds; `--draft`
+makes a draft release. Commit subjects are `feat:`, `fix:`, `perf:`, ... so the changelog sorts them.
 
 ## The tablet app
 The host installs the app over adb when the tablet is plugged in, updates it when it differs
