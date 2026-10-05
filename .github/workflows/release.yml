@@ -1,6 +1,8 @@
 name: Release
 
 # One file per platform, the tablet app built in: download, run, nothing to install.
+# The macOS file is built on a Mac and uploaded with tools/release-mac.sh (macOS runners are
+# slow to get and the build needs Apple's SDK, so it cannot be made on Linux).
 on:
   push:
     branches: [main]
@@ -33,24 +35,6 @@ jobs:
         with:
           name: apk
           path: android/app/build/outputs/apk/release/app-release.apk
-
-  macos:
-    needs: apk
-    # ScreenCaptureKit's bindings use the macOS 26 SDK (Xcode 26).
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
-        with:
-          name: apk
-      - run: cargo test --release -p tabdisplay-host
-      - run: TABDISPLAY_APK=$PWD/app-release.apk cargo build --release -p tabdisplay-host
-      - run: cp target/release/tabdisplay-host tabdisplay-macos-arm64
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tabdisplay-macos-arm64
-          path: tabdisplay-macos-arm64
 
   linux:
     needs: apk
@@ -116,7 +100,7 @@ jobs:
           grep -q "all unpacked" fake.log && grep -q "keyframes_at=\[" fake.log
 
   publish:
-    needs: [macos, linux, other-distros]
+    needs: [linux, other-distros]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
@@ -131,4 +115,4 @@ jobs:
           chmod +x tabdisplay-*
           gh release view latest >/dev/null 2>&1 || gh release create latest --prerelease --target "$GITHUB_SHA" \
             --title "TabDisplay (latest)" --notes "Built from main. Download the file for your computer and run it; see the README."
-          gh release upload latest tabdisplay-macos-arm64 tabdisplay-linux-x86_64 --clobber
+          gh release upload latest tabdisplay-linux-x86_64 --clobber
