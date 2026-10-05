@@ -766,7 +766,11 @@ impl Host for LinuxHost {
         // a free one: always-copy (above) hands each back at once, and without a clock nothing
         // waits on a timestamp while holding one. Otherwise GNOME runs out on a fast GPU and
         // sends only empty "cursor moved" frames: a black tablet. (RustDesk does the same.)
-        capture.use_clock(None::<&gst::Clock>);
+        // (Only PipeWire: it sends when the screen changes. X11 and the test pattern are paced
+        // by the clock, and without one would run flat out.)
+        if matches!(self.source, Some(Source::Portal(_) | Source::Node(_))) {
+            capture.use_clock(None::<&gst::Clock>);
+        }
         let sink = capture.by_name("raw").unwrap().downcast::<gst_app::AppSink>().unwrap();
         // Frames the converter cannot read: the first one is described, since why depends on the
         // desktop. (Empty frames, which mutter sends when only the cursor moved, never get here.)
