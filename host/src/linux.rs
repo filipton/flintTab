@@ -663,22 +663,49 @@ impl Host for LinuxHost {
         .downcast::<gst::Pipeline>()
         .unwrap();
         let sink = capture.by_name("raw").unwrap().downcast::<gst_app::AppSink>().unwrap();
-        // Frames whose memory is smaller than their format says (some PipeWire versions hand
-        // over empty or partial buffers): the converter cannot read them, so drop them here.
+        // Frames the converter cannot read (it would only warn and drop them): dropped here, and
+        // the first one described, since why it is unreadable depends on the desktop's PipeWire.
         if let Some(pad) = capture.by_name("conv").and_then(|c| c.static_pad("sink")) {
-            let told = AtomicBool::new(false);
+            let (told, bad, good) = (AtomicBool::new(false), AtomicUsize::new(0), AtomicUsize::new(0));
             pad.add_probe(gst::PadProbeType::BUFFER, move |pad, probe| {
                 let Some(buf) = probe.buffer() else { return gst::PadProbeReturn::Ok };
-                let Some(info) = pad.current_caps().and_then(|c| gstreamer_video::VideoInfo::from_caps(&c).ok()) else {
+                let caps = pad.current_caps();
+                let Some(info) = caps.as_ref().and_then(|c| gstreamer_video::VideoInfo::from_caps(c).ok()) else {
                     return gst::PadProbeReturn::Ok;
                 };
-                if buf.meta::<gstreamer_video::VideoMeta>().is_none() && buf.size() < info.size() {
-                    if !told.swap(true, Ordering::Relaxed) {
-                        eprintln!("note: skipping screen frames smaller than their format ({} of {} bytes)", buf.size(), info.size());
+                if gstreamer_video::VideoFrameRef::from_buffer_ref_readable(buf, &info).is_ok() {
+                    if good.fetch_add(1, Ordering::Relaxed) == 0 && bad.load(Ordering::Relaxed) > 0 {
+                        eprintln!("note: readable screen frames again");
                     }
-                    return gst::PadProbeReturn::Drop;
+                    return gst::PadProbeReturn::Ok;
                 }
-                gst::PadProbeReturn::Ok
+                bad.fetch_add(1, Ordering::Relaxed);
+                if !told.swap(true, Ordering::Relaxed) {
+                    let mems: Vec<String> = (0..buf.n_memory())
+                        .map(|i| {
+                            let m = buf.peek_memory(i);
+                            format!("{} {} bytes", m.allocator().map(|a| a.memory_type().to_string()).unwrap_or_default(), m.size())
+                        })
+                        .collect();
+                    let meta = buf.meta::<gstreamer_video::VideoMeta>().map(|m| {
+                        format!("{:?} {}x{} stride {:?} offset {:?}", m.format(), m.width(), m.height(), m.stride(), m.offset())
+                    });
+                    eprintln!(
+                        "screen frames cannot be read: {} bytes in [{}], flags {:?}, video meta {}; format {:?} {}x{} needs {} bytes, \
+                         stride {:?}; caps {}",
+                        buf.size(),
+                        mems.join(", "),
+                        buf.flags(),
+                        meta.unwrap_or_else(|| "none".into()),
+                        info.format(),
+                        info.width(),
+                        info.height(),
+                        info.size(),
+                        info.stride(),
+                        caps.map(|c| c.to_string()).unwrap_or_default()
+                    );
+                }
+                gst::PadProbeReturn::Drop
             });
         }
         let captured = Arc::new(AtomicUsize::new(0));
