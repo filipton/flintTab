@@ -30,7 +30,8 @@ def added(node):
                 return
             time.sleep(0.02)
         print("pointer ok", flush=True)
-    threading.Thread(target=wiggle, daemon=True).start()
+    if "--still" not in sys.argv:
+        threading.Thread(target=wiggle, daemon=True).start()
 bus.add_signal_receiver(added, signal_name="PipeWireStreamAdded", dbus_interface=f"{M}.ScreenCast.Stream", path=stream_path)
 rd_session.Start()
 GLib.MainLoop().run()

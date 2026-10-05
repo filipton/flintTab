@@ -667,14 +667,14 @@ impl Host for LinuxHost {
         // Capture: NV12 frames of the tablet's size, the newest one handed to the frame thread.
         let src = self.source_desc(cfg)?;
         let capture = gst::parse::launch(&format!(
-            "{src} ! videoconvert name=conv n-threads=4 ! video/x-raw,format=NV12,width={w},height={h} \
+            "{src} ! identity drop-buffer-flags=corrupted ! videoconvert name=conv n-threads=4 ! video/x-raw,format=NV12,width={w},height={h} \
              ! appsink name=raw sync=false max-buffers=1 drop=true"
         ))?
         .downcast::<gst::Pipeline>()
         .unwrap();
         let sink = capture.by_name("raw").unwrap().downcast::<gst_app::AppSink>().unwrap();
-        // Frames the converter cannot read (it would only warn and drop them): dropped here, and
-        // the first one described, since why it is unreadable depends on the desktop's PipeWire.
+        // Frames the converter cannot read: the first one is described, since why depends on the
+        // desktop. (Empty frames, which mutter sends when only the cursor moved, never get here.)
         if let Some(pad) = capture.by_name("conv").and_then(|c| c.static_pad("sink")) {
             let (told, bad, good) = (AtomicBool::new(false), AtomicUsize::new(0), AtomicUsize::new(0));
             pad.add_probe(gst::PadProbeType::BUFFER, move |pad, probe| {
@@ -690,6 +690,8 @@ impl Host for LinuxHost {
                     return gst::PadProbeReturn::Ok;
                 }
                 bad.fetch_add(1, Ordering::Relaxed);
+                // Described, not dropped (the converter skips it): dropping a PipeWire buffer in a
+                // probe upset its reference counting.
                 if !told.swap(true, Ordering::Relaxed) {
                     let mems: Vec<String> = (0..buf.n_memory())
                         .map(|i| {
@@ -715,7 +717,7 @@ impl Host for LinuxHost {
                         caps.map(|c| c.to_string()).unwrap_or_default()
                     );
                 }
-                gst::PadProbeReturn::Drop
+                gst::PadProbeReturn::Ok
             });
         }
         let captured = Arc::new(AtomicUsize::new(0));
