@@ -158,7 +158,7 @@ DisplayObject VDisplay::CreateVirtualDisplay(unsigned int width,
 
   // Params [width, height, refreshRate, hiDPI, displayName, ppi, useMirror]
 
-  refreshRate = Clamp(refreshRate, 30, 60);
+  refreshRate = Clamp(refreshRate, 30, 240);
   ppi = Clamp(ppi, 72, 400);
 
   NSString *displayName = [NSString stringWithUTF8String:displayNameStr];

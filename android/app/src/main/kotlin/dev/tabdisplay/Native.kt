@@ -39,6 +39,12 @@ object Native {
     )
     @JvmStatic external fun yuvRender(handle: Long, index: Int): Boolean
     @JvmStatic external fun yuvDump(handle: Long, out: ByteBuffer)
+    @JvmStatic external fun yuvAttachFront(handle: Long, hb: android.hardware.HardwareBuffer, hint: Int): Boolean
+    @JvmStatic external fun yuvVsync(handle: Long, vsyncNanos: Long, periodNanos: Long)
+    @JvmStatic external fun yuvPresent(handle: Long, frame: Boolean): Boolean
+    @JvmStatic external fun yuvCountFrame(handle: Long)
+    @JvmStatic external fun yuvCursorImage(handle: Long, rgba: ByteBuffer, w: Int, h: Int)
+    @JvmStatic external fun yuvCursorMove(handle: Long, x: Int, y: Int, shown: Boolean)
     @JvmStatic external fun frontAddChainBuffer(handle: Long, hb: android.hardware.HardwareBuffer): Int
     @JvmStatic external fun frontRenderChain(handle: Long, index: Int): Boolean
     @JvmStatic external fun frontAddTwin(handle: Long, hb: android.hardware.HardwareBuffer): Boolean

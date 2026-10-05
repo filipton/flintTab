@@ -273,3 +273,47 @@ pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvDump(env: *mut JNIEn
         s.dump(unsafe { std::slice::from_raw_parts_mut(p, w * hh) });
     }
 }
+
+fn screen<'a>(h: jlong) -> &'a mut yuv::Screen {
+    unsafe { &mut *(h as *mut yuv::Screen) }
+}
+
+/// Front mode: the NV12 buffer `hb` (screen-sized) is scanned out and written in place.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvAttachFront(env: *mut JNIEnv, _c: jclass, h: jlong, hb: jobject, hint: jint) -> jni_sys::jboolean {
+    unsafe { screen(h).attach_front(env, hb, hint) as jni_sys::jboolean }
+}
+
+/// The panel's scan timing (front mode): a vsync (System.nanoTime clock) and the period, ns.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvVsync(_env: *mut JNIEnv, _c: jclass, h: jlong, vsync: jlong, period: jlong) {
+    screen(h).set_vsync(vsync, period);
+}
+
+/// Front mode: writes everything changed since the last call, timed against the scan.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvPresent(_env: *mut JNIEnv, _c: jclass, h: jlong, frame: jni_sys::jboolean) -> jni_sys::jboolean {
+    screen(h).present(frame != 0) as jni_sys::jboolean
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvCountFrame(_env: *mut JNIEnv, _c: jclass, h: jlong) {
+    screen(h).count_frame();
+}
+
+/// The cursor picture (front mode): premultiplied RGBA in a direct buffer, w x h pixels.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvCursorImage(env: *mut JNIEnv, _c: jclass, h: jlong, rgba: jobject, w: jint, hgt: jint) {
+    let p = direct(env, rgba);
+    if p.is_null() || w <= 0 || hgt <= 0 {
+        return;
+    }
+    let px = unsafe { std::slice::from_raw_parts(p, (w * hgt * 4) as usize) };
+    screen(h).set_cursor_image(px, w as usize, hgt as usize);
+}
+
+/// Moves the cursor's top-left to (x, y) in screen pixels (front mode).
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvCursorMove(_env: *mut JNIEnv, _c: jclass, h: jlong, x: jint, y: jint, shown: jni_sys::jboolean) {
+    screen(h).move_cursor(x as i64, y as i64, shown != 0);
+}

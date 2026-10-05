@@ -34,6 +34,8 @@ pub struct Link {
     ep_in: u8,
     ep_out: u8,
     max_packet: usize,
+    /// A handshake that arrived during a session, for the next one.
+    next: Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 fn serial_of<T: UsbContext>(dev: &rusb::Device<T>) -> Option<String> {
@@ -117,12 +119,30 @@ pub fn open(serial: &str) -> Option<Link> {
     })?;
     let handle = dev.open().ok()?;
     handle.claim_interface(iface).ok()?;
-    Some(Link { handle: Arc::new(handle), ep_in, ep_out, max_packet })
+    Some(Link { handle: Arc::new(handle), ep_in, ep_out, max_packet, next: Default::default() })
 }
 
 impl Link {
+    /// A reader for the next session: it starts with the handshake an earlier reader ran into.
     pub fn reader(&self) -> LinkReader {
-        LinkReader { handle: self.handle.clone(), ep: self.ep_in, buf: vec![0; 16384], pos: 0, len: 0, closed: Arc::new(AtomicBool::new(false)) }
+        let mut buf = vec![0; 16384];
+        let carried = std::mem::take(&mut *self.next.lock().unwrap());
+        buf[..carried.len()].copy_from_slice(&carried);
+        LinkReader {
+            handle: self.handle.clone(),
+            ep: self.ep_in,
+            buf,
+            pos: 0,
+            len: carried.len(),
+            closed: Arc::new(AtomicBool::new(false)),
+            in_session: false,
+            next: self.next.clone(),
+        }
+    }
+
+    /// The tablet app reconnected during the last session (its handshake is waiting).
+    pub fn reconnected(&self) -> bool {
+        !self.next.lock().unwrap().is_empty()
     }
 
     pub fn writer(&self) -> LinkWriter {
@@ -137,6 +157,9 @@ pub struct LinkReader {
     pos: usize,
     len: usize,
     closed: Arc<AtomicBool>,
+    /// Past the handshake: a new one means the app reconnected.
+    in_session: bool,
+    next: Arc<std::sync::Mutex<Vec<u8>>>,
 }
 
 impl LinkReader {
@@ -156,6 +179,16 @@ impl LinkReader {
             self.pos = self.len;
             self.fill()?;
         }
+        // An app that lost its host retries every few seconds, each time with a new handshake
+        // that waits in the pipe: take the newest. Nothing else comes before the host answers.
+        let mut more = vec![0; self.buf.len()];
+        while let Ok(n) = self.handle.read_bulk(self.ep, &mut more, Duration::from_millis(30)) {
+            if more[..n].starts_with(crate::protocol::MAGIC) {
+                self.buf[..n].copy_from_slice(&more[..n]);
+                (self.pos, self.len) = (0, n);
+            }
+        }
+        self.in_session = true;
         Ok(())
     }
 
@@ -165,6 +198,13 @@ impl LinkReader {
         }
         match self.handle.read_bulk(self.ep, &mut self.buf, IO_TIMEOUT) {
             Ok(n) => {
+                // The app closed the accessory and opened it again (closing it does not end
+                // anything on this side): this session is over, the handshake starts the next.
+                if self.in_session && self.buf[..n].starts_with(crate::protocol::MAGIC) {
+                    *self.next.lock().unwrap() = self.buf[..n].to_vec();
+                    self.closed.store(true, Ordering::Relaxed);
+                    return Err(io::ErrorKind::ConnectionReset.into());
+                }
                 self.pos = 0;
                 self.len = n;
                 Ok(())

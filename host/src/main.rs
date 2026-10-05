@@ -364,10 +364,14 @@ impl Conn {
 fn spawn_aoa(running: Arc<AtomicBool>, busy: Arc<AtomicBool>, current: Arc<std::sync::Mutex<Option<String>>>) -> mpsc::Receiver<Conn> {
     let (tx, rx) = mpsc::sync_channel(0);
     thread::spawn(move || {
+        let mut last: Option<aoa::Link> = None;
         while running.load(Ordering::Relaxed) {
             let serial = current.lock().unwrap().clone();
-            let link = match serial {
-                Some(s) if !busy.load(Ordering::Relaxed) => aoa::open(&s),
+            // The app reconnected during the last session (e.g. its panel rate changed): its
+            // handshake already came in on that link.
+            let link = match (last.take(), serial) {
+                (Some(l), _) if l.reconnected() => Some(l),
+                (_, Some(s)) if !busy.load(Ordering::Relaxed) => aoa::open(&s),
                 _ => None,
             };
             let Some(link) = link else {
@@ -387,8 +391,9 @@ fn spawn_aoa(running: Arc<AtomicBool>, busy: Arc<AtomicBool>, current: Arc<std::
             // Wait for that session to end before opening the accessory again.
             thread::sleep(Duration::from_millis(500));
             while busy.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(200));
+                thread::sleep(Duration::from_millis(50));
             }
+            last = Some(link);
         }
     });
     rx

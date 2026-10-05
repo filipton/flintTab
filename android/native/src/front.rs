@@ -248,9 +248,9 @@ fn rows_parallel(rows: std::ops::Range<usize>, pixels: usize, f: impl Fn(std::op
 
 const BLOCK: usize = 32;
 /// Share of a refresh the panel spends scanning rows (the rest is blanking).
-const SCAN_FRACTION: f64 = 0.97;
+pub const SCAN_FRACTION: f64 = 0.97;
 /// Margin for the uncertainty of where the scan is.
-const GUARD_NS: f64 = 400_000.0;
+pub const GUARD_NS: f64 = 400_000.0;
 
 pub fn now_ns() -> i64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
@@ -274,7 +274,7 @@ fn add_merged(list: &mut Vec<Rect>, mut r: Rect) {
 }
 
 /// Sleeps until shortly before `t`, then spins to it (sleep alone overshoots by ~0.1 ms).
-fn wait_until(t: i64) {
+pub fn wait_until(t: i64) {
     let left = t - now_ns();
     if left > 300_000 {
         std::thread::sleep(std::time::Duration::from_nanos((left - 200_000) as u64));

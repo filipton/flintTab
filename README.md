@@ -77,11 +77,15 @@ own scan (up to one refresh).
 - **Changed pixels, not video, for small changes.** The host finds which 16x16 blocks really
   changed and sends those as LZ4-compressed pixels: no encoder, no decoder (each costs ~7-9 ms
   per frame on this hardware). Large changes (scrolling, video) still go through H.264.
-- **Drawn straight into the scanned-out buffer.** On tablets whose display hardware can scan out
-  a CPU-written buffer, native code (Rust, NEON) converts updates and draws the cursor directly
-  into it: no GPU and no compositor queue (~17 ms at 90 Hz otherwise). Elsewhere the GPU does
-  the same front-buffered drawing. Fast changes may tear; "Lowest latency" in the tablet's
-  settings panel turns this off.
+- **Drawn straight into the scanned-out buffer, timed against the scan.** The screen is one
+  NV12 buffer the display hardware scans out itself (front-buffered); native code (Rust) copies
+  each update into it while the panel's scan is elsewhere, so nothing tears, and at most one
+  new frame per scan pass, so motion stays even. No GPU, no compositor queue (~17 ms at 90 Hz
+  otherwise). Turning off "Lowest latency" in the tablet's settings panel uses a regular
+  compositor-paced swap chain instead.
+- **The Mac renders at the tablet's rate.** The virtual display runs at the panel's refresh rate
+  (90 Hz here, not macOS's default 60); if the tablet's rate changes (its caps are lifted just
+  after the app starts) the app reconnects and the display follows.
 - **The tablet's own caps are lifted while streaming.** Battery saver and "Motion smoothness:
   Standard" both cap the panel at 60 Hz and slow the decoder; the host turns them off over adb
   and restores them on exit (`--keep-tablet-settings` leaves them alone).

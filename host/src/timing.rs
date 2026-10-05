@@ -49,6 +49,9 @@ struct Window {
     recv: Vec<f64>,
     bytes: usize,
     frames: usize,
+    /// Distinct captured frames shown (a frame's tiles are separate messages).
+    shown: usize,
+    last_delivered: Option<u64>,
 }
 
 struct Inner {
@@ -60,6 +63,7 @@ struct Inner {
 pub struct Timing {
     epoch: Instant,
     inner: Mutex<Inner>,
+    captured: std::sync::atomic::AtomicUsize,
 }
 
 impl Timing {
@@ -67,12 +71,18 @@ impl Timing {
         Self {
             epoch,
             inner: Mutex::new(Inner { frames: VecDeque::new(), pongs: VecDeque::new(), window: Window::default() }),
+            captured: Default::default(),
         }
     }
 
     /// Microseconds on the session clock.
     pub fn now(&self) -> u64 {
         self.epoch.elapsed().as_micros() as u64
+    }
+
+    /// The capture delivered a new frame.
+    pub fn captured(&self) {
+        self.captured.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Converts a time `age` before now to the session clock.
@@ -123,7 +133,8 @@ impl Timing {
     /// Answer to a ping sent at `sent` (session clock), received by the tablet at `tablet` (its clock).
     pub fn pong(&self, sent: u64, tablet: u64) {
         let now = self.now();
-        let rtt = now.saturating_sub(sent);
+        // An answer to an earlier session's ping (another clock): ignore it.
+        let Some(rtt) = now.checked_sub(sent).filter(|&r| r < 1_000_000) else { return };
         let offset = tablet as i64 - ((sent + now) / 2) as i64;
         let mut g = self.inner.lock().unwrap();
         if g.pongs.len() >= KEEP_PONGS {
@@ -169,6 +180,10 @@ impl Timing {
         w.recv.push((t.recv_end - t.recv_start.min(t.recv_end)) as f64 / 1000.0);
         w.bytes += f.bytes;
         w.frames += 1;
+        if f.delivered.is_some() && f.delivered != w.last_delivered {
+            w.shown += 1;
+            w.last_delivered = f.delivered;
+        }
         if since.elapsed() >= REPORT_EVERY {
             let secs = since.elapsed().as_secs_f64();
             let mut line = String::from("latency ms (median/p95):");
@@ -180,6 +195,8 @@ impl Timing {
             if let Some((m, p)) = median_p95(&mut w.recv) {
                 line += &format!(" | on the wire {m:.1}/{p:.1}");
             }
+            let captured = self.captured.swap(0, std::sync::atomic::Ordering::Relaxed);
+            line += &format!(" | captured {:.0} fps, shown {:.0}", captured as f64 / secs, g.window.shown as f64 / secs);
             let mut rtts: Vec<f64> = g.pongs.iter().map(|p| p.0 as f64 / 1000.0).collect();
             let w = &mut g.window;
             let rtt_median = median_p95(&mut rtts).map_or(0.0, |(m, _)| m);

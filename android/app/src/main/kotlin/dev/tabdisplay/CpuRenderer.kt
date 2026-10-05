@@ -40,8 +40,14 @@ class CpuRenderer(
             hint?.reportActualWorkDuration(System.nanoTime() - started)
         } catch (_: Exception) {}
     }
-    /** The default: NV12 buffers the compositor shows ([YuvChain]); the cursor is its own layer. */
+    /** The default: one NV12 buffer the panel scans out, written in place ([YuvFront]). */
+    private var yuvFront: YuvFront? = null
+    /** Without "lowest latency": NV12 buffers the compositor shows ([YuvChain]); cursor on its own layer. */
     private var yuv: YuvChain? = null
+    /** The NV12 screen, either way. */
+    private val screen: Long get() = yuvFront?.handle ?: yuv?.handle ?: 0L
+    /** False: the compositor-paced chain instead of the front buffer. */
+    var lowestLatency = true
     private val overlayCursor by lazy { HostCursor(view) }
     /** Fallback: RGBA buffers the compositor shows. */
     private var chain: SwapChain? = null
@@ -81,12 +87,13 @@ class CpuRenderer(
         handler.post(::attach)
     }
 
-    private val ready get() = yuv != null || handle != 0L
+    private val ready get() = screen != 0L || handle != 0L
 
     private fun attach() {
         if (ready) return
         when {
             useFrontBuffer -> front = CpuFront.attach(view)
+            lowestLatency && YuvFront.supported() -> yuvFront = YuvFront.attach(view)
             YuvChain.supported() -> yuv = YuvChain.attach(view, handler)
             else -> chain = SwapChain.attach(view, handler)
         }
@@ -135,7 +142,7 @@ class CpuRenderer(
     }
 
     override fun setCursorImage(bitmap: Bitmap?, displayWidthPt: Int, sizePt: IntArray, hotPt: IntArray) {
-        if (yuv != null) return overlayCursor.setImage(bitmap, displayWidthPt, sizePt, hotPt)
+        if (yuv != null && yuvFront == null) return overlayCursor.setImage(bitmap, displayWidthPt, sizePt, hotPt)
         if (bitmap == null || displayWidthPt == 0) return
         val scale = view.width.toFloat() / displayWidthPt
         // Scaled to the panel once here; the native sprite is drawn 1:1.
@@ -148,12 +155,27 @@ class CpuRenderer(
     }
 
     override fun moveCursor(x: Int, y: Int, shown: Boolean) {
-        if (yuv != null) return overlayCursor.move(x, y, shown)
+        if (yuv != null && yuvFront == null) return overlayCursor.move(x, y, shown)
         cursorX = x; cursorY = y; cursorShown = shown
         handler.post(::drawCursor)
     }
 
     private fun drawCursor() {
+        val s = screen
+        if (yuvFront != null) {
+            val img = cursorImage
+            if (img != null && img !== cursorUploaded) {
+                val buf = ByteBuffer.allocateDirect(img.byteCount).order(ByteOrder.nativeOrder())
+                img.copyPixelsToBuffer(buf) // premultiplied RGBA
+                Native.yuvCursorImage(s, buf, img.width, img.height)
+                cursorUploaded = img
+            }
+            val x = cursorX / 65535f * view.width - cursorHot[0]
+            val y = cursorY / 65535f * view.height - cursorHot[1]
+            Native.yuvCursorMove(s, x.toInt(), y.toInt(), cursorShown && img != null)
+            Native.yuvPresent(s, false)
+            return
+        }
         val h = handle
         if (h == 0L) return
         val img = cursorImage
@@ -179,8 +201,9 @@ class CpuRenderer(
             // Older: the frame time is the app's vsync, close enough to the panel's.
             val cb = object : android.view.Choreographer.FrameCallback {
                 override fun doFrame(t: Long) {
-                    if (handle == 0L) return
                     val hz = view.display?.refreshRate ?: 60f
+                    yuvFront?.let { Native.yuvVsync(it.handle, t, (1e9 / hz).toLong()); if (streamW > 0) it.refresh() }
+                    if (handle == 0L) return
                     Native.frontVsync(handle, t, (1e9 / hz).toLong())
                     choreographer.postFrameCallback(this)
                 }
@@ -190,8 +213,15 @@ class CpuRenderer(
         }
         val callback = object : android.view.Choreographer.VsyncCallback {
             override fun onVsync(data: android.view.Choreographer.FrameData) {
-                if (handle == 0L) return
                 val hz = view.display?.refreshRate ?: 60f
+                yuvFront?.let {
+                    Native.yuvVsync(it.handle, data.preferredFrameTimeline.expectedPresentationTimeNanos, (1e9 / hz).toLong())
+                    // Every refresh while streaming: keeps the display at its full rate.
+                    if (streamW > 0) it.refresh()
+                    choreographer.postVsyncCallback(this)
+                    return
+                }
+                if (handle == 0L) return
                 Native.frontVsync(handle, data.preferredFrameTimeline.expectedPresentationTimeNanos, (1e9 / hz).toLong())
                 val f = front
                 if (f != null && streamW > 0) {
@@ -222,6 +252,19 @@ class CpuRenderer(
      * soon as one comes back, with whatever arrived meanwhile.
      */
     private fun show() {
+        val f0 = yuvFront
+        if (f0 != null) {
+            // Into the scanned-out buffer, timed against the scan: on the panel as it passes.
+            // Tiles of one Mac frame go out as separate messages, pts 1 µs apart: one frame.
+            val newFrame = shown.any { it - lastFramePts > 1000 }
+            shown.maxOrNull()?.let { lastFramePts = maxOf(lastFramePts, it) }
+            Native.yuvPresent(f0.handle, newFrame)
+            if (newFrame) Native.yuvCountFrame(f0.handle)
+            val now = System.nanoTime()
+            for (p in shown) onShown(p, now)
+            shown.clear()
+            return
+        }
         val y = yuv
         if (y != null) {
             val batch = ArrayList(shown)
@@ -249,6 +292,9 @@ class CpuRenderer(
         shown.clear()
     }
 
+    /** The newest update presented (front mode). */
+    private var lastFramePts = Long.MIN_VALUE / 2
+
     /** Updates converted but not yet presented (render thread only). */
     private val shown = ArrayList<Long>()
 
@@ -259,8 +305,7 @@ class CpuRenderer(
             when (u) {
                 is Tile -> {
                     val cr = u.chroma.duplicate().also { it.position(1) }.slice()
-                    val y = yuv
-                    if (y != null) Native.yuvUpdate(y.handle, u.luma, u.w, u.chroma, cr, u.w, 2, u.x, u.y, u.x, u.y, u.x + u.w, u.y + u.h)
+                    if (screen != 0L) Native.yuvUpdate(screen, u.luma, u.w, u.chroma, cr, u.w, 2, u.x, u.y, u.x, u.y, u.x + u.w, u.y + u.h)
                     else Native.frontYuv(h, u.luma, u.w, u.chroma, cr, u.w, 2, u.x, u.y, u.x, u.y, u.x + u.w, u.y + u.h)
                     Native.recycle(u.luma)
                     Native.recycle(u.chroma)
@@ -307,9 +352,8 @@ class CpuRenderer(
         }
         if (x0 >= x1 || y0 >= y1) return
         val p = img.planes
-        val yc = yuv
-        if (yc != null) {
-            Native.yuvUpdate(yc.handle, p[0].buffer, p[0].rowStride, p[1].buffer, p[2].buffer, p[1].rowStride, p[1].pixelStride,
+        if (screen != 0L) {
+            Native.yuvUpdate(screen, p[0].buffer, p[0].rowStride, p[1].buffer, p[2].buffer, p[1].rowStride, p[1].pixelStride,
                 0, 0, x0, y0, x1, y1)
             return
         }
@@ -321,11 +365,10 @@ class CpuRenderer(
     fun dump(path: java.io.File) {
         handler.post {
             val h = handle
-            val yc = yuv
-            if (yc != null) {
+            if (screen != 0L) {
                 val b = dumpBuf ?: ByteBuffer.allocateDirect(view.width * view.height * 4).order(ByteOrder.nativeOrder()).also { dumpBuf = it }
                 b.clear()
-                Native.yuvDump(yc.handle, b)
+                Native.yuvDump(screen, b)
                 val bmp = Bitmap.createBitmap(view.width and 1.inv(), view.height and 1.inv(), Bitmap.Config.ARGB_8888)
                 b.rewind()
                 bmp.copyPixelsFromBuffer(b)
@@ -359,6 +402,8 @@ class CpuRenderer(
             chain = null
             yuv?.release()
             yuv = null
+            yuvFront?.release()
+            yuvFront = null
             overlayCursor.release()
         }
         thread.quitSafely()

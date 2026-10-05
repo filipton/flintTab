@@ -57,7 +57,9 @@ class MainActivity : Activity() {
         override fun onDisplayAdded(id: Int) {}
         override fun onDisplayRemoved(id: Int) {}
         override fun onDisplayChanged(id: Int) {
-            if (id == display?.displayId) refreshHz = pickFastestDisplayMode()
+            if (id != display?.displayId) return
+            refreshHz = pickFastestDisplayMode()
+            session?.panelChanged()
         }
     }
 
@@ -189,7 +191,9 @@ class MainActivity : Activity() {
             front = when {
                 variant == 3 -> FrontRenderer(surfaceView, changed, shown)
                 variant in 1..8 && CpuFront.supported() -> CpuRenderer(surfaceView, changed, shown).also { it.useFrontBuffer = true }
-                SwapChain.supported() -> CpuRenderer(surfaceView, changed, shown)
+                // 9: the compositor-paced NV12 chain instead of the front buffer.
+                YuvFront.supported() || YuvChain.supported() || SwapChain.supported() ->
+                    CpuRenderer(surfaceView, changed, shown).also { it.lowestLatency = variant != 9 }
                 else -> null // the plain video path
             }
             android.util.Log.i("tabdisplay", "renderer: ${front?.let { it::class.simpleName } ?: "video"}")

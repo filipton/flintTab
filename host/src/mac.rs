@@ -224,6 +224,7 @@ impl Host for MacHost {
                 }
                 drop(c);
                 let delivered = timing.now();
+                timing.captured();
                 let composited = age.map(|a| timing.ago(a));
                 capture_gate.push(Frame { buf, composited, delivered })
             },

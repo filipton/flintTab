@@ -74,6 +74,21 @@ class Session(
         sendControl(KIND_AUDIO, if (enabled) 1 else 0)
     }
 
+    /** The rate the host was told; it streams (and sizes its virtual display) for it. */
+    @Volatile private var sentFps = 0
+
+    /**
+     * The panel's modes changed (the host lifts the 60 Hz caps as the app starts, often after
+     * it said hello): reconnect if the stream rate should change, or a 60 fps stream lands on a
+     * 90 Hz panel and moves unevenly (one frame every 1.5 refreshes).
+     */
+    fun panelChanged() {
+        val fps = maxFps()
+        if (sentFps == 0 || fps == sentFps) return
+        android.util.Log.i("tabdisplay", "panel rate changed ($sentFps -> $fps fps): reconnecting")
+        try { socket?.close() } catch (_: Exception) {}
+    }
+
     fun stop() {
         running = false
         try { socket?.close() } catch (_: Exception) {}
@@ -221,7 +236,7 @@ class Session(
                 writeByte(VERSION)
                 writeInt(screenW)
                 writeInt(screenH)
-                writeInt(maxFps())
+                writeInt(maxFps().also { sentFps = it })
                 writeByte(if (front != null) FEATURE_TILES else 0)
             }
         }.toByteArray()
@@ -236,9 +251,25 @@ class Session(
         var config: IntArray? = null // w, h, fps
         var needKeyframe = false
         var frameBuf = ByteArray(1 shl 20) // reused: no per-frame allocation/GC
+        // The host answers the handshake at once and pings every second: silence means the
+        // link is dead (over USB the hello can get lost when the app restarts), so start over.
+        val lastRx = java.util.concurrent.atomic.AtomicLong(System.nanoTime())
+        val watchdog = thread(name = "link-watchdog", isDaemon = true) {
+            try {
+                while (true) {
+                    Thread.sleep(500)
+                    if (System.nanoTime() - lastRx.get() > 3_000_000_000L) {
+                        android.util.Log.i("tabdisplay", "host silent for 3 s: reconnecting")
+                        try { s.close() } catch (_: Exception) {}
+                        return@thread
+                    }
+                }
+            } catch (_: InterruptedException) {}
+        }
         try {
             while (running) {
                 val kind = input.readUnsignedByte()
+                lastRx.set(System.nanoTime())
                 val arrived = nowUs()
                 val len = input.readInt()
                 when (kind) {
@@ -337,6 +368,7 @@ class Session(
                 }
             }
         } finally {
+            watchdog.interrupt()
             onCursor(0, 0, false)
             decoder?.close()
             audio?.close()
