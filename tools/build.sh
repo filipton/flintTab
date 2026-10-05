@@ -3,7 +3,7 @@
 # given): nothing is committed, versioned or uploaded.
 #
 #   tabdisplay-macos-arm64    natively (needs Xcode 26)
-#   tabdisplay-linux-x86_64   in Docker: x86-64 Debian 12 with GStreamer bundled into the file,
+#   tabdisplay-linux-x86_64   in Docker: x86-64 Ubuntu 24.04 with GStreamer bundled into the file,
 #                             then run on clean Ubuntu and Arch containers against a stand-in tablet
 #   tabdisplay.apk            the tablet app
 #   SHA256SUMS
@@ -36,7 +36,7 @@ cp target/release/tabdisplay-host "$out/tabdisplay-macos-arm64"
 step "Linux (x86-64, in Docker)"
 docker build -q --platform linux/amd64 -t tabdisplay-build-amd64 -f tools/linux-build.Dockerfile tools >/dev/null
 docker run --rm --platform linux/amd64 -v "$PWD":/src -w /src \
-  -v tabdisplay-cargo-amd64:/usr/local/cargo/registry -v tabdisplay-target-amd64:/target -e CARGO_TARGET_DIR=/target \
+  -v tabdisplay-cargo-noble:/root/.cargo/registry -v tabdisplay-target-noble:/target -e CARGO_TARGET_DIR=/target \
   -e OUT="$out" tabdisplay-build-amd64 sh -c '
     set -e
     TABDISPLAY_APK=/src/$OUT/tabdisplay.apk cargo build -q --release -p tabdisplay-host

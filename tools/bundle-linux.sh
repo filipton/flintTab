@@ -1,7 +1,7 @@
 #!/bin/sh
 # Packs the Linux host with the GStreamer libraries and plugins it uses into one .tar.zst,
 # which the launcher (launcher/) carries: the release then needs nothing installed.
-# Run on the oldest distribution to support (CI: Debian 12), with the GStreamer runtime,
+# Run on the oldest distribution to support (Ubuntu 24.04, tools/linux-build.Dockerfile), with the GStreamer runtime,
 # its -dev packages and zstd installed. Usage: tools/bundle-linux.sh HOST_BINARY OUT.tar.zst
 set -eu
 host=$1

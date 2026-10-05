@@ -657,12 +657,30 @@ impl Host for LinuxHost {
         // Capture: NV12 frames of the tablet's size, the newest one handed to the frame thread.
         let src = self.source_desc(cfg)?;
         let capture = gst::parse::launch(&format!(
-            "{src} ! videoconvert n-threads=4 ! video/x-raw,format=NV12,width={w},height={h} \
+            "{src} ! videoconvert name=conv n-threads=4 ! video/x-raw,format=NV12,width={w},height={h} \
              ! appsink name=raw sync=false max-buffers=1 drop=true"
         ))?
         .downcast::<gst::Pipeline>()
         .unwrap();
         let sink = capture.by_name("raw").unwrap().downcast::<gst_app::AppSink>().unwrap();
+        // Frames whose memory is smaller than their format says (some PipeWire versions hand
+        // over empty or partial buffers): the converter cannot read them, so drop them here.
+        if let Some(pad) = capture.by_name("conv").and_then(|c| c.static_pad("sink")) {
+            let told = AtomicBool::new(false);
+            pad.add_probe(gst::PadProbeType::BUFFER, move |pad, probe| {
+                let Some(buf) = probe.buffer() else { return gst::PadProbeReturn::Ok };
+                let Some(info) = pad.current_caps().and_then(|c| gstreamer_video::VideoInfo::from_caps(&c).ok()) else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                if buf.meta::<gstreamer_video::VideoMeta>().is_none() && buf.size() < info.size() {
+                    if !told.swap(true, Ordering::Relaxed) {
+                        eprintln!("note: skipping screen frames smaller than their format ({} of {} bytes)", buf.size(), info.size());
+                    }
+                    return gst::PadProbeReturn::Drop;
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
         let captured = Arc::new(AtomicUsize::new(0));
         {
             let frames = frames.clone();

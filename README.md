@@ -16,7 +16,7 @@ Download from the [latest release](https://github.com/filipton/macos-usb-display
 (the repository is private: be logged in, or use `gh release download -R filipton/macos-usb-display -p 'tabdisplay-*'`):
 
 - **macOS (Apple silicon):** `tabdisplay-macos-arm64`
-- **Linux (x86-64; Debian 12, Ubuntu 23.04, Fedora 37 or newer):** `tabdisplay-linux-x86_64`.
+- **Linux (x86-64; Ubuntu 24.04, Debian 13, Fedora 40, Arch or newer):** `tabdisplay-linux-x86_64`.
   It carries its own GStreamer; it uses the desktop's PipeWire and your GPU's video driver
   (VA-API or NVIDIA) for hardware encoding, else encodes on the CPU. The first start unpacks
   it into `~/.cache/tabdisplay` (a few seconds).
