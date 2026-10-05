@@ -298,6 +298,9 @@ class CpuRenderer(
     /** Updates converted but not yet presented (render thread only). */
     private val shown = ArrayList<Long>()
 
+    /** Decoded frames given back unshown (see [processUpdates]); logged when it changes. */
+    private var orphans = 0
+
     private fun processUpdates() {
         val h = handle
         while (true) {
@@ -330,10 +333,20 @@ class CpuRenderer(
                 }
             }
         }
-        // Frames nobody waits for (should not happen): drop them.
-        if (updates.isEmpty() && frames.isNotEmpty()) {
-            frames.values.forEach { it.second() }
-            frames.clear()
+        // Frames nobody waits for (they came after their update was given up as lost): give
+        // them back now. Each holds one of the decoder's few output buffers; once all are
+        // held it stops taking input and the stream freezes.
+        if (frames.isNotEmpty()) {
+            val waiting = updates.mapNotNullTo(HashSet()) { (it as? Video)?.pts }
+            val it = frames.entries.iterator()
+            while (it.hasNext()) {
+                val e = it.next()
+                if (e.key !in waiting) {
+                    e.value.second()
+                    it.remove()
+                    android.util.Log.i("tabdisplay", "decoded frame came too late, given back (${++orphans} so far)")
+                }
+            }
         }
     }
 
