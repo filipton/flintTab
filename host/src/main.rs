@@ -226,6 +226,7 @@ pub trait Control: Send + Sync {
     fn close(&self);
 }
 
+#[derive(Clone)]
 pub struct StreamConfig {
     pub width: u32,
     pub height: u32,

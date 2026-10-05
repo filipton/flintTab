@@ -241,7 +241,7 @@ impl LinuxHost {
                 "videotestsrc is-live=true pattern=ball ! video/x-raw,width={w},height={h},framerate={fps}/1"
             ),
             Source::Node(n) => format!(
-                "pipewiresrc path={n} do-timestamp=true ! video/x-raw,max-framerate={fps}/1 ! videoscale ! video/x-raw,width={w},height={h}"
+                "pipewiresrc path={n} do-timestamp=true always-copy=true ! video/x-raw,max-framerate={fps}/1 ! videoscale ! video/x-raw,width={w},height={h}"
             ),
             Source::X11 { x, y } => format!(
                 "ximagesrc use-damage=false show-pointer=true startx={x} starty={y} endx={} endy={} \
@@ -259,7 +259,7 @@ impl LinuxHost {
                 // matches) sizes it exactly; KDE picks the size in its dialog and then
                 // videoscale really scales. PipeWire only sends frames when something changed.
                 format!(
-                    "pipewiresrc fd={raw} path={} do-timestamp=true \
+                    "pipewiresrc fd={raw} path={} do-timestamp=true always-copy=true \
                      ! video/x-raw,max-framerate={fps}/1 ! videoscale ! video/x-raw,width={w},height={h}",
                     p.node
                 )
@@ -518,6 +518,12 @@ struct Encoder {
     pipeline: gst::Pipeline,
     src: gst::Pad,
     pending: Pending,
+    /// It posted an error or refused a frame: time for the next encoder.
+    failed: Arc<AtomicBool>,
+    name: &'static str,
+    /// Debugging: TD_BREAK_ENCODER=<element> makes that encoder fail after a few frames.
+    break_after: Option<usize>,
+    frames: AtomicUsize,
 }
 
 /// The running time of `buf` in `sample`'s segment, in µs: the pts it was pushed with
@@ -528,9 +534,11 @@ fn running_us(sample: &gst::Sample, buf: &gst::BufferRef) -> Option<u64> {
 }
 
 impl Encoder {
-    /// The first candidate that starts and encodes a test frame.
+    /// The first candidate that starts and encodes a test frame; with `after`, only those
+    /// after it in the list (the one that stopped working).
     fn start(
         wanted: Option<&str>,
+        after: Option<&str>,
         cfg: &StreamConfig,
         frames: &Arc<Frames<GstFrame>>,
         tx: &mpsc::Sender<Vec<u8>>,
@@ -540,7 +548,12 @@ impl Encoder {
             None => anyhow!("no H.264 encoder found (install gstreamer1.0-plugins-bad and -ugly)"),
         };
         let StreamConfig { width: w, height: h, fps, .. } = *cfg;
+        let mut skipping = after.is_some();
         for (name, pre, props) in encoders(cfg) {
+            if skipping {
+                skipping = Some(name) != after;
+                continue;
+            }
             if wanted.is_some_and(|e| e != name) || gst::ElementFactory::find(name).is_none() {
                 continue;
             }
@@ -556,7 +569,7 @@ impl Encoder {
     }
 
     fn try_start(
-        name: &str,
+        name: &'static str,
         pre: &str,
         props: &[(&str, String)],
         (w, h, fps): (u32, u32, u32),
@@ -626,7 +639,8 @@ impl Encoder {
         src.push_event(gst::event::StreamStart::new("tabdisplay"));
         src.push_event(gst::event::Caps::new(&caps));
         src.push_event(gst::event::Segment::new(&gst::FormattedSegment::<gst::ClockTime>::new()));
-        let encoder = Self { pipeline, src, pending };
+        let break_after = (std::env::var("TD_BREAK_ENCODER").as_deref() == Ok(name)).then_some(2);
+        let encoder = Self { pipeline, src, pending, failed: Default::default(), name, break_after, frames: AtomicUsize::new(0) };
 
         // One black frame: many encoders only fail once they see data.
         let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::Nv12, w, h).build()?;
@@ -643,7 +657,7 @@ impl Encoder {
         let pushed = encoder.src.push(b);
         encoder.drain();
         if probe_rx.recv_timeout(Duration::from_secs(3)).is_ok() {
-            watch_errors(&encoder.pipeline, "encoder");
+            watch_errors(&encoder.pipeline, "encoder", Some(encoder.failed.clone()));
             return Ok(encoder);
         }
         let bus = encoder.pipeline.bus().unwrap();
@@ -664,8 +678,15 @@ impl Encoder {
         self.src.peer_query(&mut q);
     }
 
-    /// Encodes `f` as `pts`; its output goes out from the sink callback.
-    fn encode(&self, f: &Frame<GstFrame>, pts: u64, area: [u16; 4], keyframe: bool) {
+    /// Encodes `f` as `pts`; its output goes out from the sink callback. False once the
+    /// encoder has failed (an error, or a frame refused).
+    fn encode(&self, f: &Frame<GstFrame>, pts: u64, area: [u16; 4], keyframe: bool) -> bool {
+        if self.break_after.is_some_and(|n| self.frames.fetch_add(1, Ordering::Relaxed) >= n) {
+            self.failed.store(true, Ordering::Relaxed);
+        }
+        if self.failed.load(Ordering::Relaxed) {
+            return false;
+        }
         {
             let mut p = self.pending.lock().unwrap();
             p.retain(|&t, _| t + 2_000_000 > pts); // frames an encoder dropped
@@ -677,20 +698,20 @@ impl Encoder {
         let mut b = f.buf.buf.copy(); // shares the pixels
         b.make_mut().set_pts(gst::ClockTime::from_useconds(pts));
         if let Err(e) = self.src.push(b) {
-            static TOLD: AtomicBool = AtomicBool::new(false);
-            if !TOLD.swap(true, Ordering::Relaxed) {
-                eprintln!("encoder refused a frame: {e:?}");
-            }
+            eprintln!("{} refused a frame: {e:?}", self.name);
+            self.failed.store(true, Ordering::Relaxed);
+            return false;
         }
         // Still inside: an encoder that holds frames back. Have it finish them now.
         if self.pending.lock().unwrap().contains_key(&pts) {
             self.drain();
         }
+        !self.failed.load(Ordering::Relaxed)
     }
 }
 
 /// Prints what goes wrong in a pipeline after it started (otherwise nobody would see it).
-fn watch_errors(p: &gst::Pipeline, what: &'static str) {
+fn watch_errors(p: &gst::Pipeline, what: &'static str, failed: Option<Arc<AtomicBool>>) {
     let bus = p.bus().unwrap();
     let pipeline = p.downgrade();
     std::thread::spawn(move || {
@@ -698,7 +719,12 @@ fn watch_errors(p: &gst::Pipeline, what: &'static str) {
             if let Some(msg) = bus.timed_pop_filtered(gst::ClockTime::from_mseconds(250), &[gst::MessageType::Error, gst::MessageType::Warning]) {
                 let src = msg.src().map(|s| s.name().to_string()).unwrap_or_default();
                 match msg.view() {
-                    gst::MessageView::Error(e) => eprintln!("{what} failed ({src}): {} ({:?})", e.error(), e.debug()),
+                    gst::MessageView::Error(e) => {
+                        eprintln!("{what} failed ({src}): {} ({:?})", e.error(), e.debug());
+                        if let Some(f) = &failed {
+                            f.store(true, Ordering::Relaxed);
+                        }
+                    }
                     gst::MessageView::Warning(w) => eprintln!("{what} warning ({src}): {}", w.error()),
                     _ => {}
                 }
@@ -725,7 +751,7 @@ impl Host for LinuxHost {
         // Debugging: TD_TILES=none sends everything through H.264.
         let use_tiles = cfg.tiles && std::env::var("TD_TILES").map_or(true, |v| v != "none");
         let frames = Frames::<GstFrame>::new(timing.clone(), w, h);
-        let (encoder, name) = Encoder::start(self.encoder.as_deref(), cfg, &frames, &tx)?;
+        let (encoder, name) = Encoder::start(self.encoder.as_deref(), None, cfg, &frames, &tx)?;
         println!("encoding with {name}");
 
         // Capture: NV12 frames of the tablet's size, the newest one handed to the frame thread.
@@ -736,6 +762,11 @@ impl Host for LinuxHost {
         ))?
         .downcast::<gst::Pipeline>()
         .unwrap();
+        // The compositor shares frames through a few buffers and can only draw a new frame into
+        // a free one: always-copy (above) hands each back at once, and without a clock nothing
+        // waits on a timestamp while holding one. Otherwise GNOME runs out on a fast GPU and
+        // sends only empty "cursor moved" frames: a black tablet. (RustDesk does the same.)
+        capture.use_clock(None::<&gst::Clock>);
         let sink = capture.by_name("raw").unwrap().downcast::<gst_app::AppSink>().unwrap();
         // Frames the converter cannot read: the first one is described, since why depends on the
         // desktop. (Empty frames, which mutter sends when only the cursor moved, never get here.)
@@ -824,9 +855,31 @@ impl Host for LinuxHost {
         let frame_thread = {
             let frames = frames.clone();
             let tx = tx.clone();
-            let enc = encoder;
+            let mut enc = encoder;
+            let (wanted, cfg) = (self.encoder.clone(), cfg.clone());
             Some(std::thread::spawn(move || {
-                frames.run(use_tiles, tx, |f, pts, area, keyframe| enc.encode(f, pts, area, keyframe));
+                let frames2 = frames.clone();
+                let tx2 = tx.clone();
+                let mut exhausted = false;
+                frames.run(use_tiles, tx, |f, pts, area, keyframe| {
+                    if exhausted || enc.encode(f, pts, area, keyframe) {
+                        return;
+                    }
+                    // A hardware encoder can pass its test frame and still fail on real ones:
+                    // carry on with the next one rather than leave the tablet black.
+                    let _ = enc.pipeline.set_state(gst::State::Null);
+                    match Encoder::start(wanted.as_deref(), Some(enc.name), &cfg, &frames2, &tx2) {
+                        Ok((next, name)) => {
+                            eprintln!("{} stopped working; encoding with {name} instead", enc.name);
+                            enc = next;
+                            enc.encode(f, pts, area, true);
+                        }
+                        Err(e) => {
+                            eprintln!("{} stopped working and no other encoder works: {e:#}", enc.name);
+                            exhausted = true;
+                        }
+                    }
+                });
                 let _ = enc.pipeline.set_state(gst::State::Null);
             }))
         };
