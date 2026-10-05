@@ -324,9 +324,11 @@ class CpuRenderer(
                             shown.add(u.pts)
                             updates.poll()
                         }
-                        frames.keys.any { it > u.pts } || System.nanoTime() - u.queuedAt > 300_000_000L -> updates.poll() // lost
+                        // Lost (the decoder skipped it): decoding takes ~8-13 ms, so 50 ms is plenty,
+                        // and what is queued behind it does not wait longer.
+                        frames.keys.any { it > u.pts } || System.nanoTime() - u.queuedAt > 50_000_000L -> updates.poll()
                         else -> {
-                            handler.postDelayed(::process, 50) // in case it never comes
+                            handler.postDelayed(::process, 10) // in case it never comes
                             return
                         }
                     }
