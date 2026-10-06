@@ -46,9 +46,15 @@ impl SCStreamOutput for VideoHandler {
             Duration::from_nanos(now.saturating_sub(shown) * tb[0] as u64 / tb[1].max(1) as u64)
         });
         // The areas that changed since the previous frame.
-        let dirty = sample.dirty_rects().map(|rects| {
+        let dirty: Dirty = sample.dirty_rects().map(|rects| {
             rects.iter().filter(|r| r.width > 0.0 && r.height > 0.0).map(|r| [r.x, r.y, r.x + r.width, r.y + r.height]).collect()
         });
+        if std::env::var_os("TD_DEBUG_DIRTY").is_some()
+            && let Some(d) = &dirty
+        {
+            let max = d.iter().fold([0f64; 2], |m: [f64; 2], r: &[f64; 4]| [m[0].max(r[2]), m[1].max(r[3])]);
+            eprintln!("dirty: {} rects, reaching {:.0}x{:.0}; frame {}x{}", d.len(), max[0], max[1], pixel_buffer.width(), pixel_buffer.height());
+        }
         // Zero-copy: the IOSurface-backed NV12 buffer (retained) goes straight to the encoder.
         (self.sink.lock().unwrap())(pixel_buffer, age, dirty);
     }

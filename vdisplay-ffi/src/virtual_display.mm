@@ -95,7 +95,12 @@ void VDisplay::InitializeDescriptor(NSString *displayName, unsigned int width,
   _descriptor.sizeInMillimeters = CGSizeMake(width * ratio, height * ratio);
   _descriptor.productID = 0xeeee + width + height + ppi;
   _descriptor.vendorID = 0xeeee;
-  _descriptor.serialNum = 0x0001;
+  // A serial number from the name: each tablet's display is its own monitor to macOS (which
+  // keys arrangement, mirroring and capture on vendor/product/serial; two displays with the
+  // same serial got mirrored and one captured in place of the other).
+  unsigned int serial = 2166136261u;
+  for (const char *c = displayName.UTF8String; c && *c; c++) serial = (serial ^ (unsigned char)*c) * 16777619u;
+  _descriptor.serialNum = serial ? serial : 1;
 
   dispatch_queue_t queue =
       dispatch_queue_create("com.vdisplay.queue", DISPATCH_QUEUE_SERIAL);

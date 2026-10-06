@@ -267,6 +267,9 @@ pub struct StreamConfig {
     pub timing: Arc<timing::Timing>,
     /// The tablet draws small updates sent as pixels (MSG_TILE).
     pub tiles: bool,
+    /// Which tablet (its adb serial, or "tablet"): names its virtual display, so each tablet
+    /// is a monitor of its own to the computer.
+    pub tablet: String,
 }
 
 /// A running capture + encode pipeline; dropping `guard` stops it.
@@ -437,7 +440,7 @@ fn spawn_aoa(running: Arc<AtomicBool>, on_aoa: Arc<AtomicBool>, current: Arc<std
     rx
 }
 
-fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBool) -> Result<()> {
+fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBool, tablet: &str) -> Result<()> {
     let Conn { mut reader, writer, close, ready, via } = conn;
     let hello = protocol::read_hello(&mut reader)?;
     ready();
@@ -468,7 +471,7 @@ fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBoo
 
     let epoch = std::time::Instant::now();
     let timing = Arc::new(timing::Timing::new(epoch));
-    let cfg = StreamConfig { width, height, fps, bitrate, epoch, timing: timing.clone(), tiles: hello.tiles };
+    let cfg = StreamConfig { width, height, fps, bitrate, epoch, timing: timing.clone(), tiles: hello.tiles, tablet: tablet.to_owned() };
     // Clock sync for the latency breakdown; cheap enough to run all the time.
     {
         let tx = tx.clone();
@@ -647,7 +650,8 @@ fn main() -> Result<()> {
             Some(conn) => {
                 busy.store(true, Ordering::Relaxed);
                 on_aoa.store(conn.via == "USB accessory", Ordering::Relaxed);
-                if let Err(e) = run_session(conn, &args, host.as_mut(), &running) {
+                let tablet = current.lock().unwrap().clone().or_else(|| args.serial.clone()).unwrap_or_else(|| "tablet".into());
+                if let Err(e) = run_session(conn, &args, host.as_mut(), &running, &tablet) {
                     eprintln!("session error: {e:#}");
                 }
                 if !args.no_adb

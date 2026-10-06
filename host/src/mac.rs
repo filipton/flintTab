@@ -27,7 +27,7 @@ use std::ffi::c_void;
 /// so a quick reconnect reuses it and macOS does not shuffle windows back to the main screen.
 pub struct MacHost {
     vd: vdisplay_ffi::VDisplay,
-    current: Option<((u32, u32, u32), u32)>, // (w, h, fps), display id
+    current: Option<((u32, u32, u32), String, u32)>, // (w, h, fps), name, display id
     idle_since: Option<Instant>,
 }
 
@@ -36,20 +36,21 @@ impl MacHost {
         Self { vd: vdisplay_ffi::VDisplay::new(), current: None, idle_since: None }
     }
 
-    fn display(&mut self, args: &Args, w: u32, h: u32, fps: u32) -> Result<u32> {
+    fn display(&mut self, args: &Args, w: u32, h: u32, fps: u32, name: &str) -> Result<u32> {
         self.idle_since = None;
-        if let Some((mode, id)) = self.current {
-            if mode == (w, h, fps) {
+        if let Some((mode, current_name, id)) = &self.current {
+            let id = *id;
+            if *mode == (w, h, fps) && current_name == name {
                 println!("reusing the virtual display");
                 return Ok(id);
             }
             self.shutdown();
         }
-        let d = self.vd.create_virtual_display(w, h, fps as f64, !args.no_hidpi, "Tablet", args.ppi, false);
+        let d = self.vd.create_virtual_display(w, h, fps as f64, !args.no_hidpi, name, args.ppi, false);
         if d.display_id == 0 {
             bail!("failed to create the virtual display");
         }
-        self.current = Some(((w, h, fps), d.display_id));
+        self.current = Some(((w, h, fps), name.to_owned(), d.display_id));
         Ok(d.display_id)
     }
 }
@@ -112,7 +113,8 @@ impl Host for MacHost {
         let timing = cfg.timing.clone();
         // Debugging: TD_TILES=none sends everything through H.264.
         let use_tiles = cfg.tiles && std::env::var("TD_TILES").map_or(true, |v| v != "none");
-        let display_id = self.display(args, w, h, fps)?;
+        // Named after the tablet: a monitor of its own to macOS (see vdisplay-ffi's serial).
+        let display_id = self.display(args, w, h, fps, &format!("Tablet {}", cfg.tablet))?;
         let frames = Frames::<CVPixelBuffer>::new(timing.clone(), w, h);
         let gate = frames.gate.clone();
 
