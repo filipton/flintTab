@@ -74,6 +74,10 @@ tablet's screen and streams it.
 - **X11:** make room for the tablet (`xrandr --fb`, `xrandr --setmonitor tablet 2560/0x1600/0+1920+0 none`,
   or an EVDI output) and run with `--x11-region 1920,0`.
 
+**Several tablets:** run one host per tablet, each with its serial and its own port:
+`tabdisplay-host -s SERIAL1 --port 27183` and `tabdisplay-host -s SERIAL2 --port 27184`
+(serials from `adb devices`). Each tablet gets its own display.
+
 **Touch and pen** are off by default, so the tablet is purely a display for the computer's own
 mouse and keyboard; a tap shows the settings panel. Turn on *Touch controls mouse* there to
 use them: tap to click, drag to drag, two-finger drag to scroll, two-finger tap to right-click,

@@ -46,7 +46,8 @@ const APP_ACTIVITY: &str = "dev.tabdisplay/.MainActivity";
 #[derive(Parser)]
 #[command(version, about = "Use an Android tablet as a USB secondary display (macOS, Linux)")]
 pub struct Args {
-    /// TCP port used between host and tablet (via `adb reverse`)
+    /// TCP port on this computer for the adb fallback (`adb reverse`); give each host its own
+    /// when running one per tablet
     #[arg(long, default_value_t = 27183)]
     port: u16,
     /// Frame rate (30-120). Default: the tablet's refresh rate, if it can decode that fast
@@ -174,7 +175,10 @@ fn spawn_adb_watcher(args: &Args, busy: Arc<AtomicBool>, current: Arc<std::sync:
         let mut tweaked: Option<String> = None;
         loop {
             if !busy.load(Ordering::Relaxed) {
+                // The app always dials 27183; on this computer it can be any port (several hosts,
+                // one per tablet).
                 let spec = format!("tcp:{port}");
+                let app_spec = "tcp:27183";
                 let device = pick_device(&adb, wanted.as_deref());
                 // Before the port forward, so the app cannot connect while the caps still apply.
                 if tweak && device != tweaked {
@@ -185,7 +189,7 @@ fn spawn_adb_watcher(args: &Args, busy: Arc<AtomicBool>, current: Arc<std::sync:
                 }
                 let device = device.filter(|serial| {
                     Command::new(&adb)
-                        .args(["-s", serial, "reverse", &spec, &spec])
+                        .args(["-s", serial, "reverse", app_spec, &spec])
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .status()
