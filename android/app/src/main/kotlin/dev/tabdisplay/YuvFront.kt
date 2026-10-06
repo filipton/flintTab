@@ -15,16 +15,16 @@ import android.view.SurfaceView
  * again every refresh, so it keeps the display at full rate (it idles to 30 Hz otherwise).
  */
 class YuvFront private constructor(
-    val handle: Long,
+    override val handle: Long,
     private val sc: SurfaceControl,
     private val buffer: HardwareBuffer,
-) {
+) : FrontBuffer {
     private val notifier = android.os.HandlerThread("front-refresh").apply { start() }
     private val notifyHandler = android.os.Handler(notifier.looper)
     private val pending = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** Once per refresh while streaming: keeps the display active at its full rate. */
-    fun refresh() {
+    override fun refresh() {
         if (!pending.compareAndSet(false, true)) return
         notifyHandler.post {
             pending.set(false)
@@ -34,7 +34,7 @@ class YuvFront private constructor(
         }
     }
 
-    fun release() {
+    override fun release() {
         notifier.quitSafely()
         SurfaceControl.Transaction().reparent(sc, null).apply()
         sc.release()
@@ -83,4 +83,18 @@ class YuvFront private constructor(
             return YuvFront(handle, sc, buffer)
         }
     }
+}
+
+/** One NV12 buffer the panel scans out, written in place ([YuvFront] on Android 13+, [NdkFront] before). */
+interface FrontBuffer {
+    /** The NV12 screen (yuv.rs) that writes it. */
+    val handle: Long
+
+    /** Once per refresh while streaming: keeps the display at its full rate. */
+    fun refresh()
+
+    /** The newest hardware vsync, if this knows it (0: the caller's frame time is the best guess). */
+    fun vsync(): Long = 0
+
+    fun release()
 }

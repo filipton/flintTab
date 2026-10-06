@@ -52,6 +52,7 @@ unsafe extern "C" {
     fn ASurfaceTransaction_setOnComplete(t: *mut ASurfaceTransaction, context: *mut c_void, f: OnComplete);
     fn ASurfaceTransactionStats_getLatchTime(stats: *mut ASurfaceTransactionStats) -> i64;
     fn ASurfaceTransactionStats_getPreviousReleaseFenceFd(stats: *mut ASurfaceTransactionStats, sc: *mut ASurfaceControl) -> i32;
+    fn ASurfaceTransactionStats_getPresentFenceFd(stats: *mut ASurfaceTransactionStats) -> i32;
 }
 
 const VISIBILITY_SHOW: i8 = 1;
@@ -90,6 +91,10 @@ pub struct Chain {
     freed: jmethodID,
     /// committed(): the compositor took the frame for its next refresh (null before Android 12).
     committed: jmethodID,
+    /// Front mode: the present fence of the newest refresh (-1: none), and the newest time one
+    /// signaled: a hardware vsync, when the panel's scan started over.
+    present_fence: Mutex<i32>,
+    vsync_ns: std::sync::atomic::AtomicI64,
 }
 
 unsafe impl Send for Chain {}
@@ -126,11 +131,8 @@ impl Chain {
                 (fns.GetMethodID.unwrap())(env, class, n.as_ptr(), s.as_ptr())
             };
             let (presented, freed, committed) = (method("presented", "(JJ)V"), method("freed", "()V"), method("committed", "()V"));
-            if presented.is_null() || freed.is_null() {
-                (fns.ExceptionClear.unwrap())(env);
-                ASurfaceControl_release(sc);
-                return None;
-            }
+            // A front-mode owner (NdkFront) has none of the swap chain's callbacks.
+            (fns.ExceptionClear.unwrap())(env);
             let owner = (fns.NewGlobalRef.unwrap())(env, owner);
 
             let t = ASurfaceTransaction_create();
@@ -152,6 +154,8 @@ impl Chain {
                 presented,
                 freed,
                 committed,
+                present_fence: Mutex::new(-1),
+                vsync_ns: Default::default(),
             }))
         }
     }
@@ -207,7 +211,35 @@ impl Chain {
         }
     }
 
+    /// Front mode: hands buffer `i` (on screen already, written in place) to the compositor
+    /// again: it keeps the display at its full rate and the layer its own plane (one left alone
+    /// may be merged into a cached composition, which writes in place would not reach).
+    pub fn show(self: &Arc<Self>, i: usize) {
+        let Some(&b) = self.bufs.lock().unwrap().get(i) else { return };
+        unsafe {
+            let t = ASurfaceTransaction_create();
+            ASurfaceTransaction_setBuffer(t, self.sc, b, -1);
+            ASurfaceTransaction_setOnComplete(t, Arc::into_raw(self.clone()) as *mut c_void, on_shown);
+            ASurfaceTransaction_apply(t);
+            ASurfaceTransaction_delete(t);
+        }
+    }
+
+    /// Front mode: the newest hardware vsync seen (0: none yet).
+    pub fn vsync(&self) -> i64 {
+        let mut fd = self.present_fence.lock().unwrap();
+        if *fd >= 0 && let Some(t) = signal_time(*fd) {
+            unsafe { libc::close(*fd) };
+            *fd = -1;
+            self.vsync_ns.store(t, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.vsync_ns.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     unsafe fn call(&self, method: jmethodID, args: &[jvalue]) {
+        if method.is_null() {
+            return;
+        }
         unsafe {
             let vm = self.vm;
             let mut env: *mut JNIEnv = std::ptr::null_mut();
@@ -247,6 +279,66 @@ impl Drop for Chain {
             }
             ASurfaceControl_release(self.sc);
         }
+    }
+}
+
+/// Front mode: a refresh's present fence, read once it signaled (by the next refresh).
+unsafe extern "C" fn on_shown(context: *mut c_void, stats: *mut ASurfaceTransactionStats) {
+    let chain = unsafe { Arc::from_raw(context as *const Chain) };
+    let fence = unsafe { ASurfaceTransactionStats_getPresentFenceFd(stats) };
+    let release = unsafe { ASurfaceTransactionStats_getPreviousReleaseFenceFd(stats, chain.sc) };
+    if release >= 0 {
+        unsafe { libc::close(release) };
+    }
+    if fence < 0 {
+        return;
+    }
+    let mut fd = chain.present_fence.lock().unwrap();
+    // The older one: read now if it signaled, else replaced (one fence per refresh is plenty).
+    if *fd >= 0 {
+        if let Some(t) = signal_time(*fd) {
+            chain.vsync_ns.store(t, std::sync::atomic::Ordering::Relaxed);
+        }
+        unsafe { libc::close(*fd) };
+    }
+    *fd = fence;
+}
+
+/// When sync file `fd` signaled (CLOCK_MONOTONIC ns), None if it has not (linux/sync_file.h).
+fn signal_time(fd: i32) -> Option<i64> {
+    #[repr(C)]
+    struct FileInfo {
+        name: [u8; 32],
+        status: i32,
+        flags: u32,
+        num_fences: u32,
+        pad: u32,
+        fences: u64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FenceInfo {
+        obj_name: [u8; 32],
+        driver_name: [u8; 32],
+        status: i32,
+        flags: u32,
+        timestamp_ns: u64,
+    }
+    // _IOWR('>', 4, struct sync_file_info)
+    const SYNC_IOC_FILE_INFO: libc::c_int = (0xC000_0000u32 | (56 << 16) | (0x3E << 8) | 4) as libc::c_int;
+    unsafe {
+        let mut info: FileInfo = std::mem::zeroed();
+        if libc::ioctl(fd, SYNC_IOC_FILE_INFO as _, &mut info) != 0 || info.status != 1 || info.num_fences == 0 {
+            return None;
+        }
+        let mut fences = vec![std::mem::zeroed::<FenceInfo>(); info.num_fences as usize];
+        info = std::mem::zeroed();
+        info.num_fences = fences.len() as u32;
+        info.fences = fences.as_mut_ptr() as u64;
+        if libc::ioctl(fd, SYNC_IOC_FILE_INFO as _, &mut info) != 0 {
+            return None;
+        }
+        fences.iter().map(|f| f.timestamp_ns as i64).max().filter(|&t| t > 0)
     }
 }
 

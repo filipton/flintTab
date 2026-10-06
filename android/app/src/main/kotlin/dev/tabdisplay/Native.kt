@@ -42,11 +42,13 @@ object Native {
     /** Where a panic in the native code is written (see CrashLog). */
     @JvmStatic external fun crashFile(path: String)
     @JvmStatic external fun panicTest()
-    @JvmStatic external fun chainCreate(surface: android.view.Surface, owner: NdkChain, bw: Int, bh: Int, vw: Int, vh: Int): Long
+    @JvmStatic external fun chainCreate(surface: android.view.Surface, owner: Any, bw: Int, bh: Int, vw: Int, vh: Int): Long
     @JvmStatic external fun chainAddBuffer(chain: Long, hb: android.hardware.HardwareBuffer): Boolean
     @JvmStatic external fun chainTake(chain: Long): Int
     @JvmStatic external fun chainSubmit(chain: Long, index: Int, batch: Long)
     @JvmStatic external fun chainRelease(chain: Long)
+    @JvmStatic external fun chainShow(chain: Long, index: Int)
+    @JvmStatic external fun chainVsync(chain: Long): Long
     @JvmStatic external fun yuvAttachFront(handle: Long, hb: android.hardware.HardwareBuffer, hint: Int): Boolean
     @JvmStatic external fun yuvVsync(handle: Long, vsyncNanos: Long, periodNanos: Long)
     @JvmStatic external fun yuvPresent(handle: Long, frame: Boolean): Boolean

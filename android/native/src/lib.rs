@@ -358,6 +358,16 @@ pub unsafe extern "system" fn Java_dev_tabdisplay_Native_chainSubmit(_env: *mut 
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_chainShow(_env: *mut JNIEnv, _c: jclass, h: jlong, i: jint) {
+    chain(h).show(i as usize);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_chainVsync(_env: *mut JNIEnv, _c: jclass, h: jlong) -> jlong {
+    chain(h).vsync()
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_dev_tabdisplay_Native_chainRelease(env: *mut JNIEnv, _c: jclass, h: jlong) {
     let c = unsafe { Box::from_raw(h as *mut std::sync::Arc<chain::Chain>) };
     unsafe { c.release(env) };

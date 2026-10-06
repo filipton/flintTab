@@ -114,7 +114,7 @@ class MainActivity : Activity() {
                 "Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}), " +
                     "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}: renderer " +
                     when {
-                        front != null -> "NV12 (front buffer: ${if (YuvFront.supported()) "available" else "needs Android 13"})"
+                        front != null -> "NV12 (front buffer: ${if (YuvFront.supported() || NdkFront.supported()) "available" else "needs Android 10"})"
                         forcePlainVideo -> "plain video (the fast paths failed on this device)"
                         else -> "plain video (this device cannot hand CPU-written buffers to the compositor)"
                     }
