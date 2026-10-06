@@ -120,11 +120,14 @@ pub fn ensure_installed(adb: &str, serial: &str, apk: &Path) {
         .and_then(|path| adb_output(adb, serial, &["shell", "md5sum", &path]))
         .and_then(|o| o.split_whitespace().next().map(str::to_owned));
     if have.as_deref() == Some(want.as_str()) {
+        println!("tablet app is up to date ({})", &want[..8]);
         return;
     }
     println!(
-        "{} the tablet app from {}...",
+        "{} the tablet app ({} -> {}) from {}...",
         if have.is_some() { "updating" } else { "installing" },
+        have.as_deref().map_or("none", |h| &h[..8.min(h.len())]),
+        &want[..8],
         apk.display()
     );
     let apk_arg = apk.to_string_lossy();
