@@ -25,6 +25,14 @@ class CpuRenderer(
     private val changedArea: (pts: Long) -> IntArray?,
     private val onShown: (pts: Long, nanos: Long) -> Unit,
 ) : Renderer {
+    /** The part of the screen video frame `pts` is (x, y, w, h pixels); null: all of it. */
+    var regionOf: (pts: Long) -> IntArray? = { null }
+
+    private var partMisses = 0
+
+    /** A whole-screen keyframe is needed (a part came where everything had to be redrawn). */
+    var onNeedKeyframe: () -> Unit = {}
+
     private val thread = HandlerThread("render", Process.THREAD_PRIORITY_URGENT_DISPLAY).apply { start() }
     private val handler = Handler(thread.looper)
 
@@ -444,6 +452,7 @@ class CpuRenderer(
                         frames.keys.any { it > u.pts } || System.nanoTime() - u.queuedAt > 150_000_000L -> {
                             // Its area is redrawn from the next decoded frame (see [carried]).
                             val a = changedArea(u.pts)
+                            regionOf(u.pts) // forgotten with it
                             if (a == null) fullNext = true
                             else carried = carried?.let { c ->
                                 intArrayOf(minOf(c[0], a[0]), minOf(c[1], a[1]), maxOf(c[2], a[2]), maxOf(c[3], a[3]))
@@ -483,8 +492,13 @@ class CpuRenderer(
     }
 
     private fun drawFrame(target: Long, img: Image, pts: Long) {
-        val w = minOf(img.width, if (screen != 0L) streamW else view.width)
-        val h = minOf(img.height, if (screen != 0L) streamH else view.height)
+        val sw = if (screen != 0L) streamW else view.width
+        val sh = if (screen != 0L) streamH else view.height
+        // Where the picture goes: a part of the screen (a video's window) or all of it.
+        val part = regionOf(pts)?.takeIf { screen != 0L && it[2] > 0 && it[3] > 0 } ?: intArrayOf(0, 0, sw, sh)
+        val crop = img.cropRect
+        val px0 = part[0]; val py0 = part[1]
+        val px1 = minOf(sw, px0 + minOf(part[2], crop.width())); val py1 = minOf(sh, py0 + minOf(part[3], crop.height()))
         val own = if (fullNext) null else changedArea(pts)
         val extra = carried
         val c = when {
@@ -492,25 +506,41 @@ class CpuRenderer(
             extra == null -> own
             else -> intArrayOf(minOf(own[0], extra[0]), minOf(own[1], extra[1]), maxOf(own[2], extra[2]), maxOf(own[3], extra[3]))
         }
-        fullNext = false
-        carried = null
-        val x0: Int; val y0: Int; val x1: Int; val y1: Int
+        // What needs redrawing, in screen pixels.
+        var x0: Int; var y0: Int; var x1: Int; var y1: Int
         if (c == null) {
-            x0 = 0; y0 = 0; x1 = w; y1 = h
+            x0 = 0; y0 = 0; x1 = sw; y1 = sh
         } else {
             // Padded by 2 px: chroma is shared between pixel pairs.
-            x0 = maxOf(0, (c[0] / 65535f * w).toInt() - 2); y0 = maxOf(0, (c[1] / 65535f * h).toInt() - 2)
-            x1 = minOf(w, Math.ceil(c[2] / 65535.0 * w).toInt() + 2); y1 = minOf(h, Math.ceil(c[3] / 65535.0 * h).toInt() + 2)
+            x0 = maxOf(0, (c[0] / 65535f * sw).toInt() - 2); y0 = maxOf(0, (c[1] / 65535f * sh).toInt() - 2)
+            x1 = minOf(sw, Math.ceil(c[2] / 65535.0 * sw).toInt() + 2); y1 = minOf(sh, Math.ceil(c[3] / 65535.0 * sh).toInt() + 2)
         }
+        // (The 2 px padding and the 0..65535 rounding may reach past the part: only what
+        // changed has to be in it.)
+        if (x0 + 4 < px0 || y0 + 4 < py0 || x1 - 4 > px1 || y1 - 4 > py1) {
+            // More is needed than this part has (everything after a rebuild, or what lost frames
+            // changed): this part now, the rest from a whole-screen keyframe.
+            if (c == null) fullNext = true else carried = c
+            if (partMisses++ < 5) {
+                TLog.i("video part $px0,$py0-$px1,$py1 lacks $x0,$y0-$x1,$y1 (${if (own == null) "everything" else "lost frames' areas"}): asking for a whole-screen keyframe")
+            }
+            onNeedKeyframe()
+        } else {
+            fullNext = false
+            carried = null
+        }
+        x0 = maxOf(x0, px0); y0 = maxOf(y0, py0); x1 = minOf(x1, px1); y1 = minOf(y1, py1)
         if (x0 >= x1 || y0 >= y1) return
         val p = img.planes
+        // The picture's pixel (0, 0) is screen pixel (ox, oy).
+        val ox = px0 - crop.left; val oy = py0 - crop.top
         if (screen != 0L) {
             Native.yuvUpdate(screen, p[0].buffer, p[0].rowStride, p[1].buffer, p[2].buffer, p[1].rowStride, p[1].pixelStride,
-                0, 0, x0, y0, x1, y1)
+                ox, oy, x0, y0, x1, y1)
             return
         }
         Native.frontYuv(target, p[0].buffer, p[0].rowStride, p[1].buffer, p[2].buffer, p[1].rowStride, p[1].pixelStride,
-            0, 0, x0, y0, x1, y1)
+            ox, oy, x0, y0, x1, y1)
     }
 
     /** Saves what the panel shows to [path] as a PNG (debugging). */

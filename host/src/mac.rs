@@ -14,7 +14,7 @@ use std::{
 
 use crate::{
     Args, Button, Host, Input, Pointer, Stream, StreamConfig, capture, cursor,
-    frames::{Buffer, Frame, Frames},
+    frames::{Buffer, Frame, Frames, Region},
     gate::Gate,
     protocol,
     tiles::Picture,
@@ -118,26 +118,64 @@ impl Host for MacHost {
         let frames = Frames::<CVPixelBuffer>::new(timing.clone(), w, h);
         let gate = frames.gate.clone();
 
-        // The frame being encoded (pts, changed area): encoding is synchronous, so the output
-        // callback reads it back.
-        let sending = Arc::new(std::sync::Mutex::new((0u64, protocol::ALL)));
-        let encoder = {
-            let tx = tx.clone();
-            let frames = frames.clone();
-            let sending = sending.clone();
-            vt::VtEncoder::new(w, h, fps, bitrate, move |au, _| {
-                let (pts, area) = *sending.lock().unwrap();
-                frames.encoded(&tx, pts, area, &au);
-            })?
+        // The frame being encoded (pts, changed area, part of the screen): encoding is
+        // synchronous, so the output callback reads it back.
+        let full = Region { x: 0, y: 0, w, h };
+        let sending = Arc::new(std::sync::Mutex::new((0u64, protocol::ALL, full)));
+        // One encoder per size: the whole screen, and parts of it (a video's window).
+        let new_encoder = {
+            let (tx, frames, sending) = (tx.clone(), frames.clone(), sending.clone());
+            move |w: u32, h: u32| {
+                let (tx, frames, sending) = (tx.clone(), frames.clone(), sending.clone());
+                vt::VtEncoder::new(w, h, fps, bitrate, move |au, _| {
+                    let (pts, area, region) = *sending.lock().unwrap();
+                    frames.encoded(&tx, pts, area, region, &au);
+                })
+            }
         };
+        let mut encoders = std::collections::HashMap::new();
+        encoders.insert((w, h), new_encoder(w, h)?);
         // encoder: takes the newest captured frame whenever the tablet can take another one
         let encode_thread = {
             let frames = frames.clone();
             let tx = tx.clone();
+            // Parts of the screen only for a tablet that places pictures itself (the one that
+            // takes tiles); TD_REGIONS=none: always the whole screen (debugging).
+            let regions = use_tiles && std::env::var("TD_REGIONS").map_or(true, |v| v != "none");
             thread::spawn(move || {
-                frames.run(use_tiles, tx, |f, pts, area, keyframe| {
-                    *sending.lock().unwrap() = (pts, area);
-                    encoder.encode(f.buf.as_ptr(), pts, keyframe);
+                let gate = frames.gate.clone();
+                frames.run(use_tiles, regions, tx, |f, pts, area, region, keyframe| {
+                    *sending.lock().unwrap() = (pts, area, region);
+                    let whole = |encoders: &std::collections::HashMap<(u32, u32), vt::VtEncoder>, keyframe| {
+                        *sending.lock().unwrap() = (pts, area, full);
+                        encoders[&(w, h)].encode(f.buf.as_ptr(), pts, keyframe);
+                    };
+                    if region == full {
+                        whole(&encoders, keyframe);
+                        return;
+                    }
+                    // A few sizes at most (a session holds encoder memory): the oldest go.
+                    if !encoders.contains_key(&(region.w, region.h)) {
+                        if encoders.len() >= 4 {
+                            encoders.retain(|k, _| *k == (w, h));
+                        }
+                        match new_encoder(region.w, region.h) {
+                            Ok(e) => {
+                                encoders.insert((region.w, region.h), e);
+                            }
+                            Err(e) => eprintln!("encoder for {}x{}: {e:#}", region.w, region.h),
+                        }
+                    }
+                    let ok = encoders.get(&(region.w, region.h)).is_some_and(|e| {
+                        e.encode_crop(f.buf.as_ptr(), region.x as usize, region.y as usize, pts, keyframe)
+                    });
+                    if !ok {
+                        // The whole screen instead, from scratch; and the next frame too, so the
+                        // part's encoder starts over as well.
+                        eprintln!("could not encode the {}x{} part at {},{}: the whole screen instead", region.w, region.h, region.x, region.y);
+                        whole(&encoders, true);
+                        gate.request_keyframe();
+                    }
                 })
             })
         };

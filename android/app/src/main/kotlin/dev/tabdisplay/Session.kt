@@ -143,6 +143,22 @@ class Session(
     /** The area frame [pts] changed (and forgets it); null if unknown. */
     fun takeChangedArea(pts: Long): IntArray? = changedAreas.remove(pts)
 
+    /** The part of the screen each frame in flight is (x, y, w, h pixels), by pts. */
+    private val regions = ConcurrentHashMap<Long, IntArray>()
+
+    /** The part of the screen frame [pts] is (and forgets it); null: the whole screen. */
+    fun takeRegion(pts: Long): IntArray? = regions.remove(pts)
+
+    @Volatile private var keyframeAskedAt = 0L
+
+    /** A whole-screen keyframe from the host (the renderer needs all of it); at most every 200 ms. */
+    fun requestKeyframe() {
+        val now = System.nanoTime()
+        if (now - keyframeAskedAt < 200_000_000L) return
+        keyframeAskedAt = now
+        sendControl(KIND_IDR, 0)
+    }
+
     private fun onDecoded(pts: Long) {
         frameTimes[pts]?.set(3, nowUs())
     }
@@ -349,16 +365,29 @@ class Session(
                         // What changed since the previous frame (0..65535 across it): all the
                         // front renderer has to redraw.
                         val changed = IntArray(4) { input.readUnsignedShort() }
-                        val n = len - 16
+                        // The part of the screen this picture is (a video's window, or all of it).
+                        val region = IntArray(4) { input.readUnsignedShort() }
+                        val n = len - 24
                         if (changedAreas.size > 256) changedAreas.clear()
                         changedAreas[pts] = changed
+                        if (regions.size > 256) regions.clear()
+                        regions[pts] = region
                         if (n > frameBuf.size) frameBuf = ByteArray(n * 2)
                         input.readFully(frameBuf, 0, n)
                         val received = nowUs()
                         if (frameTimes.size > 256) frameTimes.clear() // no render callbacks on this device
                         frameTimes[pts] = longArrayOf(arrived, received, 0, 0)
                         if (needKeyframe && isKeyframe(frameBuf, n)) needKeyframe = false
-                        val d = decoder
+                        var d = decoder
+                        // A part of another size comes with a keyframe: a decoder that cannot change
+                        // size on the fly (no adaptive playback) is made anew for it.
+                        if (d != null && !d.adaptive && (region[2] != d.width || region[3] != d.height) &&
+                            isKeyframe(frameBuf, n)) {
+                            d.close()
+                            d = newDecoder(surface, region[2], region[3], config!![2])
+                            decoder = d
+                            needKeyframe = false
+                        }
                         if (d != null && !needKeyframe) {
                             front?.queueVideo(pts)
                             val ok = !d.failed && try { d.feed(frameBuf, n, pts) } catch (_: Exception) { false }
@@ -432,7 +461,7 @@ class Session(
     }
 
     companion object {
-        const val VERSION = 5
+        const val VERSION = 6
         const val MSG_CONFIG = 1
         const val MSG_VIDEO = 2
         const val MSG_AUDIO = 3
@@ -561,8 +590,8 @@ private fun lowLatencyOptions(info: MediaCodecInfo?, fps: Int): List<Map<String,
  */
 private class Decoder(
     surface: Surface?,
-    width: Int,
-    height: Int,
+    val width: Int,
+    val height: Int,
     fps: Int,
     private val toTexture: Boolean,
     /** Setup level (see Session.newDecoder): 0 low-latency hardware, 1 plain hardware, 2 software. */
@@ -573,6 +602,9 @@ private class Decoder(
     private val onImage: ((pts: Long, image: android.media.Image, done: () -> Unit) -> Unit)? = null,
 ) {
     private val codec: MediaCodec
+    /** Takes pictures of other sizes (up to the configured one) without being made anew. */
+    var adaptive = false
+        private set
     @Volatile private var open = true
     /** Set when the codec reported an error; the owner then rebuilds it. */
     @Volatile var failed = false
@@ -644,6 +676,16 @@ private class Decoder(
         for (opts in if (level == 0) lowLatencyOptions(info, fps) else listOf(emptyMap())) {
             val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
             for ((k, v) in opts) fmt.setInteger(k, v)
+            // Parts of the screen (a video's window) come at their own size, the whole screen
+            // at most: decoders that can, switch between them in place.
+            adaptive = try {
+                codec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                    .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_AdaptivePlayback)
+            } catch (_: Exception) { false }
+            if (adaptive) {
+                fmt.setInteger(MediaFormat.KEY_MAX_WIDTH, width)
+                fmt.setInteger(MediaFormat.KEY_MAX_HEIGHT, height)
+            }
             try {
                 codec.setCallback(callback, handler)
                 codec.configure(fmt, surface, null, 0)

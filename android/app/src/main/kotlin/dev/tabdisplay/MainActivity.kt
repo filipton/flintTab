@@ -106,6 +106,8 @@ class MainActivity : Activity() {
                 forcePlainVideo -> null
                 YuvFront.supported() || YuvChain.supported() || NdkChain.supported() || SwapChain.supported() ->
                     CpuRenderer(surfaceView, changed, shown).also {
+                        it.regionOf = { pts -> session?.takeRegion(pts) }
+                        it.onNeedKeyframe = { session?.requestKeyframe() }
                         it.onUnusable = { runOnUiThread { forcePlainVideo = true; recreate() } }
                     }
                 else -> null

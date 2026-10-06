@@ -10,7 +10,7 @@ W,H,FPS = int(os.environ.get("W",1280)),int(os.environ.get("H",800)),60
 s = socket.create_connection(("127.0.0.1", 27183))
 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 TILES = os.environ.get("TILES") == "1"  # also take small changes as pixel tiles
-s.sendall(b"TDSP" + bytes([4]) + struct.pack(">III", W, H, FPS) + bytes([1 if TILES else 0]))
+s.sendall(b"TDSP" + bytes([6]) + struct.pack(">III", W, H, FPS) + bytes([1 if TILES else 0]))
 _log = "fake tablet: hello from the log channel".encode()
 s.sendall(bytes([8, 0]) + struct.pack(">H", len(_log)) + _log)
 def lz4(src, size):
@@ -68,7 +68,7 @@ try:
                 if 2.0 < time.time()-t0 and owed[0] >= 0: owed[0] += 1; continue
             ack(); continue
         if kind != 2: continue
-        au = body[16:]; now = time.time()-t0  # after pts and the changed area
+        au = body[24:]; now = time.time()-t0  # after pts, the changed area and the region
         t = time.monotonic_ns() // 1000  # "shown" right away: the host prints its side of the latency
         s.sendall(bytes([6,0]) + body[:8] + struct.pack(">QQQQQ", t, t, t, t, t))
         nals = [au[i+3] & 0x1f for i in range(len(au)-3) if au[i:i+3]==b"\0\0\1"]

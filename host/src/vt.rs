@@ -106,8 +106,34 @@ unsafe extern "C" {
     ) -> OSStatus;
 }
 
+#[link(name = "CoreVideo", kind = "framework")]
+unsafe extern "C" {
+    static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
+    static kCVPixelBufferWidthKey: CFStringRef;
+    static kCVPixelBufferHeightKey: CFStringRef;
+    static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
+    fn CVPixelBufferPoolCreatePixelBuffer(alloc: *const c_void, pool: *mut c_void, out: *mut *mut c_void) -> i32;
+    fn CVPixelBufferLockBaseAddress(b: *mut c_void, flags: u64) -> i32;
+    fn CVPixelBufferUnlockBaseAddress(b: *mut c_void, flags: u64) -> i32;
+    fn CVPixelBufferGetBaseAddressOfPlane(b: *mut c_void, plane: usize) -> *mut u8;
+    fn CVPixelBufferGetBytesPerRowOfPlane(b: *mut c_void, plane: usize) -> usize;
+    fn CVPixelBufferGetHeightOfPlane(b: *mut c_void, plane: usize) -> usize;
+    fn CVPixelBufferGetWidthOfPlane(b: *mut c_void, plane: usize) -> usize;
+    fn CVPixelBufferGetPlaneCount(b: *mut c_void) -> usize;
+}
+
+#[link(name = "VideoToolbox", kind = "framework")]
+unsafe extern "C" {
+    fn VTCompressionSessionGetPixelBufferPool(session: Session) -> *mut c_void;
+}
+
+const LOCK_READ_ONLY: u64 = 1;
+/// kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: what ScreenCaptureKit delivers.
+const NV12_VIDEO_RANGE: u32 = u32::from_be_bytes(*b"420v");
+
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
+    fn CFRelease(p: *const c_void);
     fn CFArrayGetValueAtIndex(a: *const c_void, i: isize) -> *const c_void;
     fn CFDictionaryGetValue(d: *const c_void, key: *const c_void) -> *const c_void;
 }
@@ -120,6 +146,8 @@ pub struct VtEncoder {
     session: Session,
     sink: *mut Sink,
     force_key: CFDictionary<CFString, CFType>,
+    width: usize,
+    height: usize,
 }
 
 // The VT session is thread-safe; `sink` is only touched by VT's callback and by Drop
@@ -148,6 +176,15 @@ impl VtEncoder {
             ])
         };
 
+        // NV12 IOSurface buffers of the session's size: its pool holds them for [`Self::encode_crop`].
+        let attrs = unsafe {
+            CFDictionary::from_CFType_pairs(&[
+                (cf_key(kCVPixelBufferPixelFormatTypeKey), CFNumber::from(NV12_VIDEO_RANGE as i64).as_CFType()),
+                (cf_key(kCVPixelBufferWidthKey), CFNumber::from(width as i64).as_CFType()),
+                (cf_key(kCVPixelBufferHeightKey), CFNumber::from(height as i64).as_CFType()),
+                (cf_key(kCVPixelBufferIOSurfacePropertiesKey), CFDictionary::<CFString, CFType>::from_CFType_pairs(&[]).as_CFType()),
+            ])
+        };
         let mut session: Session = ptr::null_mut();
         let st = unsafe {
             VTCompressionSessionCreate(
@@ -156,7 +193,7 @@ impl VtEncoder {
                 height as i32,
                 CODEC_H264,
                 spec.as_concrete_TypeRef() as *const c_void,
-                ptr::null(),
+                attrs.as_concrete_TypeRef() as *const c_void,
                 ptr::null(),
                 output_callback,
                 sink as *mut c_void,
@@ -204,7 +241,43 @@ impl VtEncoder {
         let force_key = unsafe {
             CFDictionary::from_CFType_pairs(&[(cf_key(kVTEncodeFrameOptionKey_ForceKeyFrame), t.as_CFType())])
         };
-        Ok(Self { session, sink, force_key })
+        Ok(Self { session, sink, force_key, width: width as usize, height: height as usize })
+    }
+
+    /// Encodes the session-sized area at (`x`, `y`) of the NV12 buffer `src` (a part of the
+    /// screen: a video playing in a window costs its own size, not the screen's, to encode and
+    /// to decode). The area is copied into a buffer of the session's pool (~0.1 ms).
+    pub fn encode_crop(&self, src: *mut c_void, x: usize, y: usize, pts_us: u64, keyframe: bool) -> bool {
+        let (x, y) = (x & !1, y & !1);
+        unsafe {
+            let pool = VTCompressionSessionGetPixelBufferPool(self.session);
+            let mut dst: *mut c_void = ptr::null_mut();
+            if pool.is_null() || CVPixelBufferPoolCreatePixelBuffer(ptr::null(), pool, &mut dst) != 0 || dst.is_null() {
+                return false;
+            }
+            let ok = CVPixelBufferGetPlaneCount(src) == 2
+                && CVPixelBufferGetWidthOfPlane(src, 0) >= x + self.width
+                && CVPixelBufferGetHeightOfPlane(src, 0) >= y + self.height
+                && CVPixelBufferLockBaseAddress(src, LOCK_READ_ONLY) == 0;
+            if !ok {
+                CFRelease(dst);
+                return false;
+            }
+            CVPixelBufferLockBaseAddress(dst, 0);
+            // Plane 0: Y, one byte per pixel; plane 1: Cb Cr pairs at half height.
+            for (plane, rows, row0) in [(0, self.height, y), (1, self.height / 2, y / 2)] {
+                let (s, d) = (CVPixelBufferGetBaseAddressOfPlane(src, plane), CVPixelBufferGetBaseAddressOfPlane(dst, plane));
+                let (ss, ds) = (CVPixelBufferGetBytesPerRowOfPlane(src, plane), CVPixelBufferGetBytesPerRowOfPlane(dst, plane));
+                for r in 0..rows {
+                    ptr::copy_nonoverlapping(s.add((row0 + r) * ss + x), d.add(r * ds), self.width);
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(dst, 0);
+            CVPixelBufferUnlockBaseAddress(src, LOCK_READ_ONLY);
+            let ok = self.encode(dst, pts_us, keyframe);
+            CFRelease(dst);
+            ok
+        }
     }
 
     /// Encodes one IOSurface-backed CVPixelBuffer and blocks until its access unit was

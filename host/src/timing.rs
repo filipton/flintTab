@@ -64,6 +64,7 @@ pub struct Timing {
     epoch: Instant,
     inner: Mutex<Inner>,
     captured: std::sync::atomic::AtomicUsize,
+    keyframes: std::sync::atomic::AtomicUsize,
 }
 
 impl Timing {
@@ -72,6 +73,7 @@ impl Timing {
             epoch,
             inner: Mutex::new(Inner { frames: VecDeque::new(), pongs: VecDeque::new(), window: Window::default() }),
             captured: Default::default(),
+            keyframes: Default::default(),
         }
     }
 
@@ -83,6 +85,11 @@ impl Timing {
     /// The capture delivered a new frame.
     pub fn captured(&self) {
         self.captured.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The encoder was asked for a keyframe (a full picture: big, slow to encode and decode).
+    pub fn keyframe(&self) {
+        self.keyframes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Converts a time `age` before now to the session clock.
@@ -207,6 +214,10 @@ impl Timing {
                 rtt as f64 / 1000.0,
                 rtt_median
             );
+            let keyframes = self.keyframes.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if keyframes > 0 {
+                line += &format!(", {keyframes} keyframes");
+            }
             println!("{line}");
             *w = Window::default();
         }

@@ -20,7 +20,9 @@
 //!   MSG_VIDEO:  u64 pts_us (when the frame was captured, or handed to the encoder,
 //!               on the host's session clock), u16 x0, y0, x1, y1 (the area that changed
 //!               since the previous video frame, 0..=65535 across the frame; the tablet only
-//!               needs to redraw that), H.264 Annex-B access unit
+//!               needs to redraw that), u16 x, y, w, h (pixels: the part of the screen the
+//!               picture is, at that place; the whole screen, or e.g. a video's window, whose
+//!               size changes only with a keyframe), H.264 Annex-B access unit
 //!   MSG_AUDIO:  interleaved signed 16-bit little-endian PCM
 //!   MSG_CURSOR: u16 x, u16 y (hotspot position, 0..=65535 across the display), u8 visible.
 //!               The host's own mouse, drawn by the tablet on top of the video so it moves
@@ -37,7 +39,7 @@
 use std::io::{self, Read};
 
 pub const MAGIC: &[u8; 4] = b"TDSP";
-pub const VERSION: u8 = 5;
+pub const VERSION: u8 = 6;
 
 pub const MSG_CONFIG: u8 = 1;
 pub const MSG_VIDEO: u8 = 2;
@@ -142,16 +144,16 @@ pub fn config_msg(width: u32, height: u32, fps: u32) -> Vec<u8> {
 /// The whole frame changed.
 pub const ALL: [u16; 4] = [0, 0, 65535, 65535];
 
-pub fn video_msg(pts_us: u64, changed: [u16; 4], au: &[u8]) -> Vec<u8> {
-    let mut c = [0u8; 8];
-    for (i, v) in changed.iter().enumerate() {
+pub fn video_msg(pts_us: u64, changed: [u16; 4], region: [u16; 4], au: &[u8]) -> Vec<u8> {
+    let mut c = [0u8; 16];
+    for (i, v) in changed.iter().chain(&region).enumerate() {
         c[2 * i..2 * i + 2].copy_from_slice(&v.to_be_bytes());
     }
     frame(MSG_VIDEO, &[&pts_us.to_be_bytes(), &c, au])
 }
 
 /// Offset of the access unit in a MSG_VIDEO message.
-pub const VIDEO_HEADER: usize = 5 + 8 + 8;
+pub const VIDEO_HEADER: usize = 5 + 8 + 16;
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn cursor_msg(x: f64, y: f64, visible: bool) -> Vec<u8> {
@@ -207,10 +209,10 @@ mod tests {
 
     #[test]
     fn frame_layout() {
-        let m = video_msg(7, [1, 2, 3, 4], &[1, 2, 3]);
+        let m = video_msg(7, [1, 2, 3, 4], [5, 6, 7, 8], &[1, 2, 3]);
         assert_eq!(m[0], MSG_VIDEO);
-        assert_eq!(u32::from_be_bytes(m[1..5].try_into().unwrap()), 19);
-        assert_eq!(&m[13..21], &[0, 1, 0, 2, 0, 3, 0, 4]);
+        assert_eq!(u32::from_be_bytes(m[1..5].try_into().unwrap()), 27);
+        assert_eq!(&m[13..29], &[0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8]);
         assert_eq!(&m[VIDEO_HEADER..], &[1, 2, 3]);
     }
 }

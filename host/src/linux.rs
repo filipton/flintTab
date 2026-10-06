@@ -621,7 +621,7 @@ impl Encoder {
                         return Ok(gst::FlowSuccess::Ok); // wait for the first SPS/IDR
                     }
                     first = false;
-                    f.encoded(&tx, pts, area, patched.as_deref().unwrap_or(&map));
+                    f.encoded(&tx, pts, area, f.whole(), patched.as_deref().unwrap_or(&map));
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
@@ -865,7 +865,8 @@ impl Host for LinuxHost {
                 let frames2 = frames.clone();
                 let tx2 = tx.clone();
                 let mut exhausted = false;
-                frames.run(use_tiles, tx, |f, pts, area, keyframe| {
+                // Always the whole screen: a GStreamer encoder's size is fixed once it runs.
+                frames.run(use_tiles, false, tx, |f, pts, area, _region, keyframe| {
                     if exhausted || enc.encode(f, pts, area, keyframe) {
                         return;
                     }
