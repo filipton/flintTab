@@ -126,13 +126,19 @@ impl Chain {
             let mut vm: *mut JavaVM = std::ptr::null_mut();
             (fns.GetJavaVM.unwrap())(env, &mut vm);
             let class = (fns.GetObjectClass.unwrap())(env, owner);
+            // A front-mode owner (NdkFront) has none of the swap chain's callbacks: a
+            // missing method must be cleared before the next lookup, since a second
+            // GetMethodID with an exception pending aborts the process instead of
+            // returning null (the callbacks stay null, and Chain::call skips those).
             let method = |name: &str, sig: &str| {
                 let (n, s) = (CString::new(name).unwrap(), CString::new(sig).unwrap());
-                (fns.GetMethodID.unwrap())(env, class, n.as_ptr(), s.as_ptr())
+                let m = (fns.GetMethodID.unwrap())(env, class, n.as_ptr(), s.as_ptr());
+                if m.is_null() {
+                    (fns.ExceptionClear.unwrap())(env);
+                }
+                m
             };
             let (presented, freed, committed) = (method("presented", "(JJ)V"), method("freed", "()V"), method("committed", "()V"));
-            // A front-mode owner (NdkFront) has none of the swap chain's callbacks.
-            (fns.ExceptionClear.unwrap())(env);
             let owner = (fns.NewGlobalRef.unwrap())(env, owner);
 
             let t = ASurfaceTransaction_create();
