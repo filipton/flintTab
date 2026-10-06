@@ -154,9 +154,9 @@ class Session(
     @Volatile private var keyframeAskedAt = 0L
 
     /** A whole-screen keyframe from the host (the renderer needs all of it); at most every 200 ms. */
-    fun requestKeyframe() {
+    fun requestKeyframe(minIntervalNanos: Long = 200_000_000L) {
         val now = System.nanoTime()
-        if (now - keyframeAskedAt < 200_000_000L) return
+        if (now - keyframeAskedAt < minIntervalNanos) return
         keyframeAskedAt = now
         sendControl(KIND_IDR, 0)
     }

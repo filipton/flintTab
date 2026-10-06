@@ -31,7 +31,7 @@ class CpuRenderer(
     private var partMisses = 0
 
     /** A whole-screen keyframe is needed (a part came where everything had to be redrawn). */
-    var onNeedKeyframe: () -> Unit = {}
+    var onNeedKeyframe: (lost: Boolean) -> Unit = {}
 
     private val thread = HandlerThread("render", Process.THREAD_PRIORITY_URGENT_DISPLAY).apply { start() }
     /**
@@ -609,7 +609,9 @@ class CpuRenderer(
             if (partMisses++ < 5) {
                 TLog.i("video part $px0,$py0-$px1,$py1 lacks $x0,$y0-$x1,$y1 (${if (own == null) "everything" else "lost frames' areas"}): asking for a whole-screen keyframe")
             }
-            onNeedKeyframe()
+            // For lost frames' areas at most once a second: a decoder that fell behind and then
+            // gets keyframes (the heaviest frames) falls further behind, and asks again.
+            onNeedKeyframe(c != null)
         } else {
             fullNext = false
             carried = null

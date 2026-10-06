@@ -100,6 +100,10 @@ struct Regions {
     /// Frames since the last big change: a part with none for a while is given up (small
     /// changes go back to exact tiles).
     since_big: u32,
+    /// Any big change at all yet.
+    seen_big: bool,
+    /// Small frames needed before the next part, after one was outgrown.
+    cooldown: u32,
 }
 
 /// Frames without a big change after which a part is given up (~0.7 s at 90 Hz).
@@ -108,18 +112,26 @@ const PART_IDLE_FRAMES: u32 = 60;
 /// Changes up to this many pixels go as tiles beside a part of the screen the codec takes.
 const SMALL_CHANGE: f64 = 128.0 * 128.0;
 
-/// Above this share of the screen a part is not worth it (percent).
-const REGION_MAX_PERCENT: u64 = 45;
+/// A part is started for changes up to this share of the screen (percent), and kept (grown)
+/// up to the second: a change near one limit does not flip between part and whole screen.
+const REGION_ENTER_PERCENT: u64 = 40;
+const REGION_KEEP_PERCENT: u64 = 55;
 
 impl Regions {
     fn new(width: u32, height: u32) -> Self {
-        Self { width, height, current: Region { x: 0, y: 0, w: width, h: height }, small_streak: 0, loose_streak: 0, since_big: 0 }
+        Self { width, height, current: Region { x: 0, y: 0, w: width, h: height }, small_streak: 0, loose_streak: 0, since_big: 0, seen_big: false, cooldown: 0 }
+    }
+
+    /// The codec has had big changes lately (a video playing): its part's changes are its own.
+    fn active(&self) -> bool {
+        self.seen_big && self.since_big < PART_IDLE_FRAMES
     }
 
     /// A frame with (or without) a big change went by.
     fn note(&mut self, big: bool) {
         if big {
             self.since_big = 0;
+            self.seen_big = true;
             return;
         }
         self.since_big += 1;
@@ -144,8 +156,8 @@ impl Regions {
         Region { x: x0, y: y0, w: (x1 - x0).max(16), h: (y1 - y0).max(16) }
     }
 
-    fn small(&self, r: &Region) -> bool {
-        r.area() * 100 <= self.full().area() * REGION_MAX_PERCENT
+    fn fits(&self, r: &Region, percent: u64) -> bool {
+        r.area() * 100 <= self.full().area() * percent
     }
 
     /// The part for a frame whose change is `changed` (`None`: the whole screen).
@@ -157,20 +169,23 @@ impl Regions {
             return full;
         };
         let want = self.around(a);
-        if !self.small(&want) {
+        let limit = if self.current == full { REGION_ENTER_PERCENT } else { REGION_KEEP_PERCENT };
+        if !self.fits(&want, limit) {
             self.small_streak = 0;
             self.current = full;
             return full;
         }
         if self.current == full {
-            // Several small changes in a row first: leaving and coming back to the whole screen
-            // costs two keyframes, for e.g. a menu between two scrolls.
+            // Several small changes in a row first (~0.2 s): leaving and coming back to the whole
+            // screen costs two keyframes, for e.g. a menu between two scrolls, or a frame that
+            // changed only part of a video that fills most of the screen.
             self.small_streak += 1;
-            if self.small_streak < 4 {
+            if self.small_streak < 20.max(self.cooldown) {
                 return full;
             }
             self.current = want;
             self.loose_streak = 0;
+            self.cooldown = 0;
             return want;
         }
         let c = self.current;
@@ -187,11 +202,26 @@ impl Regions {
             }
             return self.current;
         }
-        // Outside the part: grow it to take both, unless that is most of the screen.
+        // Outside the part: grow it to take both, with room to spare (every new size is a
+        // keyframe, and a change that crossed the border once tends to wander further) unless
+        // that is most of the screen.
         let x0 = c.x.min(want.x);
         let y0 = c.y.min(want.y);
-        let both = Region { x: x0, y: y0, w: (c.x + c.w).max(want.x + want.w) - x0, h: (c.y + c.h).max(want.y + want.h) - y0 };
-        self.current = if self.small(&both) { both } else { full };
+        let x1 = (c.x + c.w).max(want.x + want.w);
+        let y1 = (c.y + c.h).max(want.y + want.h);
+        let grown = self.around([x0 as f64 - 128.0, y0 as f64 - 128.0, x1 as f64 + 128.0, y1 as f64 + 128.0]);
+        let both = Region { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+        self.current = if self.fits(&grown, REGION_KEEP_PERCENT) {
+            grown
+        } else if self.fits(&both, REGION_KEEP_PERCENT) {
+            both
+        } else {
+            // Outgrown: the whole screen, and for a while (no part again after a few quiet
+            // frames, only to outgrow it again: two keyframes each time).
+            self.small_streak = 0;
+            self.cooldown = 90;
+            full
+        };
         self.loose_streak = 0;
         self.current
     }
@@ -298,17 +328,20 @@ impl<B: Buffer> Frames<B> {
                 let now = timing.now();
                 now_frame = now;
                 let big = tiles::bounds(&rects.iter().copied().filter(|r| tiles::size(*r) > SMALL_CHANGE).collect::<Vec<_>>());
-                if regions {
-                    parts.note(big.is_some());
-                }
                 // While a part of the screen is the codec's (a video playing), changes in it go
                 // through the codec too: its last picture stays what the tablet shows, so a clock
                 // ticking inside a video's window costs a small P-frame, not a keyframe.
-                let in_part = regions && parts.current != parts.full() && rects.iter().any(|r| parts.current.overlaps(*r));
+                // The same while the whole screen is the codec's (a video near full screen): a tile
+                // would make its last picture stale and the next frame a keyframe.
+                let in_part = parts.active() && rects.iter().any(|r| parts.current.overlaps(*r));
                 // Small change: the exact pixels, no codec.
                 if let Some(msgs) =
                     pic.as_ref().filter(|_| use_tiles && !in_part).and_then(|p| tiles::build_all(p, &rects, now))
                 {
+                    parts.note(false);
+                    if debug_regions {
+                        eprintln!("regions: tiles {:?} (active {}, part {:?})", rects.iter().map(|r| r.map(|v| v as i32)).collect::<Vec<_>>(), parts.active(), parts.current);
+                    }
                     gate.sent_batch(msgs.len());
                     // The encoder's last picture is out of date where the tiles went.
                     if !regions || parts.current == parts.full() {
@@ -325,13 +358,16 @@ impl<B: Buffer> Frames<B> {
                     tx.send(all).ok();
                     continue;
                 }
+                // Too much for tiles (a video playing): the codec is busy for a while. (Changes it
+                // was only given because it is busy do not keep it so.)
+                parts.note(!in_part || big.is_some());
                 // Big changes (a video playing) through the codec, in a part of the screen around
                 // them; small ones elsewhere (a clock, a menu) as tiles, sent first.
                 let mut a = a;
                 if regions
                     && use_tiles
                     && let Some(p) = pic.as_ref()
-                    && (big.is_some() || in_part)
+                    && (big.is_some() || (in_part && parts.current != parts.full()))
                 {
                     let region = match big {
                         Some(b) => parts.pick(Some(b)),
@@ -386,9 +422,13 @@ impl<B: Buffer> Frames<B> {
             // The first frame too: an encoder may have seen frames before (a test frame). A
             // part of another size starts over (its encoder's last frame is not the tablet's).
             let resized = last_size.replace((region.w, region.h)) != Some((region.w, region.h));
-            let keyframe = full || resized || std::mem::take(&mut stale_reference);
+            let stale = std::mem::take(&mut stale_reference);
+            let keyframe = full || resized || stale;
             if keyframe {
                 timing.keyframe();
+                if debug_regions {
+                    eprintln!("regions: keyframe (requested {}, new size {resized}, stale {stale})", job.keyframe);
+                }
             }
             encode(f, now, rect.map_or(protocol::ALL, |r| normalize(r, self.width, self.height)), region, keyframe);
         }
@@ -417,20 +457,22 @@ mod tests {
     fn a_video_gets_a_part_after_a_few_frames_and_keeps_it() {
         let mut p = Regions::new(2304, 1440);
         let video = [512.0, 360.0, 1792.0, 1080.0];
-        for _ in 0..3 {
+        for _ in 0..19 {
             assert_eq!(p.pick(Some(video)), p.full());
         }
         let part = p.pick(Some(video));
         assert_eq!(part, Region { x: 512, y: 320, w: 1280, h: 768 });
-        // A ball crossing the border by a few pixels: same part, no new size.
-        assert_eq!(p.pick(Some([508.0, 360.0, 1796.0, 1080.0])), Region { x: 448, y: 320, w: 1408, h: 768 });
-        assert_eq!(p.pick(Some(video)), Region { x: 448, y: 320, w: 1408, h: 768 });
+        // A ball crossing the border: the part grows with room to spare, and then stays.
+        let grown = Region { x: 320, y: 192, w: 1664, h: 1024 };
+        assert_eq!(p.pick(Some([508.0, 360.0, 1796.0, 1080.0])), grown);
+        assert_eq!(p.pick(Some([500.0, 350.0, 1800.0, 1090.0])), grown);
+        assert_eq!(p.pick(Some(video)), grown);
     }
 
     #[test]
     fn big_changes_take_the_whole_screen() {
         let mut p = Regions::new(2304, 1440);
-        for _ in 0..4 {
+        for _ in 0..20 {
             p.pick(Some([512.0, 360.0, 1792.0, 1080.0]));
         }
         assert_eq!(p.pick(Some([0.0, 0.0, 2000.0, 1200.0])), p.full());
