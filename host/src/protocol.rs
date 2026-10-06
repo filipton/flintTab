@@ -37,7 +37,7 @@
 use std::io::{self, Read};
 
 pub const MAGIC: &[u8; 4] = b"TDSP";
-pub const VERSION: u8 = 4;
+pub const VERSION: u8 = 5;
 
 pub const MSG_CONFIG: u8 = 1;
 pub const MSG_VIDEO: u8 = 2;
@@ -50,6 +50,14 @@ pub const MSG_CURSOR_IMAGE: u8 = 5;
 pub const MSG_PING: u8 = 6;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const MSG_TILE: u8 = 7;
+/// u8 flags (SETTING_*): how the tablet behaves, decided here, not on the tablet.
+pub const MSG_SETTINGS: u8 = 8;
+/// Draw into the scanned-out buffer (Android 13+) instead of a compositor-paced swap chain.
+pub const SETTING_LOWEST_LATENCY: u8 = 1;
+/// Touches and the pen drive this computer's mouse.
+pub const SETTING_TOUCH: u8 = 2;
+/// System audio plays on the tablet.
+pub const SETTING_AUDIO: u8 = 4;
 
 pub const KIND_AUDIO: u8 = 1;
 pub const KIND_ACK: u8 = 2;
@@ -115,6 +123,10 @@ pub fn frame(kind: u8, parts: &[&[u8]]) -> Vec<u8> {
         out.extend_from_slice(p);
     }
     out
+}
+
+pub fn settings_msg(flags: u8) -> Vec<u8> {
+    frame(MSG_SETTINGS, &[&[flags]])
 }
 
 pub fn config_msg(width: u32, height: u32, fps: u32) -> Vec<u8> {

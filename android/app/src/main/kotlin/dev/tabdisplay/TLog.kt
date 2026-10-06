@@ -8,9 +8,17 @@ package dev.tabdisplay
 object TLog {
     @Volatile private var sink: ((String) -> Unit)? = null
     private val early = ArrayDeque<String>()
+    /** The last lines, connected or not, for crash reports. */
+    private val last = ArrayDeque<String>()
+
+    fun recent(): List<String> = synchronized(last) { last.toList() }
 
     fun i(msg: String) {
         android.util.Log.i("tabdisplay", msg)
+        synchronized(last) {
+            if (last.size >= 300) last.removeFirst()
+            last.addLast("${java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.ROOT).format(java.util.Date())} $msg")
+        }
         val s = sink
         if (s != null) s(msg) else synchronized(early) {
             if (early.size >= 40) early.removeFirst()

@@ -78,21 +78,30 @@ tablet's screen and streams it.
 `tabdisplay-host -s SERIAL1 --port 27183` and `tabdisplay-host -s SERIAL2 --port 27184`
 (serials from `adb devices`). Each tablet gets its own display.
 
+Everything is set on the host; the tablet only shows what it is told.
+
 **Touch and pen** are off by default, so the tablet is purely a display for the computer's own
-mouse and keyboard; a tap shows the settings panel. Turn on *Touch controls mouse* there to
-use them: tap to click, drag to drag, two-finger drag to scroll, two-finger tap to right-click,
-three-finger tap for the panel. A pen moves the cursor while hovering and its barrel button
-right-clicks.
+mouse and keyboard. With `--touch` they drive the mouse: tap to click, drag to drag, two-finger
+drag to scroll, two-finger tap to right-click. A pen moves the cursor while hovering and its
+barrel button right-clicks.
 - macOS: allow your terminal under System Settings > Privacy & Security > Accessibility.
 - Linux (Wayland): the portal dialog asks for pointer control along with the screen. On X11 it
   uses XTEST. Sway's portal has no remote-desktop support, so no touch input there yet.
 
-**Audio** is off by default; use the *Audio* switch in the same panel (top right).
+**Audio** is off by default; `--audio` plays the computer's sound on the tablet.
 Only system audio is captured; the host mutes nothing on the computer.
+
+**Lowest latency** (drawing straight into the buffer the panel scans out, Android 13+) is on by
+default; `--no-lowest-latency` uses the tablet's compositor-paced swap chain instead.
+
+**Logs:** the host writes everything it prints to `logs/host-<time>.log` in its cache folder
+(`~/Library/Caches/tabdisplay` on macOS, `~/.cache/tabdisplay` on Linux), and after each session
+saves the tablet's recent Android log (`tablet-<serial>-<time>.log`). If the tablet app crashes,
+its report (stack trace, last log lines) is printed by the host on the next connection.
 
 The stream runs at the tablet's refresh rate (up to 120 Hz) when its decoder can keep up.
 
-Options: `--fps N --bitrate MBPS --keep-display SECS --max-width 2560 --serial SERIAL --no-aoa --keep-tablet-settings --no-launch --apk PATH --no-install --width W --height H`;
+Options: `--touch --audio --no-lowest-latency --fps N --bitrate MBPS --keep-display SECS --max-width 2560 --serial SERIAL --no-aoa --keep-tablet-settings --no-launch --apk PATH --no-install --width W --height H`;
 macOS: `--ppi 220 --no-hidpi --cursor-in-video`; Linux: `--encoder NAME --portal-monitor --x11-region X,Y`.
 
 ## How it keeps latency low
@@ -111,8 +120,8 @@ own scan (up to one refresh).
   NV12 buffer the display hardware scans out itself (front-buffered); native code (Rust) copies
   each update into it while the panel's scan is elsewhere, so nothing tears, and at most one
   new frame per scan pass, so motion stays even. No GPU, no compositor queue (~17 ms at 90 Hz
-  otherwise). Turning off "Lowest latency" in the tablet's settings panel uses a regular
-  compositor-paced swap chain instead.
+  otherwise). `--no-lowest-latency`, or Android before 13, uses a compositor-paced NV12 swap
+  chain instead (the NDK's ASurfaceControl on Android 11 and 12).
 - **The Mac renders at the tablet's rate.** The virtual display runs at the panel's refresh rate
   (90 Hz here, not macOS's default 60); if the tablet's rate changes (its caps are lifted just
   after the app starts) the app reconnects and the display follows.

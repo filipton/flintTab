@@ -39,6 +39,9 @@ object Native {
     )
     @JvmStatic external fun yuvRender(handle: Long, index: Int): Boolean
     @JvmStatic external fun yuvDump(handle: Long, out: ByteBuffer)
+    /** Where a panic in the native code is written (see CrashLog). */
+    @JvmStatic external fun crashFile(path: String)
+    @JvmStatic external fun panicTest()
     @JvmStatic external fun chainCreate(surface: android.view.Surface, owner: NdkChain, bw: Int, bh: Int, vw: Int, vh: Int): Long
     @JvmStatic external fun chainAddBuffer(chain: Long, hb: android.hardware.HardwareBuffer): Boolean
     @JvmStatic external fun chainTake(chain: Long): Int

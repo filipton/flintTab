@@ -99,6 +99,25 @@ class CpuRenderer(
     private val paintWidth get() = if (screen != 0L && streamW > 0) streamW else view.width
     private val paintHeight get() = if (screen != 0L && streamH > 0) streamH else view.height
 
+    /**
+     * The host's choice: the front buffer (where supported) or the swap chain. A change rebuilds
+     * the buffers; the picture comes back with the next frame (a full one after a rebuild).
+     */
+    fun chooseLowestLatency(on: Boolean) {
+        handler.post {
+            if (lowestLatency == on) return@post
+            lowestLatency = on
+            if (yuv != null || yuvFront != null) {
+                yuv?.release()
+                yuv = null
+                yuvFront?.release()
+                yuvFront = null
+                fullNext = true
+                attach()
+            }
+        }
+    }
+
     /** None of the CPU paths could be set up on this device: the app falls back to plain video. */
     var onUnusable: (() -> Unit)? = null
     private var failedAttaches = 0

@@ -362,3 +362,30 @@ pub unsafe extern "system" fn Java_dev_tabdisplay_Native_chainRelease(env: *mut 
     let c = unsafe { Box::from_raw(h as *mut std::sync::Arc<chain::Chain>) };
     unsafe { c.release(env) };
 }
+
+// --- crash reports (CrashLog.kt) -------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_crashFile(env: *mut JNIEnv, _c: jclass, path: jni_sys::jstring) {
+    let path = unsafe {
+        let chars = ((**env).GetStringUTFChars.unwrap())(env, path, std::ptr::null_mut());
+        if chars.is_null() {
+            return;
+        }
+        let p = std::ffi::CStr::from_ptr(chars).to_string_lossy().into_owned();
+        ((**env).ReleaseStringUTFChars.unwrap())(env, path, chars);
+        p
+    };
+    // A panic aborts the app (panic = "abort"): say what and where first, in logcat and in a
+    // file the app sends to the host on its next start.
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = format!("native code panicked: {info}\n{}", std::backtrace::Backtrace::force_capture());
+        front::log(&msg);
+        let _ = std::fs::write(&path, msg);
+    }));
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_panicTest(_env: *mut JNIEnv, _c: jclass) {
+    panic!("panic test");
+}

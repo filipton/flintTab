@@ -24,35 +24,13 @@ class MainActivity : Activity() {
 
     private lateinit var surfaceView: SurfaceView
     private lateinit var status: TextView
-    private lateinit var panel: LinearLayout
-    private lateinit var audioSwitch: Switch
-    private lateinit var touchSwitch: Switch
     private lateinit var hostCursor: HostCursor
-    private lateinit var latencySwitch: Switch
+    /** The host's --touch: touches and the pen drive the computer's mouse. */
+    @Volatile private var touchEnabled = false
     /** Draws video and cursor into the scanned-out buffer; null when off or unsupported. */
     private var front: Renderer? = null
-    private var tapDownAt = 0L
     private var session: Session? = null
-    private val hidePanel = Runnable { panel.visibility = View.GONE }
     @Volatile private var refreshHz = 60
-
-    /** Experiment (variant F): redraw the (transparent) window every frame while streaming. */
-    private var keepAwake = false
-    @Volatile private var streaming = false
-    private val keepAlive by lazy {
-        object : View(this) {
-            private val paint = android.graphics.Paint()
-            private var tick = false
-            override fun onDraw(c: android.graphics.Canvas) {
-                if (!keepAwake || !streaming) return
-                // One pixel at alpha 0 or 1/255: invisible, but a new frame with full damage.
-                tick = !tick
-                paint.color = if (tick) 0x01000000 else 0
-                c.drawRect(0f, 0f, 1f, 1f, paint)
-                postInvalidateOnAnimation()
-            }
-        }
-    }
 
     /**
      * The panel's modes change at runtime (battery saver, motion smoothness: the host lifts
@@ -90,19 +68,12 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CrashLog.install(this)
+        // Testing the crash reports: `--ez crash true` (Kotlin) or `--ez panic true` (native).
+        if (intent.getBooleanExtra("crash", false)) Thread { Thread.sleep(3000); error("crash test") }.start()
+        if (intent.getBooleanExtra("panic", false)) Thread { Thread.sleep(3000); Native.panicTest() }.start()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         refreshHz = pickFastestDisplayMode()
-        if (intent.getBooleanExtra("yuvprobe", false)) { // PROBE
-            val HB = android.hardware.HardwareBuffer::class.java
-            for ((name, usage) in listOf(
-                "overlay+cpu" to (android.hardware.HardwareBuffer.USAGE_COMPOSER_OVERLAY or android.hardware.HardwareBuffer.USAGE_CPU_WRITE_RARELY),
-                "overlay+cpu+gpu" to (android.hardware.HardwareBuffer.USAGE_COMPOSER_OVERLAY or android.hardware.HardwareBuffer.USAGE_CPU_WRITE_RARELY or android.hardware.HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE),
-            )) {
-                val ok = android.hardware.HardwareBuffer.isSupported(2304, 1440, android.hardware.HardwareBuffer.YCBCR_420_888, 1, usage)
-                android.util.Log.i("tabdisplay", "yuv probe $name supported=$ok ${HB.simpleName}")
-                if (ok) android.hardware.HardwareBuffer.create(2304, 1440, android.hardware.HardwareBuffer.YCBCR_420_888, 1, usage).use { Native.probeYuv(it) }
-            }
-        }
         getSystemService(android.hardware.display.DisplayManager::class.java)
             .registerDisplayListener(displayListener, android.os.Handler(mainLooper))
 
@@ -116,68 +87,11 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.BLACK)
         }
 
-        audioSwitch = Switch(this).apply {
-            text = "Audio  "
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            setOnCheckedChangeListener { _, on ->
-                session?.setAudio(on)
-                scheduleHide()
-            }
-        }
-        // Off by default: the tablet is a display for the computer's own mouse. When on, touches
-        // and the pen drive the mouse and a three-finger tap brings this panel back.
-        val prefs = getPreferences(MODE_PRIVATE)
-        touchSwitch = Switch(this).apply {
-            text = "Touch controls mouse  "
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            isChecked = prefs.getBoolean("touch", false)
-            setOnCheckedChangeListener { _, on ->
-                prefs.edit().putBoolean("touch", on).apply()
-                scheduleHide()
-            }
-        }
-        // On by default where the hardware allows it: skips the compositor's queue (~17 ms at
-        // 90 Hz) at the cost of possible tearing. Switching rebuilds the activity.
-        val frontSupported = YuvFront.supported()
-        // For measuring: `am start ... --ez front false` sets the switch.
-        if (intent.hasExtra("front")) prefs.edit().putBoolean("front", intent.getBooleanExtra("front", true)).commit()
-        latencySwitch = Switch(this).apply {
-            text = if (frontSupported) "Lowest latency  " else "Lowest latency (needs Android 13)  "
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            isEnabled = frontSupported
-            isChecked = frontSupported && prefs.getBoolean("front", true)
-            setOnCheckedChangeListener { _, on ->
-                prefs.edit().putBoolean("front", on).apply()
-                recreate()
-            }
-        }
-        panel = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(40, 24, 40, 24)
-            setBackgroundColor(0xCC000000.toInt())
-            addView(latencySwitch)
-            addView(touchSwitch)
-            addView(audioSwitch)
-            visibility = View.GONE
-        }
-
         val root = FrameLayout(this)
         root.addView(surfaceView)
-        root.addView(keepAlive)
         val cursor = CursorOverlay(this)
         root.addView(cursor)
         root.addView(status)
-        root.addView(
-            panel,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.END,
-            ).apply { setMargins(24, 24, 24, 24) },
-        )
         setContentView(root)
         hideSystemBars()
 
@@ -185,35 +99,22 @@ class MainActivity : Activity() {
         run {
             val changed = { pts: Long -> session?.takeChangedArea(pts) }
             val shown = { pts: Long, nanos: Long -> session?.frameShown(pts, nanos); Unit }
-            // The CPU writes into the scanned-out buffer where the hardware allows it; else the GPU does.
-            // Experiment: `--ei variant` 1 = CPU, 2 = CPU with a GPU-allocated buffer, 3 = GL.
-            val variant = if (latencySwitch.isChecked) intent.getIntExtra("variant", 0) else 0
-            CpuFront.gpuUsage = variant == 2
-            CpuFront.singleBuffer = variant in 1..6
-            CpuFront.noFrontFlag = variant == 4 || variant == 8
-            CpuFront.noDamage = variant == 5 || variant == 6
-            keepAwake = variant == 6
+            // NV12 into a buffer the display scans out (front buffer, Android 13+, when the host
+            // asks for lowest latency) or into a compositor-paced swap chain; plain video if this
+            // device can do neither.
             front = when {
-                variant == 3 -> FrontRenderer(surfaceView, changed, shown)
-                variant in 1..8 && CpuFront.supported() -> CpuRenderer(surfaceView, changed, shown).also { it.useFrontBuffer = true }
-                // 9: the compositor-paced NV12 chain instead of the front buffer.
                 forcePlainVideo -> null
                 YuvFront.supported() || YuvChain.supported() || NdkChain.supported() || SwapChain.supported() ->
                     CpuRenderer(surfaceView, changed, shown).also {
-                        // The switch picks the front buffer; without it (or before Android 13)
-                        // the compositor-paced NV12 swap chain.
-                        it.lowestLatency = latencySwitch.isChecked && variant != 9
                         it.onUnusable = { runOnUiThread { forcePlainVideo = true; recreate() } }
                     }
-                else -> null // the plain video path
+                else -> null
             }
             TLog.i(
                 "Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}), " +
                     "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}: renderer " +
                     when {
-                        front is CpuRenderer && latencySwitch.isChecked && YuvFront.supported() -> "front buffer (lowest latency)"
-                        front is CpuRenderer -> "NV12 swap chain"
-                        front != null -> front!!::class.simpleName
+                        front != null -> "NV12 (front buffer: ${if (YuvFront.supported()) "available" else "needs Android 13"})"
                         forcePlainVideo -> "plain video (the fast paths failed on this device)"
                         else -> "plain video (this device cannot hand CPU-written buffers to the compositor)"
                     }
@@ -226,28 +127,22 @@ class MainActivity : Activity() {
             }, android.content.IntentFilter("dev.tabdisplay.DUMP"), RECEIVER_EXPORTED)
         }
 
-        // With touch input off, a tap shows the panel for a few seconds. With it on, touches and
-        // the pen control the computer's mouse and a three-finger tap shows the panel.
+        // With the host's --touch, touches and the pen control the computer's mouse.
         val touch = TouchInput(
             send = { a, x, y -> session?.sendPointer(a, x, y) },
             scroll = { dx, dy -> session?.sendScroll(dx, dy) },
-            onThreeFingerTap = {
-                panel.visibility = View.VISIBLE
-                scheduleHide()
-            },
+            onThreeFingerTap = {},
             touchSlop = ViewConfiguration.get(this).scaledTouchSlop.toFloat(),
         )
         surfaceView.addOnLayoutChangeListener { v, _, _, _, _, _, _, _, _ -> touch.setViewSize(v.width, v.height) }
         surfaceView.setOnTouchListener { _, e ->
-            if (touchSwitch.isChecked) {
+            touchEnabled && run {
                 cursor.onPen(e)
                 touch.onTouch(e)
-            } else {
-                showPanelOnTap(e)
             }
         }
         surfaceView.setOnGenericMotionListener { _, e ->
-            touchSwitch.isChecked && run { cursor.onPen(e); touch.onHover(e) }
+            touchEnabled && run { cursor.onPen(e); touch.onHover(e) }
         }
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(h: SurfaceHolder) {
@@ -256,22 +151,6 @@ class MainActivity : Activity() {
             override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {}
             override fun surfaceDestroyed(h: SurfaceHolder) = hostCursor.release()
         })
-    }
-
-    private fun showPanelOnTap(e: MotionEvent): Boolean {
-        when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> tapDownAt = e.eventTime
-            MotionEvent.ACTION_UP -> if (e.eventTime - tapDownAt < 300) {
-                panel.visibility = View.VISIBLE
-                scheduleHide()
-            }
-        }
-        return true
-    }
-
-    private fun scheduleHide() {
-        panel.removeCallbacks(hidePanel)
-        panel.postDelayed(hidePanel, 4000)
     }
 
     override fun onStart() {
@@ -301,14 +180,16 @@ class MainActivity : Activity() {
             onState = { connected ->
                 runOnUiThread {
                     status.visibility = if (connected) View.GONE else View.VISIBLE
-                    streaming = connected
-                    keepAlive.invalidate()
                 }
             },
             onCursor = front?.let { it::moveCursor } ?: hostCursor::move,
             onCursorImage = front?.let { f -> { msg: ByteArray -> HostCursor.parseImage(msg)?.let { f.setCursorImage(it.bitmap, it.displayWidthPt, it.sizePt, it.hotPt) } } }
                 ?: hostCursor::setImage,
-        ).also { it.setAudio(audioSwitch.isChecked) }
+            onSettings = { flags ->
+                touchEnabled = flags and Session.SETTING_TOUCH != 0
+                (front as? CpuRenderer)?.chooseLowestLatency(flags and Session.SETTING_LOWEST_LATENCY != 0)
+            },
+        )
         // Debugging: `--ei decoder N` starts at decoder setup N (1 plain, 2 software).
         session?.decoderLevel = intent.getIntExtra("decoder", 0)
     }

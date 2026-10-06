@@ -12,6 +12,7 @@ mod capture;
 mod cursor;
 mod frames;
 mod gate;
+mod logs;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -98,6 +99,16 @@ pub struct Args {
     /// Stay on adb's TCP forward instead of switching the tablet to a raw USB accessory
     #[arg(long)]
     no_aoa: bool,
+    /// Use the tablet's compositor-paced swap chain instead of drawing straight into the
+    /// scanned-out buffer (which needs Android 13; a little more latency, never tearing)
+    #[arg(long)]
+    no_lowest_latency: bool,
+    /// Let the tablet's touches and pen move and click this computer's mouse
+    #[arg(long)]
+    touch: bool,
+    /// Play this computer's sound on the tablet
+    #[arg(long)]
+    audio: bool,
     /// Do not run adb at all (the tablet connects some other way, e.g. a test client)
     #[arg(long, hide = true)]
     no_adb: bool,
@@ -432,8 +443,15 @@ fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBoo
     );
 
     let alive = Arc::new(AtomicBool::new(true));
-    let audio_on = Arc::new(AtomicBool::new(false)); // audio is off until the tablet asks
+    let audio_on = Arc::new(AtomicBool::new(args.audio));
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    // Settings first: the tablet sets up its display for them when the configuration comes.
+    let settings = [
+        (!args.no_lowest_latency, protocol::SETTING_LOWEST_LATENCY),
+        (args.touch, protocol::SETTING_TOUCH),
+        (args.audio, protocol::SETTING_AUDIO),
+    ];
+    tx.send(protocol::settings_msg(settings.iter().filter(|(on, _)| *on).fold(0, |f, (_, bit)| f | bit))).ok();
     tx.send(protocol::config_msg(width, height, fps)).ok();
 
     let epoch = std::time::Instant::now();
@@ -537,10 +555,8 @@ fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBoo
                         println!("tablet asked for a keyframe");
                         control.request_keyframe();
                     }
-                    protocol::KIND_AUDIO => {
-                        audio_on.store(m[1] != 0, Ordering::Relaxed);
-                        println!("audio {}", if m[1] != 0 { "on" } else { "off" });
-                    }
+                    // (Older apps asked for audio themselves; --audio decides now.)
+                    protocol::KIND_AUDIO => {}
                     _ => {}
                 }
             }
@@ -581,6 +597,7 @@ fn make_host(args: &Args) -> Result<Box<dyn Host>> {
 
 fn main() -> Result<()> {
     let mut args = Args::parse();
+    logs::tee();
     let mut host = make_host(&args)?;
     if !args.no_adb {
         args.adb = app::find_adb(&args.adb);
@@ -621,6 +638,11 @@ fn main() -> Result<()> {
                 if let Err(e) = run_session(conn, &args, host.as_mut(), &running) {
                     eprintln!("session error: {e:#}");
                 }
+                if !args.no_adb
+                    && let Some(serial) = current.lock().unwrap().clone()
+                {
+                    logs::save_tablet(&args.adb, &serial);
+                }
                 busy.store(false, Ordering::Relaxed);
                 on_aoa.store(false, Ordering::Relaxed);
             }
@@ -634,6 +656,7 @@ fn main() -> Result<()> {
     if !args.no_adb {
         tablet::restore(&args.adb);
     }
+    logs::finish();
     Ok(())
 }
 

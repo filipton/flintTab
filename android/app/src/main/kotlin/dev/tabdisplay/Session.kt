@@ -55,6 +55,8 @@ class Session(
     private val usb: UsbManager? = null,
     /** Asks the user once to let the app use the accessory (when not opened through it). */
     private val askUsbPermission: (android.hardware.usb.UsbAccessory) -> Unit = {},
+    /** What the host decided (MSG_SETTINGS flags: SETTING_*), once per connection. */
+    private val onSettings: (flags: Int) -> Unit = {},
 ) {
     @Volatile private var running = true
     @Volatile private var socket: Closeable? = null
@@ -68,11 +70,6 @@ class Session(
         loop()
     }
 
-    fun setAudio(enabled: Boolean) {
-        audioWanted = enabled
-        audio?.setEnabled(enabled)
-        sendControl(KIND_AUDIO, if (enabled) 1 else 0)
-    }
 
     /** The rate the host was told; it streams (and sizes its virtual display) for it. */
     @Volatile private var sentFps = 0
@@ -117,7 +114,7 @@ class Session(
     }
 
     private fun sendLog(line: String) {
-        val text = line.toByteArray(Charsets.UTF_8).let { if (it.size > 2000) it.copyOf(2000) else it }
+        val text = line.toByteArray(Charsets.UTF_8).let { if (it.size > 16000) it.copyOf(16000) else it }
         outbox.add(byteArrayOf(KIND_LOG.toByte(), 0, (text.size shr 8).toByte(), text.size.toByte()) + text)
     }
 
@@ -273,6 +270,7 @@ class Session(
         outbox.clear() // nothing from an earlier connection
         out = output
         TLog.connected(::sendLog)
+        CrashLog.sendPending()
         connectedOnce = true
 
         var decoder: Decoder? = null
@@ -335,9 +333,16 @@ class Session(
                         decoder = newDecoder(surface, w, h, fps)
                         needKeyframe = false
                         audio = AudioPlayer(rate, ch).also { it.setEnabled(audioWanted) }
-                        // host starts with audio off; tell it what the switch currently says
-                        sendControl(KIND_AUDIO, if (audioWanted) 1 else 0)
                         onState(true)
+                    }
+                    MSG_SETTINGS -> {
+                        val flags = input.readUnsignedByte()
+                        if (len > 1) input.skipBytes(len - 1)
+                        audioWanted = flags and SETTING_AUDIO != 0
+                        audio?.setEnabled(audioWanted)
+                        TLog.i("settings from the host: lowest latency ${flags and SETTING_LOWEST_LATENCY != 0}, " +
+                            "touch ${flags and SETTING_TOUCH != 0}, audio $audioWanted")
+                        onSettings(flags)
                     }
                     MSG_VIDEO -> {
                         val pts = input.readLong() // host clock; echoed back once shown, for latency stats
@@ -427,7 +432,7 @@ class Session(
     }
 
     companion object {
-        const val VERSION = 4
+        const val VERSION = 5
         const val MSG_CONFIG = 1
         const val MSG_VIDEO = 2
         const val MSG_AUDIO = 3
@@ -435,6 +440,11 @@ class Session(
         const val MSG_CURSOR_IMAGE = 5
         const val MSG_PING = 6
         const val MSG_TILE = 7
+        /** u8 flags: what the host decided (SETTING_*). */
+        const val MSG_SETTINGS = 8
+        const val SETTING_LOWEST_LATENCY = 1
+        const val SETTING_TOUCH = 2
+        const val SETTING_AUDIO = 4
         const val FEATURE_TILES = 1
         const val KIND_AUDIO = 1
         const val KIND_ACK = 2
