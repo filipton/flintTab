@@ -152,8 +152,23 @@ impl Capture {
             AudioHandler { sink: Mutex::new(Box::new(audio)) },
             SCStreamOutputType::Audio,
         );
-        stream.start_capture()?;
-        Ok(Self { stream })
+        // ScreenCaptureKit can leave start_capture unanswered (seen while another virtual display
+        // was being removed and created): wait a few seconds, then give up on this session; the
+        // tablet reconnects and capture starts afresh, instead of the host hanging for good.
+        struct Pending(SCStream);
+        unsafe impl Send for Pending {}
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let pending = Pending(stream);
+        thread::spawn(move || {
+            let mut p = pending;
+            let r = p.0.start_capture().map_err(|e| anyhow::anyhow!("{e:?}"));
+            let _ = done_tx.send((p, r));
+        });
+        match done_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok((p, Ok(()))) => Ok(Self { stream: p.0 }),
+            Ok((_, Err(e))) => Err(e.context("starting screen capture")),
+            Err(_) => bail!("ScreenCaptureKit did not start capturing within 5 s; trying again"),
+        }
     }
 }
 
