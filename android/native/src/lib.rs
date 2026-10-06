@@ -1,5 +1,6 @@
 //! Native hot paths of the tablet app (JNI: see `Native.kt`).
 
+mod chain;
 mod front;
 mod neon;
 mod yuv;
@@ -316,4 +317,39 @@ pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvCursorImage(env: *mu
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvCursorMove(_env: *mut JNIEnv, _c: jclass, h: jlong, x: jint, y: jint, shown: jni_sys::jboolean) {
     screen(h).move_cursor(x as i64, y as i64, shown != 0);
+}
+
+// --- NV12 swap chain through ASurfaceControl (Android 10-12; chain.rs) -------------------------
+
+fn chain<'a>(h: jlong) -> &'a std::sync::Arc<chain::Chain> {
+    unsafe { &*(h as *const std::sync::Arc<chain::Chain>) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_chainCreate(env: *mut JNIEnv, _c: jclass, surface: jobject, owner: jobject) -> jlong {
+    match unsafe { chain::Chain::create(env, surface, owner) } {
+        Some(c) => Box::into_raw(Box::new(c)) as jlong,
+        None => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_chainAddBuffer(env: *mut JNIEnv, _c: jclass, h: jlong, hb: jobject) -> jni_sys::jboolean {
+    unsafe { chain(h).add_buffer(env, hb) as jni_sys::jboolean }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_chainTake(_env: *mut JNIEnv, _c: jclass, h: jlong) -> jint {
+    chain(h).take()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_chainSubmit(_env: *mut JNIEnv, _c: jclass, h: jlong, i: jint, batch: jlong) {
+    chain(h).submit(i as usize, batch);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_chainRelease(env: *mut JNIEnv, _c: jclass, h: jlong) {
+    let c = unsafe { Box::from_raw(h as *mut std::sync::Arc<chain::Chain>) };
+    unsafe { c.release(env) };
 }

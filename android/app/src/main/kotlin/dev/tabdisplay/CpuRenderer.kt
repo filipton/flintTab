@@ -43,7 +43,7 @@ class CpuRenderer(
     /** The default: one NV12 buffer the panel scans out, written in place ([YuvFront]). */
     private var yuvFront: YuvFront? = null
     /** Without "lowest latency": NV12 buffers the compositor shows ([YuvChain]); cursor on its own layer. */
-    private var yuv: YuvChain? = null
+    private var yuv: Chain? = null
     /** The NV12 screen, either way. */
     private val screen: Long get() = yuvFront?.handle ?: yuv?.handle ?: 0L
     /** False: the compositor-paced chain instead of the front buffer. */
@@ -89,15 +89,27 @@ class CpuRenderer(
 
     private val ready get() = screen != 0L || handle != 0L
 
+    /** None of the CPU paths could be set up on this device: the app falls back to plain video. */
+    var onUnusable: (() -> Unit)? = null
+    private var failedAttaches = 0
+
     private fun attach() {
         if (ready) return
         when {
             useFrontBuffer -> front = CpuFront.attach(view)
             lowestLatency && YuvFront.supported() -> yuvFront = YuvFront.attach(view)
             YuvChain.supported() -> yuv = YuvChain.attach(view, handler)
-            else -> chain = SwapChain.attach(view, handler)
+            NdkChain.supported() -> yuv = NdkChain.attach(view, handler)
+            SwapChain.supported() -> chain = SwapChain.attach(view, handler)
         }
         if (!ready) {
+            // Laid out and still nothing: this device cannot do it (not just "not yet").
+            val laidOut = view.width > 0 && view.holder.surface?.isValid == true
+            if (laidOut && ++failedAttaches >= 5) {
+                TLog.i("the fast display paths could not be set up here; switching to plain video")
+                onUnusable?.invoke()
+                return
+            }
             handler.postDelayed(::attach, 100) // the view is not laid out yet
             return
         }

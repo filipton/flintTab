@@ -39,6 +39,11 @@ object Native {
     )
     @JvmStatic external fun yuvRender(handle: Long, index: Int): Boolean
     @JvmStatic external fun yuvDump(handle: Long, out: ByteBuffer)
+    @JvmStatic external fun chainCreate(surface: android.view.Surface, owner: NdkChain): Long
+    @JvmStatic external fun chainAddBuffer(chain: Long, hb: android.hardware.HardwareBuffer): Boolean
+    @JvmStatic external fun chainTake(chain: Long): Int
+    @JvmStatic external fun chainSubmit(chain: Long, index: Int, batch: Long)
+    @JvmStatic external fun chainRelease(chain: Long)
     @JvmStatic external fun yuvAttachFront(handle: Long, hb: android.hardware.HardwareBuffer, hint: Int): Boolean
     @JvmStatic external fun yuvVsync(handle: Long, vsyncNanos: Long, periodNanos: Long)
     @JvmStatic external fun yuvPresent(handle: Long, frame: Boolean): Boolean

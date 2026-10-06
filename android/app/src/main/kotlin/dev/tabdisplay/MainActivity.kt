@@ -17,6 +17,11 @@ import android.widget.TextView
 import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
+    companion object {
+        /** The CPU display paths failed on this device: plain video until the app restarts. */
+        @Volatile var forcePlainVideo = false
+    }
+
     private lateinit var surfaceView: SurfaceView
     private lateinit var status: TextView
     private lateinit var panel: LinearLayout
@@ -192,8 +197,12 @@ class MainActivity : Activity() {
                 variant == 3 -> FrontRenderer(surfaceView, changed, shown)
                 variant in 1..8 && CpuFront.supported() -> CpuRenderer(surfaceView, changed, shown).also { it.useFrontBuffer = true }
                 // 9: the compositor-paced NV12 chain instead of the front buffer.
-                YuvFront.supported() || YuvChain.supported() || SwapChain.supported() ->
-                    CpuRenderer(surfaceView, changed, shown).also { it.lowestLatency = variant != 9 }
+                forcePlainVideo -> null
+                YuvFront.supported() || YuvChain.supported() || NdkChain.supported() || SwapChain.supported() ->
+                    CpuRenderer(surfaceView, changed, shown).also {
+                        it.lowestLatency = variant != 9
+                        it.onUnusable = { runOnUiThread { forcePlainVideo = true; recreate() } }
+                    }
                 else -> null // the plain video path
             }
             TLog.i(

@@ -19,11 +19,11 @@ import android.view.SurfaceView
  * (android/native/src/yuv.rs) keeps the picture and copies each buffer only what it is missing.
  */
 class YuvChain private constructor(
-    val handle: Long,
+    override val handle: Long,
     private val sc: SurfaceControl,
     private val buffers: List<HardwareBuffer>,
     private val handler: Handler,
-) {
+) : Chain {
     private val free = BooleanArray(buffers.size) { true }
     private val releaseFence = arrayOfNulls<SyncFence>(buffers.size)
     private var pendingRetry: (() -> Unit)? = null
@@ -35,7 +35,7 @@ class YuvChain private constructor(
      * it reached the screen (its present fence). False if every buffer is still with the
      * compositor: [retry] runs once one comes back. Render thread only.
      */
-    fun submit(onShown: (Long) -> Unit, retry: () -> Unit): Boolean {
+    override fun submit(onShown: (Long) -> Unit, retry: () -> Unit): Boolean {
         val i = free.indexOfFirst { it }
         if (i < 0) {
             pendingRetry = retry
@@ -72,7 +72,7 @@ class YuvChain private constructor(
         return true
     }
 
-    fun release() {
+    override fun release() {
         fences.shutdownNow()
         SurfaceControl.Transaction().reparent(sc, null).apply()
         sc.release()
