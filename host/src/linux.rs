@@ -24,7 +24,7 @@ use std::{
 
 use crate::{
     Args, Button, Host, Input, Pointer, Stream, StreamConfig,
-    frames::{Buffer, Frame, Frames},
+    frames::{Buffer, Frame, Frames, Region},
     protocol, sps,
     tiles::Picture,
 };
@@ -236,9 +236,10 @@ impl LinuxHost {
             });
         }
         Ok(match self.source.as_ref().unwrap() {
-            Source::Test => format!(
-                "videotestsrc is-live=true pattern=ball ! video/x-raw,width={w},height={h},framerate={fps}/1"
-            ),
+            // Testing: TD_TEST_SOURCE=<pipeline> instead of the ball (e.g. a noise "video" window).
+            Source::Test => std::env::var("TD_TEST_SOURCE").unwrap_or_else(|_| {
+                format!("videotestsrc is-live=true pattern=ball ! video/x-raw,width={w},height={h},framerate={fps}/1")
+            }),
             Source::Node(n) => format!(
                 "pipewiresrc path={n} do-timestamp=true always-copy=true ! video/x-raw,max-framerate={fps}/1 ! videoscale ! video/x-raw,width={w},height={h}"
             ),
@@ -506,8 +507,8 @@ fn start_audio(audio_on: Arc<AtomicBool>, tx: mpsc::Sender<Vec<u8>>) -> Result<g
     Ok(p)
 }
 
-/// Frames inside the encoder: their pts (session µs) and changed area.
-type Pending = Arc<Mutex<std::collections::HashMap<u64, [u16; 4]>>>;
+/// Frames inside the encoder: their pts (session µs), changed area and part of the screen.
+type Pending = Arc<Mutex<std::collections::HashMap<u64, ([u16; 4], Region)>>>;
 
 /// A running H.264 encoder the host feeds itself (the frame thread decides per frame whether
 /// it is encoded at all: small changes go out as tiles). Frames are pushed through it on the
@@ -567,6 +568,19 @@ impl Encoder {
         Err(last_err)
     }
 
+    /// Another encoder of the element `name` (one that works), for pictures of `w`x`h`: a
+    /// part of the screen (a GStreamer encoder's size is fixed once it runs).
+    fn start_sized(
+        name: &'static str,
+        (w, h): (u32, u32),
+        cfg: &StreamConfig,
+        frames: &Arc<Frames<GstFrame>>,
+        tx: &mpsc::Sender<Vec<u8>>,
+    ) -> Result<Self> {
+        let (_, pre, props) = encoders(cfg).into_iter().find(|(n, _, _)| *n == name).ok_or_else(|| anyhow!("no encoder {name}"))?;
+        Self::try_start(name, pre, &props, (w, h, cfg.fps), frames, tx)
+    }
+
     fn try_start(
         name: &'static str,
         pre: &str,
@@ -608,7 +622,7 @@ impl Encoder {
                     let buf = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let map = buf.map_readable().map_err(|_| gst::FlowError::Error)?;
                     let pts = running_us(&sample, buf).unwrap_or(0);
-                    let Some(area) = p.lock().unwrap().remove(&pts) else {
+                    let Some((area, region)) = p.lock().unwrap().remove(&pts) else {
                         // The test frame (pts 0): the encoder works.
                         if pts == 0 {
                             let _ = probe_tx.try_send(());
@@ -620,7 +634,7 @@ impl Encoder {
                         return Ok(gst::FlowSuccess::Ok); // wait for the first SPS/IDR
                     }
                     first = false;
-                    f.encoded(&tx, pts, area, f.whole(), patched.as_deref().unwrap_or(&map));
+                    f.encoded(&tx, pts, area, region, patched.as_deref().unwrap_or(&map));
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
@@ -679,7 +693,7 @@ impl Encoder {
 
     /// Encodes `f` as `pts`; its output goes out from the sink callback. False once the
     /// encoder has failed (an error, or a frame refused).
-    fn encode(&self, f: &Frame<GstFrame>, pts: u64, area: [u16; 4], keyframe: bool) -> bool {
+    fn encode(&self, f: &Frame<GstFrame>, pts: u64, area: [u16; 4], region: Region, keyframe: bool) -> bool {
         if self.break_after.is_some_and(|n| self.frames.fetch_add(1, Ordering::Relaxed) >= n) {
             self.failed.store(true, Ordering::Relaxed);
         }
@@ -689,12 +703,22 @@ impl Encoder {
         {
             let mut p = self.pending.lock().unwrap();
             p.retain(|&t, _| t + 2_000_000 > pts); // frames an encoder dropped
-            p.insert(pts, area);
+            p.insert(pts, (area, region));
         }
         if keyframe {
             self.src.push_event(gstreamer_video::DownstreamForceKeyUnitEvent::builder().all_headers(true).build());
         }
-        let mut b = f.buf.buf.copy(); // shares the pixels
+        let mut b = if region.x == 0 && region.y == 0 && region.w == f.buf.info.width() && region.h == f.buf.info.height() {
+            f.buf.buf.copy() // shares the pixels
+        } else {
+            match crop(&f.buf, region) {
+                Some(b) => b,
+                None => {
+                    eprintln!("cannot crop the {}x{} part at {},{}", region.w, region.h, region.x, region.y);
+                    return false;
+                }
+            }
+        };
         b.make_mut().set_pts(gst::ClockTime::from_useconds(pts));
         if let Err(e) = self.src.push(b) {
             eprintln!("{} refused a frame: {e:?}", self.name);
@@ -707,6 +731,29 @@ impl Encoder {
         }
         !self.failed.load(Ordering::Relaxed)
     }
+}
+
+/// The part `r` of an NV12 frame as a buffer of its own (x, y even).
+fn crop(f: &GstFrame, r: Region) -> Option<gst::Buffer> {
+    let src = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(f.buf.as_ref(), &f.info).ok()?;
+    let (x, y, w, h) = (r.x as usize, r.y as usize, r.w as usize, r.h as usize);
+    if x + w > src.width() as usize || y + h > src.height() as usize {
+        return None;
+    }
+    let mut out = gst::Buffer::with_size(w * h * 3 / 2).ok()?;
+    {
+        let mut m = out.get_mut()?.map_writable().ok()?;
+        let (luma, chroma) = m.split_at_mut(w * h);
+        for (plane, dst, rows, top) in [(0u32, luma, h, y), (1, chroma, h / 2, y / 2)] {
+            let data = src.plane_data(plane).ok()?;
+            let stride = *src.plane_stride().get(plane as usize)? as usize;
+            for row in 0..rows {
+                let at = (top + row) * stride + x;
+                dst[row * w..(row + 1) * w].copy_from_slice(data.get(at..at + w)?);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Prints what goes wrong in a pipeline after it started (otherwise nobody would see it).
@@ -864,9 +911,44 @@ impl Host for LinuxHost {
                 let frames2 = frames.clone();
                 let tx2 = tx.clone();
                 let mut exhausted = false;
-                // Always the whole screen: a GStreamer encoder's size is fixed once it runs.
-                frames.run(use_tiles, false, tx, |f, pts, area, _region, keyframe| {
-                    if exhausted || enc.encode(f, pts, area, keyframe) {
+                // Parts of the screen (a video's window) for a tablet that places pictures itself,
+                // each size with an encoder of its own; TD_REGIONS=none: always the whole screen.
+                let regions = use_tiles && std::env::var("TD_REGIONS").map_or(true, |v| v != "none");
+                let mut parts: std::collections::HashMap<(u32, u32), Encoder> = Default::default();
+                let gate = frames.gate.clone();
+                frames.run(use_tiles, regions, tx, |f, pts, area, region, keyframe| {
+                    if exhausted {
+                        return;
+                    }
+                    if region != frames2.whole() {
+                        // A few sizes at most (an encoder holds memory): the oldest go.
+                        if !parts.contains_key(&(region.w, region.h)) {
+                            if parts.len() >= 3 {
+                                for (_, e) in parts.drain() {
+                                    let _ = e.pipeline.set_state(gst::State::Null);
+                                }
+                            }
+                            match Encoder::start_sized(enc.name, (region.w, region.h), &cfg, &frames2, &tx2) {
+                                Ok(e) => {
+                                    parts.insert((region.w, region.h), e);
+                                }
+                                Err(e) => eprintln!("encoder for {}x{}: {e:#}", region.w, region.h),
+                            }
+                        }
+                        if parts.get(&(region.w, region.h)).is_some_and(|e| e.encode(f, pts, area, region, keyframe)) {
+                            return;
+                        }
+                        // The whole screen instead, from scratch; and the next frame too, so
+                        // the part's encoder starts over as well.
+                        eprintln!("could not encode the {}x{} part at {},{}: the whole screen instead", region.w, region.h, region.x, region.y);
+                        if let Some(e) = parts.remove(&(region.w, region.h)) {
+                            let _ = e.pipeline.set_state(gst::State::Null);
+                        }
+                        gate.request_keyframe();
+                        if enc.encode(f, pts, area, frames2.whole(), true) {
+                            return;
+                        }
+                    } else if enc.encode(f, pts, area, region, keyframe) {
                         return;
                     }
                     // A hardware encoder can pass its test frame and still fail on real ones:
@@ -876,7 +958,11 @@ impl Host for LinuxHost {
                         Ok((next, name)) => {
                             eprintln!("{} stopped working; encoding with {name} instead", enc.name);
                             enc = next;
-                            enc.encode(f, pts, area, true);
+                            // Parts were made with the encoder that stopped: theirs go too.
+                            for (_, e) in parts.drain() {
+                                let _ = e.pipeline.set_state(gst::State::Null);
+                            }
+                            enc.encode(f, pts, area, frames2.whole(), true);
                         }
                         Err(e) => {
                             eprintln!("{} stopped working and no other encoder works: {e:#}", enc.name);
@@ -885,6 +971,9 @@ impl Host for LinuxHost {
                     }
                 });
                 let _ = enc.pipeline.set_state(gst::State::Null);
+                for (_, e) in parts {
+                    let _ = e.pipeline.set_state(gst::State::Null);
+                }
             }))
         };
         let mut running = Running { capture, gate: gate.clone(), frame_thread, others: Vec::new() };

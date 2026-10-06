@@ -43,6 +43,7 @@ def ack():
     # a pointer move and a scroll before every ack also exercise the variable-length framing
     s.sendall(bytes([4,0]) + struct.pack(">HH", 30000, 20000) + bytes([5,0]) + struct.pack(">hh", -3, 7) + bytes([2,0]))
 stream = bytearray(); log=[]; t0=time.time()
+parts = {}  # picture size (w, h) -> video frames
 def releaser():
     time.sleep(3.0)
     with lock:
@@ -73,6 +74,7 @@ try:
         s.sendall(bytes([6,0]) + body[:8] + struct.pack(">QQQQQ", t, t, t, t, t))
         nals = [au[i+3] & 0x1f for i in range(len(au)-3) if au[i:i+3]==b"\0\0\1"]
         log.append((now, 5 in nals, len(au))); stream += au
+        size = struct.unpack(">4H", body[16:24])[2:]; parts[size] = parts.get(size, 0) + 1
         with lock:
             if 2.0 < now and owed[0] >= 0: owed[0] += 1; continue
         ack()
@@ -83,6 +85,7 @@ if TILES:
 stall = [t for t,_,_ in log if 2.0 < t < 3.0]
 keys = [round(t,2) for t,k,_ in log if k]
 print(f"frames={len(log)} keyframes_at={keys} frames_during_1s_stall={len(stall)}")
+print("picture sizes (w, h): frames =", parts)
 gaps=[b[0]-a[0] for a,b in zip(log,log[1:]) if b[0] < 2.0]
 if gaps: print(f"mean gap before stall {statistics.mean(gaps)*1000:.1f} ms")
 if os.environ.get("OUT"): open(os.environ["OUT"], "wb").write(stream)
