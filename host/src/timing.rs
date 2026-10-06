@@ -28,6 +28,8 @@ struct HostFrame {
     bytes: usize,
     /// An idle re-encode of an older frame: its capture stages are meaningless.
     repeat: bool,
+    /// Went through the codec (not a tile).
+    video: bool,
 }
 
 /// Tablet timestamps of one frame, on the tablet's clock (µs).
@@ -46,6 +48,8 @@ const STAGES: [&str; 9] =
 struct Window {
     since: Option<Instant>,
     stages: [Vec<f64>; 9],
+    /// The same for video frames alone (tiles take a few ms; these are what can stutter).
+    video: [Vec<f64>; 9],
     recv: Vec<f64>,
     bytes: usize,
     frames: usize,
@@ -85,6 +89,11 @@ impl Timing {
     /// The capture delivered a new frame.
     pub fn captured(&self) {
         self.captured.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Frame `pts` went through the codec.
+    pub fn video(&self, pts: u64) {
+        self.frame(pts, |f| f.video = true);
     }
 
     /// The encoder was asked for a keyframe (a full picture: big, slow to encode and decode).
@@ -184,6 +193,13 @@ impl Timing {
                 out.push(*v);
             }
         }
+        if f.video && !f.repeat {
+            for (v, out) in values.iter().zip(w.video.iter_mut()) {
+                if let Some(v) = v {
+                    out.push(*v);
+                }
+            }
+        }
         w.recv.push((t.recv_end - t.recv_start.min(t.recv_end)) as f64 / 1000.0);
         w.bytes += f.bytes;
         w.frames += 1;
@@ -214,6 +230,16 @@ impl Timing {
                 rtt as f64 / 1000.0,
                 rtt_median
             );
+            let w = &mut g.window;
+            if w.video[8].len() >= 5 {
+                line += "\n  video frames:";
+                for (name, v) in STAGES.iter().zip(w.video.iter_mut()).skip(2) {
+                    if let Some((m, p)) = median_p95(v) {
+                        line += &format!(" {name} {m:.1}/{p:.1}");
+                    }
+                }
+                line += &format!(" ({} frames)", w.video[8].len());
+            }
             let keyframes = self.keyframes.swap(0, std::sync::atomic::Ordering::Relaxed);
             if keyframes > 0 {
                 line += &format!(", {keyframes} keyframes");

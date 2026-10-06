@@ -619,6 +619,9 @@ private class Decoder(
     @Volatile var outputs = 0
         private set
     private var firstInputAt = 0L
+    /** Per input: waiting for a free buffer, and handing it over (ns; logged now and then). */
+    private val feedTimes = ArrayList<LongArray>()
+
     /** What the codec reported when it failed. */
     @Volatile var error: String? = null
         private set
@@ -721,13 +724,21 @@ private class Decoder(
      * the caller rebuilds it rather than blocking the connection's reading thread.
      */
     fun feed(au: ByteArray, size: Int, pts: Long): Boolean {
-        val deadline = System.nanoTime() + stuckNanos
+        val start = System.nanoTime()
+        val deadline = start + stuckNanos
         while (open && !failed && System.nanoTime() < deadline) {
             val i = freeInputs.poll(10, TimeUnit.MILLISECONDS) ?: continue
+            val got = System.nanoTime()
             val buf = codec.getInputBuffer(i)!!
             buf.clear()
             buf.put(au, 0, size)
             codec.queueInputBuffer(i, 0, size, pts, 0)
+            feedTimes.add(longArrayOf(got - start, System.nanoTime() - got))
+            if (feedTimes.size >= 300) {
+                val q = { k: Int, f: Double -> feedTimes.map { it[k] }.sorted().let { "%.1f".format(it[((it.size - 1) * f).toInt()] / 1e6) } }
+                TLog.i("decoder input: waited ${q(0, 0.5)}/${q(0, 0.95)} ms for a buffer, queueing took ${q(1, 0.5)}/${q(1, 0.95)} ms (median/p95)")
+                feedTimes.clear()
+            }
             if (inputs++ == 0) firstInputAt = System.nanoTime()
             return true
         }

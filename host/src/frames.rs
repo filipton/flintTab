@@ -72,6 +72,14 @@ impl Region {
     fn area(&self) -> u64 {
         self.w as u64 * self.h as u64
     }
+    fn clip(&self, r: Rect) -> Rect {
+        [
+            r[0].max(self.x as f64),
+            r[1].max(self.y as f64),
+            r[2].min((self.x + self.w) as f64),
+            r[3].min((self.y + self.h) as f64),
+        ]
+    }
     fn overlaps(&self, r: Rect) -> bool {
         r[0] < (self.x + self.w) as f64 && r[2] > self.x as f64 && r[1] < (self.y + self.h) as f64 && r[3] > self.y as f64
     }
@@ -89,7 +97,13 @@ struct Regions {
     small_streak: u32,
     /// Frames in a row that used little of the current part: time to fit a smaller one.
     loose_streak: u32,
+    /// Frames since the last big change: a part with none for a while is given up (small
+    /// changes go back to exact tiles).
+    since_big: u32,
 }
+
+/// Frames without a big change after which a part is given up (~0.7 s at 90 Hz).
+const PART_IDLE_FRAMES: u32 = 60;
 
 /// Changes up to this many pixels go as tiles beside a part of the screen the codec takes.
 const SMALL_CHANGE: f64 = 128.0 * 128.0;
@@ -99,7 +113,20 @@ const REGION_MAX_PERCENT: u64 = 45;
 
 impl Regions {
     fn new(width: u32, height: u32) -> Self {
-        Self { width, height, current: Region { x: 0, y: 0, w: width, h: height }, small_streak: 0, loose_streak: 0 }
+        Self { width, height, current: Region { x: 0, y: 0, w: width, h: height }, small_streak: 0, loose_streak: 0, since_big: 0 }
+    }
+
+    /// A frame with (or without) a big change went by.
+    fn note(&mut self, big: bool) {
+        if big {
+            self.since_big = 0;
+            return;
+        }
+        self.since_big += 1;
+        if self.since_big >= PART_IDLE_FRAMES {
+            self.current = self.full();
+            self.small_streak = 0;
+        }
     }
 
     fn full(&self) -> Region {
@@ -268,14 +295,23 @@ impl<B: Buffer> Frames<B> {
                 repeats = 0;
                 // Nothing changed at all (e.g. only the cursor, which is not in the video).
                 let Some(a) = area else { continue };
-                // Small change: the exact pixels, no codec.
                 let now = timing.now();
                 now_frame = now;
-                if let Some(msgs) = pic.as_ref().filter(|_| use_tiles).and_then(|p| tiles::build_all(p, &rects, now)) {
+                let big = tiles::bounds(&rects.iter().copied().filter(|r| tiles::size(*r) > SMALL_CHANGE).collect::<Vec<_>>());
+                if regions {
+                    parts.note(big.is_some());
+                }
+                // While a part of the screen is the codec's (a video playing), changes in it go
+                // through the codec too: its last picture stays what the tablet shows, so a clock
+                // ticking inside a video's window costs a small P-frame, not a keyframe.
+                let in_part = regions && parts.current != parts.full() && rects.iter().any(|r| parts.current.overlaps(*r));
+                // Small change: the exact pixels, no codec.
+                if let Some(msgs) =
+                    pic.as_ref().filter(|_| use_tiles && !in_part).and_then(|p| tiles::build_all(p, &rects, now))
+                {
                     gate.sent_batch(msgs.len());
-                    // The encoder's last picture is out of date where the tiles went (only its
-                    // part of the screen counts: a clock ticking beside a video does not).
-                    if !regions || rects.iter().any(|r| parts.current.overlaps(*r)) {
+                    // The encoder's last picture is out of date where the tiles went.
+                    if !regions || parts.current == parts.full() {
                         stale_reference = true;
                     }
                     // One send: the writer puts the frame's tiles into one USB transfer.
@@ -295,10 +331,16 @@ impl<B: Buffer> Frames<B> {
                 if regions
                     && use_tiles
                     && let Some(p) = pic.as_ref()
-                    && let Some(big) = tiles::bounds(&rects.iter().copied().filter(|r| tiles::size(*r) > SMALL_CHANGE).collect::<Vec<_>>())
+                    && (big.is_some() || in_part)
                 {
-                    let region = parts.pick(Some(big));
+                    let region = match big {
+                        Some(b) => parts.pick(Some(b)),
+                        None => parts.current,
+                    };
+                    // Partly inside: as a tile (exact), and its inside part through the codec too.
                     let (inside, outside): (Vec<Rect>, Vec<Rect>) = rects.iter().partition(|r| region.contains(**r));
+                    let touched = tiles::bounds(&rects.iter().copied().filter(|r| region.overlaps(*r)).collect::<Vec<_>>())
+                        .map(|t| region.clip(t));
                     let tiles = (region != parts.full()).then(|| {
                         let mut bytes = 0;
                         outside
@@ -326,7 +368,7 @@ impl<B: Buffer> Frames<B> {
                             }
                             tx.send(all).ok();
                         }
-                        a = tiles::bounds(&inside).unwrap_or(big);
+                        a = touched.or(tiles::bounds(&inside)).or(big).unwrap_or(a);
                         picked = Some(region);
                     }
                 }
@@ -361,6 +403,7 @@ impl<B: Buffer> Frames<B> {
     /// The encoder finished the frame encoded as `pts`: on its way to the tablet.
     pub fn encoded(&self, tx: &mpsc::Sender<Vec<u8>>, pts: u64, area: [u16; 4], region: Region, au: &[u8]) {
         self.gate.sent();
+        self.timing.video(pts);
         self.timing.encoded(pts, au.len());
         tx.send(protocol::video_msg(pts, area, region.wire(), au)).ok();
     }
