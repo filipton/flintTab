@@ -76,6 +76,14 @@ fn open_dev<T: UsbContext>(dev: &rusb::Device<T>) -> Option<DeviceHandle<T>> {
 }
 
 /// Switches the device with this adb serial to accessory mode (it re-enumerates).
+/// TD_DEBUG_AOA=1: why a tablet is not switched to raw USB.
+fn trace(msg: impl FnOnce() -> String) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("TD_DEBUG_AOA").is_some()) {
+        eprintln!("aoa: {}", msg());
+    }
+}
+
 fn switch(ctx: &Context, serial: &str) -> bool {
     let Ok(devices) = ctx.devices() else { return false };
     for dev in devices.iter() {
@@ -83,15 +91,22 @@ fn switch(ctx: &Context, serial: &str) -> bool {
         if desc.vendor_id() == GOOGLE && ACCESSORY.contains(&desc.product_id()) {
             continue;
         }
-        if !has_adb(&dev) || serial_of(&dev).as_deref() != Some(serial) {
+        let (adb, sn) = (has_adb(&dev), serial_of(&dev));
+        trace(|| format!("{:04x}:{:04x} adb interface {adb}, serial {sn:?}", desc.vendor_id(), desc.product_id()));
+        if !adb || sn.as_deref() != Some(serial) {
             continue;
         }
-        let Some(h) = open_dev(&dev) else { return false };
+        let Some(h) = open_dev(&dev) else {
+            trace(|| "cannot open it".into());
+            return false;
+        };
         let mut v = [0u8; 2];
         let t = Duration::from_secs(1);
         let in_vendor = rusb::request_type(Direction::In, rusb::RequestType::Vendor, rusb::Recipient::Device);
         let out_vendor = rusb::request_type(Direction::Out, rusb::RequestType::Vendor, rusb::Recipient::Device);
-        if h.read_control(in_vendor, GET_PROTOCOL, 0, 0, &mut v, t).is_err() || u16::from_le_bytes(v) == 0 {
+        let protocol = h.read_control(in_vendor, GET_PROTOCOL, 0, 0, &mut v, t);
+        trace(|| format!("GET_PROTOCOL -> {protocol:?}, version {}", u16::from_le_bytes(v)));
+        if protocol.is_err() || u16::from_le_bytes(v) == 0 {
             return false; // no AOA support
         }
         let strings = [MANUFACTURER, MODEL, "Tablet display over USB", "3", "https://github.com/filipton/macos-usb-display", serial];
@@ -102,7 +117,9 @@ fn switch(ctx: &Context, serial: &str) -> bool {
                 return false;
             }
         }
-        return h.write_control(out_vendor, START, 0, 0, &[], t).is_ok();
+        let started = h.write_control(out_vendor, START, 0, 0, &[], t);
+        trace(|| format!("START -> {started:?}"));
+        return started.is_ok();
     }
     false
 }
