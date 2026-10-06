@@ -184,7 +184,8 @@ class Session(
             } catch (e: Exception) {
                 // Connection refused (no host yet): retry below quietly. Anything once connected
                 // ended the session: say what.
-                if (connectedOnce) TLog.i("session ended on the tablet: $e at ${e.stackTrace.take(4).joinToString(" < ")}")
+                // (EOF: the host closed it, e.g. moving from adb to raw USB. Not worth a line.)
+                if (connectedOnce && e !is java.io.EOFException) TLog.i("session ended on the tablet: $e at ${e.stackTrace.take(4).joinToString(" < ")}")
             }
             onState(false)
             if (running) Thread.sleep(500)

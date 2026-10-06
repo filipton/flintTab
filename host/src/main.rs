@@ -368,8 +368,12 @@ impl Conn {
 
 /// Opens the USB accessory whenever the tablet is attached and no session runs, and hands it
 /// over once the tablet app talks on it (until then a TCP session can start instead).
-fn spawn_aoa(running: Arc<AtomicBool>, busy: Arc<AtomicBool>, current: Arc<std::sync::Mutex<Option<String>>>) -> mpsc::Receiver<Conn> {
+/// `on_aoa`: a session over the accessory is running. One over adb does not stop the switch:
+/// the app usually connects over adb first (it starts faster than the tablet re-enumerates as
+/// an accessory), and that session ends when it does, so the app reconnects over raw USB.
+fn spawn_aoa(running: Arc<AtomicBool>, on_aoa: Arc<AtomicBool>, current: Arc<std::sync::Mutex<Option<String>>>) -> mpsc::Receiver<Conn> {
     let (tx, rx) = mpsc::sync_channel(0);
+    let busy = on_aoa;
     thread::spawn(move || {
         let mut last: Option<aoa::Link> = None;
         while running.load(Ordering::Relaxed) {
@@ -592,7 +596,8 @@ fn main() -> Result<()> {
     if !args.no_adb {
         spawn_adb_watcher(&args, busy.clone(), current.clone());
     }
-    let usb = (!args.no_adb && !args.no_aoa).then(|| spawn_aoa(running.clone(), busy.clone(), current.clone()));
+    let on_aoa = Arc::new(AtomicBool::new(false));
+    let usb = (!args.no_adb && !args.no_aoa).then(|| spawn_aoa(running.clone(), on_aoa.clone(), current.clone()));
     println!("waiting for the tablet (plug it in with USB debugging on)...");
     let keep = Duration::from_secs(args.keep_display);
 
@@ -608,10 +613,12 @@ fn main() -> Result<()> {
         match conn {
             Some(conn) => {
                 busy.store(true, Ordering::Relaxed);
+                on_aoa.store(conn.via == "USB accessory", Ordering::Relaxed);
                 if let Err(e) = run_session(conn, &args, host.as_mut(), &running) {
                     eprintln!("session error: {e:#}");
                 }
                 busy.store(false, Ordering::Relaxed);
+                on_aoa.store(false, Ordering::Relaxed);
             }
             None => {
                 host.expire(keep);

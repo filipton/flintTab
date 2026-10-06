@@ -116,8 +116,11 @@ pub fn open(serial: &str) -> Option<Link> {
             .iter()
             .filter(|d| d.device_descriptor().is_ok_and(|x| x.vendor_id() == GOOGLE && ACCESSORY.contains(&x.product_id())))
             .collect();
-        // The accessory keeps the adb serial; if it cannot be read, a single accessory will do.
-        acc.iter().find(|d| serial_of(d).as_deref() == Some(serial)).cloned().or_else(|| (acc.len() == 1).then(|| acc[0].clone()))
+        // The accessory keeps the adb serial. Only if it cannot be read does a single accessory
+        // do: another tablet may still be an accessory from an earlier session.
+        acc.iter().find(|d| serial_of(d).as_deref() == Some(serial)).cloned().or_else(|| {
+            (acc.len() == 1 && serial_of(&acc[0]).is_none()).then(|| acc[0].clone())
+        })
     };
     let dev = match find() {
         Some(d) => d,
