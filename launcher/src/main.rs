@@ -61,7 +61,22 @@ fn main() {
     }
     let lib = dir.join("lib");
     let mut cmd = Command::new(dir.join("tabdisplay-host"));
-    cmd.args(std::env::args_os().skip(1))
+    cmd.args(std::env::args_os().skip(1));
+    // GStreamer installed on the system, at least as new as the bundled one, wins: its VA
+    // plugin matches the system's video driver (the bundled 1.24 one took frames and gave
+    // nothing back with a newer Intel driver). TD_GSTREAMER=bundled|system decides instead.
+    let choice = std::env::var("TD_GSTREAMER").unwrap_or_default();
+    let system = match choice.as_str() {
+        "bundled" => None,
+        _ => system_gstreamer(choice == "system"),
+    };
+    if let Some(found) = system {
+        println!("using this system's GStreamer {found}");
+        let err = cmd.exec();
+        eprintln!("cannot start the host: {err}");
+        std::process::exit(1);
+    }
+    cmd
         // The host puts the original back for the programs it runs (adb, ...).
         .env("TD_ORIG_LD_LIBRARY_PATH", std::env::var_os("LD_LIBRARY_PATH").unwrap_or_default())
         .env("LD_LIBRARY_PATH", &lib)
@@ -74,4 +89,36 @@ fn main() {
     let err = cmd.exec();
     eprintln!("cannot start the host: {err}");
     std::process::exit(1);
+}
+
+/// Minor version of the bundled GStreamer (1.x); the system's must be at least this.
+const BUNDLED_MINOR: u32 = 24;
+
+/// Plugins the host's pipelines need, and the encoders (one of them).
+const NEEDED: &[&str] = &["coreelements", "app", "pipewire", "videoparsersbad"];
+const CONVERT: &[&str] = &["videoconvertscale", "videoconvert"];
+const ENCODERS: &[&str] = &["va", "nvcodec", "x264"];
+
+/// The system's GStreamer ("1.26 in /usr/lib/gstreamer-1.0"), when it has what the host
+/// needs; `any_version`: also when it is older than the bundled one.
+fn system_gstreamer(any_version: bool) -> Option<String> {
+    let dirs = ["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib", "/usr/lib/aarch64-linux-gnu"];
+    for d in dirs {
+        let d = Path::new(d);
+        let plugins = d.join("gstreamer-1.0");
+        let has = |p: &str| plugins.join(format!("libgst{p}.so")).is_file();
+        if !NEEDED.iter().all(|p| has(p)) || !CONVERT.iter().any(|p| has(p)) || !ENCODERS.iter().any(|p| has(p)) {
+            continue;
+        }
+        // libgstreamer-1.0.so.0.2603.0: minor 26
+        let minor = std::fs::read_dir(d).ok()?.flatten().find_map(|e| {
+            let n = e.file_name().into_string().ok()?;
+            let v = n.strip_prefix("libgstreamer-1.0.so.0.")?;
+            v.split('.').next()?.parse::<u32>().ok().map(|v| v / 100)
+        })?;
+        if minor >= BUNDLED_MINOR || any_version {
+            return Some(format!("1.{minor} in {}", plugins.display()));
+        }
+    }
+    None
 }
