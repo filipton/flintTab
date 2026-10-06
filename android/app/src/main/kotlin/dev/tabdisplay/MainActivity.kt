@@ -191,6 +191,8 @@ class MainActivity : Activity() {
                 touchEnabled = flags and Session.SETTING_TOUCH != 0
                 (front as? CpuRenderer)?.chooseLowestLatency(flags and Session.SETTING_LOWEST_LATENCY != 0)
             },
+            onBrightness = { level -> runOnUiThread { Brightness.apply(window, level) } },
+            ownBrightness = { Brightness.own(this) },
         )
         // Debugging: `--ei decoder N` starts at decoder setup N (1 plain, 2 software).
         session?.decoderLevel = intent.getIntExtra("decoder", 0)

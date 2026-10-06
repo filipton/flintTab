@@ -57,6 +57,10 @@ class Session(
     private val askUsbPermission: (android.hardware.usb.UsbAccessory) -> Unit = {},
     /** What the host decided (MSG_SETTINGS flags: SETTING_*), once per connection. */
     private val onSettings: (flags: Int) -> Unit = {},
+    /** MSG_BRIGHTNESS: 0..100, or 255 for the tablet's own setting. */
+    private val onBrightness: (level: Int) -> Unit = {},
+    /** The tablet's own brightness setting (0..100), told to the host. */
+    private val ownBrightness: () -> Int = { 50 },
 ) {
     @Volatile private var running = true
     @Volatile private var socket: Closeable? = null
@@ -361,6 +365,14 @@ class Session(
                         TLog.i("settings from the host: lowest latency ${flags and SETTING_LOWEST_LATENCY != 0}, " +
                             "touch ${flags and SETTING_TOUCH != 0}, audio $audioWanted")
                         onSettings(flags)
+                        // Where the host's brightness keys start from.
+                        sendControl(KIND_BRIGHTNESS, ownBrightness())
+                    }
+                    MSG_BRIGHTNESS -> {
+                        val level = input.readUnsignedByte()
+                        if (len > 1) input.skipBytes(len - 1)
+                        TLog.i("brightness from the host: ${if (level > 100) "the tablet's own" else "$level%"}")
+                        onBrightness(level)
                     }
                     MSG_VIDEO -> {
                         val pts = input.readLong() // host clock; echoed back once shown, for latency stats
@@ -473,6 +485,8 @@ class Session(
         const val MSG_TILE = 7
         /** u8 flags: what the host decided (SETTING_*). */
         const val MSG_SETTINGS = 8
+        /** u8 0..100, or 255: the tablet's own setting. */
+        const val MSG_BRIGHTNESS = 9
         const val SETTING_LOWEST_LATENCY = 1
         const val SETTING_TOUCH = 2
         const val SETTING_AUDIO = 4
@@ -484,6 +498,8 @@ class Session(
         const val KIND_PONG = 7
         /** u16 length, then that much UTF-8: a log line the host prints. */
         const val KIND_LOG = 8
+        /** value: the tablet's own brightness setting, 0..100. */
+        const val KIND_BRIGHTNESS = 9
     }
 }
 

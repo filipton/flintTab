@@ -15,6 +15,8 @@
 //!              KIND_LOG value 0, then u16 length and that much UTF-8 (the tablet's log)
 //!              KIND_PONG value 0, then u64 the ping's time (host clock), u64 when the tablet
 //!                read it (tablet clock), so the host can map tablet times onto its own clock
+//!              KIND_BRIGHTNESS value = the tablet's own brightness setting, 0..=100 (where
+//!                the host's brightness keys start from when it has set none)
 //! Host -> tablet, a stream of frames: u8 kind, u32 len, payload
 //!   MSG_CONFIG: u32 width, u32 height, u32 fps, u32 audio_rate, u8 audio_channels
 //!   MSG_VIDEO:  u64 pts_us (when the frame was captured, or handed to the encoder,
@@ -35,6 +37,8 @@
 //!               bytes) and the rest LZ4-compressed interleaved CbCr (w*h/2 bytes); BT.709
 //!               video range like the video. Drawn in arrival order with the video frames,
 //!               acknowledged like them (KIND_ACK) and timed like them (KIND_TIMING).
+//!   MSG_BRIGHTNESS: u8 screen brightness 0..=100 (perceptual, like the tablet's own slider),
+//!               or 255: the tablet's own setting. Older apps skip it.
 
 use std::io::{self, Read};
 
@@ -54,6 +58,9 @@ pub const MSG_PING: u8 = 6;
 pub const MSG_TILE: u8 = 7;
 /// u8 flags (SETTING_*): how the tablet behaves, decided here, not on the tablet.
 pub const MSG_SETTINGS: u8 = 8;
+/// u8 brightness (see the top).
+pub const MSG_BRIGHTNESS: u8 = 9;
+pub const BRIGHTNESS_TABLET: u8 = 255;
 /// Draw into the scanned-out buffer (Android 13+) instead of a compositor-paced swap chain.
 pub const SETTING_LOWEST_LATENCY: u8 = 1;
 /// Touches and the pen drive this computer's mouse.
@@ -70,6 +77,7 @@ pub const KIND_TIMING: u8 = 6;
 pub const KIND_PONG: u8 = 7;
 /// u16 length, then that much UTF-8: a line from the tablet's log, printed by the host.
 pub const KIND_LOG: u8 = 8;
+pub const KIND_BRIGHTNESS: u8 = 9;
 
 pub const POINTER_MOVE: u8 = 0; // no button held (pen hover, cursor placement)
 pub const POINTER_LEFT_DOWN: u8 = 1;
@@ -129,6 +137,10 @@ pub fn frame(kind: u8, parts: &[&[u8]]) -> Vec<u8> {
 
 pub fn settings_msg(flags: u8) -> Vec<u8> {
     frame(MSG_SETTINGS, &[&[flags]])
+}
+
+pub fn brightness_msg(level: u8) -> Vec<u8> {
+    frame(MSG_BRIGHTNESS, &[&[level]])
 }
 
 pub fn config_msg(width: u32, height: u32, fps: u32) -> Vec<u8> {

@@ -6,12 +6,15 @@
 
 mod aoa;
 mod app;
+mod brightness;
 #[cfg(target_os = "macos")]
 mod capture;
 #[cfg(target_os = "macos")]
 mod cursor;
 mod frames;
 mod gate;
+#[cfg(target_os = "macos")]
+mod keys;
 mod logs;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -109,6 +112,10 @@ pub struct Args {
     /// Play this computer's sound on the tablet
     #[arg(long)]
     audio: bool,
+    /// The tablet's screen brightness, 0-100, or "tablet" for its own setting (remembered per
+    /// tablet). macOS: the brightness keys set it too while the mouse is on the tablet's display
+    #[arg(long, value_parser = brightness::parse_arg)]
+    brightness: Option<brightness::Level>,
     /// Let a tablet power this computer over USB-C (by default it is kept to taking power)
     #[arg(long)]
     tablet_powers_computer: bool,
@@ -270,6 +277,9 @@ pub struct StreamConfig {
     /// Which tablet (its adb serial, or "tablet"): names its virtual display, so each tablet
     /// is a monitor of its own to the computer.
     pub tablet: String,
+    /// The tablet's screen brightness (keys on macOS change it).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub brightness: Arc<brightness::Brightness>,
 }
 
 /// A running capture + encode pipeline; dropping `guard` stops it.
@@ -468,10 +478,11 @@ fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBoo
     ];
     tx.send(protocol::settings_msg(settings.iter().filter(|(on, _)| *on).fold(0, |f, (_, bit)| f | bit))).ok();
     tx.send(protocol::config_msg(width, height, fps)).ok();
+    let brightness = brightness::Brightness::start(tablet, args.brightness, tx.clone());
 
     let epoch = std::time::Instant::now();
     let timing = Arc::new(timing::Timing::new(epoch));
-    let cfg = StreamConfig { width, height, fps, bitrate, epoch, timing: timing.clone(), tiles: hello.tiles, tablet: tablet.to_owned() };
+    let cfg = StreamConfig { width, height, fps, bitrate, epoch, timing: timing.clone(), tiles: hello.tiles, tablet: tablet.to_owned(), brightness: brightness.clone() };
     // Clock sync for the latency breakdown; cheap enough to run all the time.
     {
         let tx = tx.clone();
@@ -548,6 +559,7 @@ fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBoo
         let alive = alive.clone();
         let control = stream.control.clone();
         let timing = timing.clone();
+        let brightness = brightness.clone();
         thread::spawn(move || {
             let mut input = input.map(|input| InputDecoder { input, last_down: None });
             let mut m = [0u8; 2];
@@ -589,6 +601,7 @@ fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBoo
                         }
                     }
                     protocol::KIND_ACK => control.ack(),
+                    protocol::KIND_BRIGHTNESS => brightness.tablet_reported(m[1]),
                     protocol::KIND_IDR => {
                         println!("tablet asked for a keyframe");
                         control.request_keyframe();

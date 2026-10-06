@@ -89,6 +89,11 @@ barrel button right-clicks.
   uses XTEST. Sway's portal has no remote-desktop support, so no touch input there yet.
 
 **Audio** is off by default; `--audio` plays the computer's sound on the tablet.
+
+**Brightness**: on macOS, the brightness keys dim or brighten the tablet while the mouse is on
+its display (⌥⇧ for finer steps; needs the Accessibility permission, like `--touch`).
+`--brightness 0-100` sets it from the command line, and `--brightness tablet` hands it back to
+the tablet's own setting. The level is remembered per tablet.
 Only system audio is captured; the host mutes nothing on the computer.
 
 **Power:** over USB-C either side can power the other, and a tablet can end up charging the
@@ -105,7 +110,7 @@ its report (stack trace, last log lines) is printed by the host on the next conn
 
 The stream runs at the tablet's refresh rate (up to 120 Hz) when its decoder can keep up.
 
-Options: `--touch --audio --no-lowest-latency --tablet-powers-computer --fps N --bitrate MBPS --keep-display SECS --max-width 2560 --serial SERIAL --no-aoa --keep-tablet-settings --no-launch --apk PATH --no-install --width W --height H`;
+Options: `--touch --audio --brightness N --no-lowest-latency --tablet-powers-computer --fps N --bitrate MBPS --keep-display SECS --max-width 2560 --serial SERIAL --no-aoa --keep-tablet-settings --no-launch --apk PATH --no-install --width W --height H`;
 macOS: `--ppi 220 --no-hidpi --cursor-in-video`; Linux: `--encoder NAME --portal-monitor --x11-region X,Y`.
 
 ## How it keeps latency low
