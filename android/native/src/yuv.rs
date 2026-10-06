@@ -40,6 +40,8 @@ struct Front {
     visible_ns: i64,
     /// Frames shown per scan pass (smoothness log, every 5 s).
     pacing: std::collections::BTreeMap<i64, u32>,
+    /// Per present since the last log: ns waited for the scan, ns writing, pixels written (max).
+    stats: Vec<(i64, i64, usize)>,
 }
 
 /// The computer's cursor, blended into the picture where it is written out (front mode).
@@ -138,6 +140,7 @@ impl Screen {
                 ns_per_px: 0.5,
                 visible_ns: 0,
                 pacing: Default::default(),
+                stats: Vec::new(),
             });
         }
         self.present(false)
@@ -182,6 +185,7 @@ impl Screen {
             })
             .collect();
         let not_before = if frame { visible } else { 0 };
+        let asked = now_ns();
         if let Some(t) = self.plan(&jobs, not_before) {
             wait_until(t);
         }
@@ -198,10 +202,14 @@ impl Screen {
             f.visible_ns = now_ns() + (period - since.rem_euclid(period)) as i64;
         }
         let area: usize = rects.iter().map(|r| (r.x1 - r.x0) * (r.y1 - r.y0)).sum();
-        if area > 20_000
-            && let Some(f) = &mut self.front
-        {
-            f.ns_per_px = f.ns_per_px * 0.8 + (now_ns() - started) as f64 / area as f64 * 0.2;
+        let done = now_ns();
+        if let Some(f) = &mut self.front {
+            if area > 20_000 {
+                f.ns_per_px = f.ns_per_px * 0.8 + (done - started) as f64 / area as f64 * 0.2;
+            }
+            if f.stats.len() < 10_000 {
+                f.stats.push((started - asked, done - started, area));
+            }
         }
         ok
     }
@@ -275,7 +283,15 @@ impl Screen {
                     _ => more += 1,
                 }
             }
-            crate::front::log(&format!("pacing: {one} refreshes with 1 frame, {more} with 2+, {zero} with none"));
+            let mut st = std::mem::take(&mut f.stats);
+            let pct = |v: &mut Vec<i64>, p: f64| if v.is_empty() { 0.0 } else { v.sort(); v[((v.len() - 1) as f64 * p) as usize] as f64 / 1e6 };
+            let mut wait: Vec<i64> = st.iter().map(|s| s.0).collect();
+            let mut write: Vec<i64> = st.iter().map(|s| s.1).collect();
+            let px = st.iter_mut().map(|s| s.2).max().unwrap_or(0);
+            crate::front::log(&format!(
+                "pacing: {one} refreshes with 1 frame, {more} with 2+, {zero} with none; per present (median/p95 ms): scan wait {:.1}/{:.1}, write {:.1}/{:.1} (up to {px} px, {:.2} ns/px), {} presents",
+                pct(&mut wait, 0.5), pct(&mut wait, 0.95), pct(&mut write, 0.5), pct(&mut write, 0.95), f.ns_per_px, st.len()
+            ));
             f.pacing.clear();
         }
     }

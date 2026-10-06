@@ -41,7 +41,7 @@ class CpuRenderer(
         } catch (_: Exception) {}
     }
     /** The default: one NV12 buffer the panel scans out, written in place ([YuvFront]). */
-    private var yuvFront: YuvFront? = null
+    private var yuvFront: FrontBuffer? = null
     /** Without "lowest latency": NV12 buffers the compositor shows ([YuvChain]); cursor on its own layer. */
     private var yuv: Chain? = null
     /** The NV12 screen, either way. */
@@ -133,6 +133,7 @@ class CpuRenderer(
         if (bw > 0) when {
             useFrontBuffer -> front = CpuFront.attach(view)
             lowestLatency && YuvFront.supported() -> yuvFront = YuvFront.attach(view, bw, bh)
+            lowestLatency && NdkFront.supported() -> yuvFront = NdkFront.attach(view, bw, bh)
             YuvChain.supported() -> yuv = YuvChain.attach(view, handler, bw, bh)
             NdkChain.supported() -> yuv = NdkChain.attach(view, handler, bw, bh)
             SwapChain.supported() -> chain = SwapChain.attach(view, handler)
@@ -159,8 +160,23 @@ class CpuRenderer(
     }
 
     override fun frameDecoded(pts: Long, image: Image, done: () -> Unit) {
-        handler.post {
-            frames.put(pts, image to done)?.second?.invoke()
+        decoded.add(Triple(pts, image, done))
+        schedule()
+    }
+
+    /** Decoded frames not yet taken over by the render thread (into [frames]). */
+    private val decoded = ConcurrentLinkedQueue<Triple<Long, Image, () -> Unit>>()
+
+    /**
+     * One [process] pending at a time: a present can wait most of a refresh for the scan, and
+     * one per message (frames, tiles, cursor moves) queued them up behind each other, ~100 ms
+     * behind at 85 fps. Whatever arrives meanwhile goes into the next one together.
+     */
+    private val processPending = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun schedule() {
+        if (processPending.compareAndSet(false, true)) handler.post {
+            processPending.set(false)
             process()
         }
     }
@@ -182,6 +198,7 @@ class CpuRenderer(
                 val u = updates.poll() ?: break
                 if (u is Tile) { Native.recycle(u.luma); Native.recycle(u.chroma) }
             }
+            while (true) decoded.poll()?.third?.invoke() ?: break
             frames.values.forEach { it.second() }
             frames.clear()
         }
@@ -193,7 +210,7 @@ class CpuRenderer(
 
     override fun queueTile(pts: Long, x: Int, y: Int, w: Int, h: Int, luma: ByteBuffer, chroma: ByteBuffer) {
         updates.add(Tile(pts, x, y, w, h, luma, chroma))
-        handler.post(::process)
+        schedule()
     }
 
     override fun setCursorImage(bitmap: Bitmap?, displayWidthPt: Int, sizePt: IntArray, hotPt: IntArray) {
@@ -206,13 +223,23 @@ class CpuRenderer(
         cursorHot = intArrayOf((hotPt[0] * scale).toInt(), (hotPt[1] * scale).toInt())
         cursorScale = scale
         cursorImage = Bitmap.createScaledBitmap(bitmap.copy(Bitmap.Config.ARGB_8888, false), w, h, true)
-        handler.post(::drawCursor)
+        scheduleCursor()
     }
 
     override fun moveCursor(x: Int, y: Int, shown: Boolean) {
         if (yuv != null && yuvFront == null) return overlayCursor.move(x, y, shown)
         cursorX = x; cursorY = y; cursorShown = shown
-        handler.post(::drawCursor)
+        scheduleCursor()
+    }
+
+    /** One cursor redraw pending at a time (moves come in faster than the scan passes). */
+    private val cursorPending = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun scheduleCursor() {
+        if (cursorPending.compareAndSet(false, true)) handler.post {
+            cursorPending.set(false)
+            drawCursor()
+        }
     }
 
     private fun drawCursor() {
@@ -250,14 +277,26 @@ class CpuRenderer(
      * Follows the panel's vsync, so the native side knows where the scan is: the expected
      * presentation time of a frame timeline is a hardware vsync, when the scan starts over.
      */
+    private var vsyncLoop = 0
+
     private fun followVsync() {
         val choreographer = android.view.Choreographer.getInstance() // the render thread's
+        // One loop: an attach after a rebuild ends the one before.
+        val loop = ++vsyncLoop
         if (android.os.Build.VERSION.SDK_INT < 33) {
             // Older: the frame time is the app's vsync, close enough to the panel's.
             val cb = object : android.view.Choreographer.FrameCallback {
                 override fun doFrame(t: Long) {
+                    if (loop != vsyncLoop) return
                     val hz = view.display?.refreshRate ?: 60f
-                    yuvFront?.let { Native.yuvVsync(it.handle, t, (1e9 / hz).toLong()); if (streamW > 0) it.refresh() }
+                    yuvFront?.let {
+                        // The panel's vsync if known: the frame time is the app's wake-up.
+                        val v = it.vsync()
+                        Native.yuvVsync(it.handle, if (v > 0) v else t, (1e9 / hz).toLong())
+                        if (streamW > 0) it.refresh()
+                        choreographer.postFrameCallback(this)
+                        return
+                    }
                     if (handle == 0L) return
                     Native.frontVsync(handle, t, (1e9 / hz).toLong())
                     choreographer.postFrameCallback(this)
@@ -268,6 +307,7 @@ class CpuRenderer(
         }
         val callback = object : android.view.Choreographer.VsyncCallback {
             override fun onVsync(data: android.view.Choreographer.FrameData) {
+                if (loop != vsyncLoop) return
                 val hz = view.display?.refreshRate ?: 60f
                 yuvFront?.let {
                     Native.yuvVsync(it.handle, data.preferredFrameTimeline.expectedPresentationTimeNanos, (1e9 / hz).toLong())
@@ -323,7 +363,7 @@ class CpuRenderer(
         val y = yuv
         if (y != null) {
             val batch = ArrayList(shown)
-            if (y.submit(onShown = { at -> for (p in batch) onShown(p, at) }, retry = { handler.post(::process) })) {
+            if (y.submit(onShown = { at -> for (p in batch) onShown(p, at) }, retry = ::schedule)) {
                 shown.clear()
             }
             return
@@ -331,7 +371,7 @@ class CpuRenderer(
         val c = chain
         if (c != null) {
             val batch = ArrayList(shown)
-            if (c.submit(onShown = { at -> for (p in batch) onShown(p, at) }, retry = { handler.post(::process) })) {
+            if (c.submit(onShown = { at -> for (p in batch) onShown(p, at) }, retry = ::schedule)) {
                 shown.clear()
             }
             return
@@ -353,6 +393,10 @@ class CpuRenderer(
     /** Updates converted but not yet presented (render thread only). */
     private val shown = ArrayList<Long>()
 
+    /** Per decoded frame: copying it out, and from its message's arrival to the copy (log). */
+    private val copyTimes = ArrayList<Long>()
+    private val queueTimes = ArrayList<Long>()
+
     /** Decoded frames given back unshown (see [processUpdates]); logged when it changes. */
     private var orphans = 0
     /** Video frames given up on (not decoded within 150 ms); counted, logged now and then. */
@@ -361,6 +405,10 @@ class CpuRenderer(
 
     private fun processUpdates() {
         val h = handle
+        while (true) {
+            val (pts, image, done) = decoded.poll() ?: break
+            frames.put(pts, image to done)?.second?.invoke()
+        }
         while (true) {
             val u = updates.peek() ?: break
             when (u) {
@@ -377,7 +425,16 @@ class CpuRenderer(
                     val frame = frames.remove(u.pts)
                     when {
                         frame != null -> {
+                            val t0 = System.nanoTime()
                             drawFrame(h, frame.first, u.pts)
+                            copyTimes.add(System.nanoTime() - t0)
+                            queueTimes.add(t0 - u.queuedAt)
+                            if (copyTimes.size >= 400) {
+                                copyTimes.sort(); queueTimes.sort()
+                                val q = { l: ArrayList<Long>, f: Double -> "%.1f".format(l[((l.size - 1) * f).toInt()] / 1e6) }
+                                TLog.i("decoded frames: copy ${q(copyTimes, 0.5)}/${q(copyTimes, 0.95)} ms, queued ${q(queueTimes, 0.5)}/${q(queueTimes, 0.95)} ms (median/p95)")
+                                copyTimes.clear(); queueTimes.clear()
+                            }
                             frame.second()
                             shown.add(u.pts)
                             updates.poll()
@@ -395,7 +452,7 @@ class CpuRenderer(
                             updates.poll()
                         }
                         else -> {
-                            handler.postDelayed(::process, 10) // in case it never comes
+                            handler.postDelayed(::schedule, 10) // in case it never comes
                             return
                         }
                     }
@@ -490,6 +547,7 @@ class CpuRenderer(
 
     override fun release() {
         handler.post {
+            while (true) decoded.poll()?.third?.invoke() ?: break
             frames.values.forEach { it.second() }
             front?.release()
             front = null
