@@ -34,6 +34,20 @@ fn prune(dir: &std::path::Path, prefix: &str, keep: usize) {
     }
 }
 
+/// stdout and stderr as they were before [`tee`] (-1: not teed).
+static ORIGINAL: [std::sync::atomic::AtomicI32; 2] = [std::sync::atomic::AtomicI32::new(-1), std::sync::atomic::AtomicI32::new(-1)];
+
+/// Gives stdout and stderr back (before the process replaces itself: the tee's threads do not
+/// survive that, and output into their pipes would go nowhere).
+pub fn untee() {
+    for (fd, saved) in [1, 2].into_iter().zip(&ORIGINAL) {
+        let s = saved.swap(-1, std::sync::atomic::Ordering::Relaxed);
+        if s >= 0 {
+            unsafe { libc::dup2(s, fd) };
+        }
+    }
+}
+
 /// From here on stdout and stderr also go to `host-<time>.log`.
 pub fn tee() {
     let Some(dir) = dir() else { return };
@@ -48,6 +62,12 @@ pub fn tee() {
                 return;
             }
             let original = libc::dup(fd);
+            // Kept for untee(); none of these are inherited by a process this one becomes.
+            let saved = libc::dup(original);
+            for f in [pipe[0], original, saved] {
+                libc::fcntl(f, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            ORIGINAL[(fd - 1) as usize].store(saved, std::sync::atomic::Ordering::Relaxed);
             libc::dup2(pipe[1], fd);
             libc::close(pipe[1]);
             let file = file.clone();

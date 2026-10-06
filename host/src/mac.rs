@@ -153,6 +153,7 @@ impl Host for MacHost {
             h,
             fps,
             args.cursor_in_video,
+            audio_on.load(Ordering::Relaxed),
             {
                 let frames = frames.clone();
                 move |buf, age, dirty| frames.push(buf, age.map(|a| timing.ago(a)), dirty)

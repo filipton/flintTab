@@ -610,6 +610,26 @@ fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBoo
     Ok(())
 }
 
+/// Starts the host afresh in this process (same arguments): clears screen-capture state macOS
+/// keeps per process. The tablet reconnects to the new one like after any session.
+#[cfg(target_os = "macos")]
+fn restart(host: &mut dyn Host, args: &Args) {
+    use std::os::unix::process::CommandExt;
+    println!("macOS stopped the screen capture: restarting the host to clear it");
+    host.shutdown();
+    if !args.no_adb {
+        tablet::restore(&args.adb);
+    }
+    logs::finish();
+    logs::untee();
+    let exe = std::env::current_exe();
+    let err = match exe {
+        Ok(exe) => std::process::Command::new(exe).args(std::env::args_os().skip(1)).exec(),
+        Err(e) => e,
+    };
+    eprintln!("could not restart the host ({err}); carrying on");
+}
+
 fn make_host(args: &Args) -> Result<Box<dyn Host>> {
     #[cfg(target_os = "macos")]
     {
@@ -638,7 +658,16 @@ fn main() -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     {
         let running = running.clone();
-        ctrlc::set_handler(move || running.store(false, Ordering::Relaxed))?;
+        ctrlc::set_handler(move || {
+            running.store(false, Ordering::Relaxed);
+            // A shutdown stuck in a system call (screen capture can go unanswered) must not
+            // keep the process, its port and its display: exit regardless after a few seconds.
+            thread::spawn(|| {
+                thread::sleep(Duration::from_secs(6));
+                eprintln!("still shutting down after 6 s: exiting now");
+                std::process::exit(130);
+            });
+        })?;
     }
 
     let listener = TcpListener::bind(("127.0.0.1", args.port))?;
@@ -678,6 +707,10 @@ fn main() -> Result<()> {
                 }
                 busy.store(false, Ordering::Relaxed);
                 on_aoa.store(false, Ordering::Relaxed);
+                #[cfg(target_os = "macos")]
+                if capture::STOPPED_BY_SYSTEM.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
+                    restart(host.as_mut(), &args);
+                }
             }
             None => {
                 host.expire(keep);
