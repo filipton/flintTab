@@ -505,6 +505,7 @@ fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBoo
             // Everything waiting goes out as one write: over USB each write is a transfer that
             // costs ~0.5 ms however small, and a frame's tiles one by one added up to ~5 ms.
             let mut batch = Vec::with_capacity(1 << 20);
+            let debug_usb = std::env::var_os("TD_DEBUG_USB").is_some();
             while let Ok(first) = rx.recv() {
                 batch.clear();
                 batch.extend_from_slice(&first);
@@ -513,8 +514,13 @@ fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBoo
                 {
                     batch.extend_from_slice(&more);
                 }
+                let started = std::time::Instant::now();
                 if out.write_all(&batch).is_err() {
                     break;
+                }
+                if debug_usb && batch.len() >= 32 << 10 {
+                    let s = started.elapsed().as_secs_f64();
+                    eprintln!("usb write: {} KB in {:.2} ms = {:.1} MB/s", batch.len() >> 10, s * 1e3, batch.len() as f64 / s / 1e6);
                 }
                 // Each message: u8 kind, u32 length, payload.
                 let mut at = 0;
