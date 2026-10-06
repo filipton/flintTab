@@ -53,6 +53,11 @@ object Native {
     @JvmStatic external fun yuvVsync(handle: Long, vsyncNanos: Long, periodNanos: Long)
     @JvmStatic external fun yuvPresent(handle: Long, frame: Boolean, mayDefer: Boolean, maxWaitNs: Long): Int
     @JvmStatic external fun yuvArrived()
+    @JvmStatic external fun codecCreate(owner: Any, name: String, mime: String, w: Int, h: Int, keys: Array<String>, values: IntArray): Long
+    @JvmStatic external fun codecFeed(handle: Long, au: ByteArray, size: Int, pts: Long, timeoutMs: Int): Long
+    @JvmStatic external fun codecDone(handle: Long, index: Int)
+    @JvmStatic external fun codecRelease(handle: Long)
+    @JvmStatic external fun codecFree(handle: Long)
     @JvmStatic external fun yuvCountFrame(handle: Long)
     @JvmStatic external fun yuvCursorImage(handle: Long, rgba: ByteBuffer, w: Int, h: Int)
     @JvmStatic external fun yuvCursorMove(handle: Long, x: Int, y: Int, shown: Boolean)

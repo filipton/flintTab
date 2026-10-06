@@ -31,5 +31,27 @@ interface Renderer {
     val wantsImages: Boolean get() = false
 
     /** A decoded frame (with [wantsImages]); call [done] once it is drawn. */
-    fun frameDecoded(pts: Long, image: android.media.Image, done: () -> Unit) = done()
+    fun frameDecoded(pts: Long, picture: Picture, done: () -> Unit) = done()
+}
+
+/**
+ * A decoded YUV 4:2:0 picture the CPU can read: Y, and Cb / Cr ([uvStep] 2: interleaved, so
+ * [v] is [u] one byte on), over the decoder's own memory until it is given back. [crop]: the
+ * part that is the picture.
+ */
+class Picture(
+    val y: ByteBuffer,
+    val u: ByteBuffer,
+    val v: ByteBuffer,
+    val yStride: Int,
+    val uvStride: Int,
+    val uvStep: Int,
+    val crop: android.graphics.Rect,
+) {
+    companion object {
+        fun of(img: android.media.Image): Picture {
+            val p = img.planes
+            return Picture(p[0].buffer, p[1].buffer, p[2].buffer, p[0].rowStride, p[1].rowStride, p[1].pixelStride, img.cropRect)
+        }
+    }
 }

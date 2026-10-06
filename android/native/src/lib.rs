@@ -1,6 +1,7 @@
 //! Native hot paths of the tablet app (JNI: see `Native.kt`).
 
 mod chain;
+mod codec;
 mod front;
 mod neon;
 mod yuv;
@@ -411,4 +412,98 @@ pub unsafe extern "system" fn Java_dev_tabdisplay_Native_crashFile(env: *mut JNI
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Java_dev_tabdisplay_Native_panicTest(_env: *mut JNIEnv, _c: jclass) {
     panic!("panic test");
+}
+
+// --- H.264 decoder through the NDK (codec.rs) ---------------------------------------------------
+
+fn codec<'a>(h: jlong) -> &'a std::sync::Arc<codec::Codec> {
+    unsafe { &*(h as *const std::sync::Arc<codec::Codec>) }
+}
+
+unsafe fn jstring(env: *mut JNIEnv, s: jni_sys::jstring) -> String {
+    unsafe {
+        let p = ((**env).GetStringUTFChars.unwrap())(env, s, std::ptr::null_mut());
+        if p.is_null() {
+            return String::new();
+        }
+        let out = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+        ((**env).ReleaseStringUTFChars.unwrap())(env, s, p);
+        out
+    }
+}
+
+/// A started decoder (0 if it failed: the reason is logged). `keys`/`values`: integer options.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_codecCreate(
+    env: *mut JNIEnv,
+    _c: jclass,
+    owner: jobject,
+    name: jni_sys::jstring,
+    mime: jni_sys::jstring,
+    w: jint,
+    h: jint,
+    keys: jni_sys::jobjectArray,
+    values: jni_sys::jintArray,
+) -> jlong {
+    unsafe {
+        let fns = **env;
+        let n = (fns.GetArrayLength.unwrap())(env, keys);
+        let mut vals = vec![0i32; n.max(0) as usize];
+        if n > 0 {
+            (fns.GetIntArrayRegion.unwrap())(env, values, 0, n, vals.as_mut_ptr());
+        }
+        let mut opts = Vec::new();
+        for i in 0..n {
+            let k = (fns.GetObjectArrayElement.unwrap())(env, keys, i);
+            opts.push((jstring(env, k), vals[i as usize]));
+            (fns.DeleteLocalRef.unwrap())(env, k);
+        }
+        match codec::Codec::create(env, owner, &jstring(env, name), &jstring(env, mime), w, h, &opts) {
+            Ok(c) => Box::into_raw(Box::new(c)) as jlong,
+            Err(e) => {
+                front::log(&format!("NDK decoder: {e}"));
+                0
+            }
+        }
+    }
+}
+
+/// Queues a frame; returns how long queueing took (ns), or -1 (the reason is logged).
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_codecFeed(
+    env: *mut JNIEnv,
+    _c: jclass,
+    h: jlong,
+    au: jni_sys::jbyteArray,
+    size: jint,
+    pts: jlong,
+    timeout_ms: jint,
+) -> jlong {
+    match unsafe { codec(h).feed(env, au, size.max(0) as usize, pts, std::time::Duration::from_millis(timeout_ms.max(0) as u64)) } {
+        Ok(ns) => ns,
+        Err(e) => {
+            front::log(&format!("NDK decoder: {e}"));
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_codecDone(_env: *mut JNIEnv, _c: jclass, h: jlong, index: jint) {
+    codec(h).done(index.max(0) as usize);
+}
+
+/// Stops and deletes the codec; the handle stays valid (for late codecDone) until codecFree.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_codecRelease(env: *mut JNIEnv, _c: jclass, h: jlong) {
+    unsafe { codec(h).release(env) };
+}
+
+/// Frees a released decoder's handle (no picture of it is held any more).
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_codecFree(_env: *mut JNIEnv, _c: jclass, h: jlong) {
+    unsafe {
+        let c = Box::from_raw(h as *mut std::sync::Arc<codec::Codec>);
+        codec::forget_callbacks(&c);
+    }
 }

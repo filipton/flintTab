@@ -499,6 +499,18 @@ private fun setStreamFrameRate(surface: Surface, fps: Int) {
     } catch (_: Exception) {}
 }
 
+/**
+ * The NDK decoder (android/native/src/codec.rs) instead of the Java one: ~2 ms less per video
+ * frame on the Galaxy Tab S10 FE (no Java thread hop or Image per frame). Off once it met an
+ * output layout it cannot read, and when the file Android/data/dev.tabdisplay/files/java-decoder
+ * exists (comparisons).
+ */
+private fun nativeDecoderWanted(): Boolean = !nativeDecoderBroken &&
+    !java.io.File("/storage/emulated/0/Android/data/dev.tabdisplay/files/java-decoder").exists()
+
+/** The NDK decoder met a picture layout it cannot read: the Java decoder from then on. */
+@Volatile private var nativeDecoderBroken = false
+
 /** True if the Annex-B access unit holds an IDR slice or an SPS (a point a decoder can start at). */
 private fun isKeyframe(au: ByteArray, size: Int): Boolean {
     var i = 0
@@ -601,9 +613,17 @@ private class Decoder(
     private val onDecoded: (pts: Long) -> Unit,
     private val onRendered: (pts: Long, nanos: Long) -> Unit,
     /** Without a surface: each decoded frame as an Image, and how to give its buffer back. */
-    private val onImage: ((pts: Long, image: android.media.Image, done: () -> Unit) -> Unit)? = null,
+    private val onImage: ((pts: Long, picture: Picture, done: () -> Unit) -> Unit)? = null,
 ) {
-    private val codec: MediaCodec
+    private lateinit var codec: MediaCodec
+    /**
+     * The NDK decoder (android/native/src/codec.rs) in place of [codec], for the CPU path:
+     * frames in and out without Java in between (0: the Java MediaCodec is used).
+     */
+    private var native = 0L
+    /** Its pictures still held by the renderer, and whether it was closed: freed at 0 and closed. */
+    private var held = 0
+    private var nativeClosed = false
     /** Takes pictures of other sizes (up to the configured one) without being made anew. */
     var adaptive = false
         private set
@@ -634,6 +654,22 @@ private class Decoder(
 
     init {
         val info = if (level >= 2) pickSoftwareDecoder() else pickDecoder()
+        if (onImage != null && level < 2 && info != null && nativeDecoderWanted()) {
+            adaptive = try {
+                info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                    .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_AdaptivePlayback)
+            } catch (_: Exception) { false }
+            for (opts in if (level == 0) lowLatencyOptions(info, fps) else listOf(emptyMap())) {
+                val all = if (adaptive) opts + mapOf(MediaFormat.KEY_MAX_WIDTH to width, MediaFormat.KEY_MAX_HEIGHT to height) else opts
+                native = Native.codecCreate(this, info.name, MediaFormat.MIMETYPE_VIDEO_AVC, width, height,
+                    all.keys.toTypedArray(), all.values.toIntArray())
+                if (native != 0L) {
+                    TLog.i("decoder ${info.name} (setup $level, NDK) started for ${width}x$height with $opts")
+                    break
+                }
+            }
+        }
+        if (native == 0L) {
         codec = if (info != null) MediaCodec.createByCodecName(info.name)
         else MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         val handler = Handler(callbacks.looper)
@@ -656,7 +692,7 @@ private class Decoder(
                         try { c.releaseOutputBuffer(index, false) } catch (_: Exception) {}
                         return
                     }
-                    sink(pts, img) {
+                    sink(pts, Picture.of(img)) {
                         try { img.close(); c.releaseOutputBuffer(index, false) } catch (_: Exception) {}
                     }
                     return
@@ -717,7 +753,39 @@ private class Decoder(
             callbacks.quitSafely()
             throw IllegalStateException("${codec.name} took no configuration")
         }
-        name = codec.name
+        }
+        name = if (native != 0L) info!!.name else codec.name
+    }
+
+    /** From the NDK decoder's thread: a decoded picture (direct buffers over its memory). */
+    @Suppress("unused")
+    fun onNativeFrame(index: Int, pts: Long, y: java.nio.ByteBuffer, u: java.nio.ByteBuffer, v: java.nio.ByteBuffer,
+                      yStride: Int, uvStride: Int, uvStep: Int, cropLeft: Int, cropTop: Int, cropW: Int, cropH: Int) {
+        val h = native
+        val sink = onImage
+        if (!open || sink == null) {
+            Native.codecDone(h, index)
+            return
+        }
+        outputs++
+        onDecoded(pts)
+        synchronized(this) { held++ }
+        val pic = Picture(y, u, v, yStride, uvStride, uvStep, android.graphics.Rect(cropLeft, cropTop, cropLeft + cropW, cropTop + cropH))
+        sink(pts, pic) {
+            Native.codecDone(h, index)
+            synchronized(this) {
+                held--
+                if (nativeClosed && held == 0) Native.codecFree(h)
+            }
+        }
+    }
+
+    /** From the NDK decoder's thread. */
+    @Suppress("unused")
+    fun onNativeError(message: String) {
+        if (message.startsWith("unsupported output layout")) nativeDecoderBroken = true
+        error = message
+        failed = true
     }
 
     /** It has taken frames for a while and given none back (some decoders hang that way). */
@@ -730,6 +798,21 @@ private class Decoder(
      * the caller rebuilds it rather than blocking the connection's reading thread.
      */
     fun feed(au: ByteArray, size: Int, pts: Long): Boolean {
+        if (native != 0L) {
+            val ns = Native.codecFeed(native, au, size, pts, (stuckNanos / 1_000_000).toInt())
+            if (ns < 0) {
+                if (open && !failed) error = error ?: "the NDK decoder took no input"
+                return false
+            }
+            feedTimes.add(longArrayOf(0, 0, ns))
+            if (feedTimes.size >= 300) {
+                val q = { f: Double -> feedTimes.map { it[2] }.sorted().let { "%.2f".format(it[((it.size - 1) * f).toInt()] / 1e6) } }
+                TLog.i("decoder input (NDK): queueInputBuffer ${q(0.5)}/${q(0.95)} ms (median/p95)")
+                feedTimes.clear()
+            }
+            if (inputs++ == 0) firstInputAt = System.nanoTime()
+            return true
+        }
         val start = System.nanoTime()
         val deadline = start + stuckNanos
         while (open && !failed && System.nanoTime() < deadline) {
@@ -755,6 +838,16 @@ private class Decoder(
 
     fun close() {
         open = false
+        if (native != 0L) {
+            Native.codecRelease(native)
+            synchronized(this) {
+                nativeClosed = true
+                if (held == 0) Native.codecFree(native)
+            }
+            HotThreads.remove(callbacks.threadId)
+            callbacks.quitSafely()
+            return
+        }
         try { codec.stop() } catch (_: Exception) {}
         codec.release()
         HotThreads.remove(callbacks.threadId)

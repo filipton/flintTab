@@ -1,7 +1,6 @@
 package dev.tabdisplay
 
 import android.graphics.Bitmap
-import android.media.Image
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Process
@@ -108,7 +107,7 @@ class CpuRenderer(
 
     private val updates = ConcurrentLinkedQueue<Update>()
     /** Decoded frames by pts with how to give them back, waiting for their turn (render thread only). */
-    private val frames = HashMap<Long, Pair<Image, () -> Unit>>()
+    private val frames = HashMap<Long, Pair<Picture, () -> Unit>>()
     private var streamW = 0
     private var streamH = 0
     private var fullNext = true
@@ -196,7 +195,7 @@ class CpuRenderer(
         HotThreads.onChange = { handler.post(::refreshHint) }
     }
 
-    override fun frameDecoded(pts: Long, image: Image, done: () -> Unit) {
+    override fun frameDecoded(pts: Long, image: Picture, done: () -> Unit) {
         decoded.add(Triple(pts, image, done))
         Native.yuvArrived()
         // As for tiles: from the decoder's thread when nothing has to wait (see [queueTile]).
@@ -204,7 +203,7 @@ class CpuRenderer(
     }
 
     /** Decoded frames not yet taken over by the render thread (into [frames]). */
-    private val decoded = ConcurrentLinkedQueue<Triple<Long, Image, () -> Unit>>()
+    private val decoded = ConcurrentLinkedQueue<Triple<Long, Picture, () -> Unit>>()
 
     /**
      * One [process] pending at a time: a present can wait most of a refresh for the scan, and
@@ -576,12 +575,12 @@ class CpuRenderer(
         }
     }
 
-    private fun drawFrame(target: Long, img: Image, pts: Long) {
+    private fun drawFrame(target: Long, img: Picture, pts: Long) {
         val sw = if (screen != 0L) streamW else view.width
         val sh = if (screen != 0L) streamH else view.height
         // Where the picture goes: a part of the screen (a video's window) or all of it.
         val part = regionOf(pts)?.takeIf { screen != 0L && it[2] > 0 && it[3] > 0 } ?: intArrayOf(0, 0, sw, sh)
-        val crop = img.cropRect
+        val crop = img.crop
         val px0 = part[0]; val py0 = part[1]
         val px1 = minOf(sw, px0 + minOf(part[2], crop.width())); val py1 = minOf(sh, py0 + minOf(part[3], crop.height()))
         val own = if (fullNext) null else changedArea(pts)
@@ -618,15 +617,14 @@ class CpuRenderer(
         }
         x0 = maxOf(x0, px0); y0 = maxOf(y0, py0); x1 = minOf(x1, px1); y1 = minOf(y1, py1)
         if (x0 >= x1 || y0 >= y1) return
-        val p = img.planes
         // The picture's pixel (0, 0) is screen pixel (ox, oy).
         val ox = px0 - crop.left; val oy = py0 - crop.top
         if (screen != 0L) {
-            Native.yuvUpdate(screen, p[0].buffer, p[0].rowStride, p[1].buffer, p[2].buffer, p[1].rowStride, p[1].pixelStride,
+            Native.yuvUpdate(screen, img.y, img.yStride, img.u, img.v, img.uvStride, img.uvStep,
                 ox, oy, x0, y0, x1, y1)
             return
         }
-        Native.frontYuv(target, p[0].buffer, p[0].rowStride, p[1].buffer, p[2].buffer, p[1].rowStride, p[1].pixelStride,
+        Native.frontYuv(target, img.y, img.yStride, img.u, img.v, img.uvStride, img.uvStep,
             ox, oy, x0, y0, x1, y1)
     }
 
