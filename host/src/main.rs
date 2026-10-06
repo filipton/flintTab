@@ -502,13 +502,30 @@ fn run_session(conn: Conn, args: &Args, host: &mut dyn Host, running: &AtomicBoo
             unsafe {
                 libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
             }
-            for msg in rx {
-                if out.write_all(&msg).is_err() {
+            // Everything waiting goes out as one write: over USB each write is a transfer that
+            // costs ~0.5 ms however small, and a frame's tiles one by one added up to ~5 ms.
+            let mut batch = Vec::with_capacity(1 << 20);
+            while let Ok(first) = rx.recv() {
+                batch.clear();
+                batch.extend_from_slice(&first);
+                while batch.len() < (512 << 10)
+                    && let Ok(more) = rx.try_recv()
+                {
+                    batch.extend_from_slice(&more);
+                }
+                if out.write_all(&batch).is_err() {
                     break;
                 }
-                if msg[0] == protocol::MSG_VIDEO || msg[0] == protocol::MSG_TILE {
-                    let pts = u64::from_be_bytes(msg[5..13].try_into().unwrap());
-                    timing.written(pts, msg.len() - protocol::VIDEO_HEADER);
+                // Each message: u8 kind, u32 length, payload.
+                let mut at = 0;
+                while at + 5 <= batch.len() {
+                    let len = u32::from_be_bytes(batch[at + 1..at + 5].try_into().unwrap()) as usize;
+                    let kind = batch[at];
+                    if (kind == protocol::MSG_VIDEO || kind == protocol::MSG_TILE) && at + 13 <= batch.len() {
+                        let pts = u64::from_be_bytes(batch[at + 5..at + 13].try_into().unwrap());
+                        timing.written(pts, len + 5 - protocol::VIDEO_HEADER);
+                    }
+                    at += 5 + len;
                 }
             }
             alive.store(false, Ordering::Relaxed);

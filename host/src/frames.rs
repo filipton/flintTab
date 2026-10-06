@@ -130,12 +130,15 @@ impl<B: Buffer> Frames<B> {
                 if let Some(msgs) = pic.as_ref().filter(|_| use_tiles).and_then(|p| tiles::build_all(p, &rects, now)) {
                     gate.sent_batch(msgs.len());
                     stale_reference = true;
+                    // One send: the writer puts the frame's tiles into one USB transfer.
+                    let mut all = Vec::with_capacity(msgs.iter().map(Vec::len).sum());
                     for (i, msg) in msgs.into_iter().enumerate() {
                         let pts = now + i as u64;
                         timing.encode_started(pts, f.composited, Some(f.delivered), false);
                         timing.encoded(pts, msg.len());
-                        tx.send(msg).ok();
+                        all.extend_from_slice(&msg);
                     }
+                    tx.send(all).ok();
                     continue;
                 }
                 lossy = Some(lossy.map_or(a, |l| [l[0].min(a[0]), l[1].min(a[1]), l[2].max(a[2]), l[3].max(a[3])]));
