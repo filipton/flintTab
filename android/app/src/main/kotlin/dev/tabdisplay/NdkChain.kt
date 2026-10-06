@@ -34,7 +34,18 @@ class NdkChain private constructor(
     private val waiting = HashMap<Long, (Long) -> Unit>()
     private var pendingRetry: (() -> Unit)? = null
 
+    /**
+     * A frame handed over and not yet on screen. Only one at a time: a second one in the same
+     * refresh would replace it unseen (a dropped frame: video stutters), and queue latency.
+     * What comes meanwhile goes into the next one.
+     */
+    @Volatile private var inFlight = false
+
     override fun submit(onShown: (Long) -> Unit, retry: () -> Unit): Boolean {
+        if (inFlight) {
+            pendingRetry = retry
+            return false
+        }
         val i = Native.chainTake(chain)
         if (i < 0) {
             pendingRetry = retry
@@ -43,6 +54,7 @@ class NdkChain private constructor(
         Native.yuvRender(handle, i)
         val b = ++batch
         synchronized(waiting) { waiting[b] = onShown }
+        inFlight = true
         Native.chainSubmit(chain, i, b)
         return true
     }
@@ -50,8 +62,29 @@ class NdkChain private constructor(
     /** From the compositor's thread (chain.rs): batch [b] was latched at [nanos]. */
     @Suppress("unused")
     fun presented(b: Long, nanos: Long) {
-        val f = synchronized(waiting) { waiting.remove(b) } ?: return
-        if (nanos > 0) f(nanos)
+        val f = synchronized(waiting) { waiting.remove(b) }
+        if (!commitCallbacks) letNextGo()
+        f?.invoke(if (nanos > 0) nanos else System.nanoTime())
+    }
+
+    /** From the compositor's thread (Android 12+): it took the frame for its next refresh. */
+    @Suppress("unused")
+    fun committed() {
+        commitCallbacks = true
+        letNextGo()
+    }
+
+    /** Whether commits are reported (else a frame counts as taken once it was shown). */
+    @Volatile private var commitCallbacks = android.os.Build.VERSION.SDK_INT >= 31
+
+    private fun letNextGo() {
+        inFlight = false
+        handler.post {
+            pendingRetry?.let {
+                pendingRetry = null
+                it()
+            }
+        }
     }
 
     /** From the compositor's thread: a buffer came back. */

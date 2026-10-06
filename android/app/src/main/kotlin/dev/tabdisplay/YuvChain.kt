@@ -35,7 +35,14 @@ class YuvChain private constructor(
      * it reached the screen (its present fence). False if every buffer is still with the
      * compositor: [retry] runs once one comes back. Render thread only.
      */
+    /** A frame handed over and not yet latched: only one at a time (see [NdkChain.inFlight]). */
+    @Volatile private var inFlight = false
+
     override fun submit(onShown: (Long) -> Unit, retry: () -> Unit): Boolean {
+        if (inFlight) {
+            pendingRetry = retry
+            return false
+        }
         val i = free.indexOfFirst { it }
         if (i < 0) {
             pendingRetry = retry
@@ -59,6 +66,17 @@ class YuvChain private constructor(
                 }
             }
         }
+        // Committed (taken for the next refresh): the next frame may go, merged with whatever
+        // came meanwhile.
+        t.addTransactionCommittedListener({ it.run() }) {
+            handler.post {
+                inFlight = false
+                pendingRetry?.let {
+                    pendingRetry = null
+                    it()
+                }
+            }
+        }
         t.addTransactionCompletedListener({ it.run() }) { stats ->
             val fence = stats.presentFence
             fences.execute {
@@ -68,6 +86,7 @@ class YuvChain private constructor(
                 if (at > 0) onShown(at)
             }
         }
+        inFlight = true
         t.apply()
         return true
     }

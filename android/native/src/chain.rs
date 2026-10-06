@@ -67,6 +67,18 @@ struct State {
     shown: Option<usize>,
 }
 
+/// ASurfaceTransaction_setOnCommit (Android 12+), looked up at run time: this builds for 11.
+type SetOnCommit = unsafe extern "C" fn(*mut ASurfaceTransaction, *mut c_void, OnComplete);
+
+fn set_on_commit() -> Option<SetOnCommit> {
+    static F: std::sync::OnceLock<Option<SetOnCommit>> = std::sync::OnceLock::new();
+    *F.get_or_init(|| unsafe {
+        let name = CString::new("ASurfaceTransaction_setOnCommit").unwrap();
+        let p = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr());
+        (!p.is_null()).then(|| std::mem::transmute::<*mut c_void, SetOnCommit>(p))
+    })
+}
+
 pub struct Chain {
     sc: *mut ASurfaceControl,
     bufs: Mutex<Vec<*mut AHB>>,
@@ -76,6 +88,8 @@ pub struct Chain {
     owner: jobject,
     presented: jmethodID,
     freed: jmethodID,
+    /// committed(): the compositor took the frame for its next refresh (null before Android 12).
+    committed: jmethodID,
 }
 
 unsafe impl Send for Chain {}
@@ -111,7 +125,7 @@ impl Chain {
                 let (n, s) = (CString::new(name).unwrap(), CString::new(sig).unwrap());
                 (fns.GetMethodID.unwrap())(env, class, n.as_ptr(), s.as_ptr())
             };
-            let (presented, freed) = (method("presented", "(JJ)V"), method("freed", "()V"));
+            let (presented, freed, committed) = (method("presented", "(JJ)V"), method("freed", "()V"), method("committed", "()V"));
             if presented.is_null() || freed.is_null() {
                 (fns.ExceptionClear.unwrap())(env);
                 ASurfaceControl_release(sc);
@@ -137,6 +151,7 @@ impl Chain {
                 owner,
                 presented,
                 freed,
+                committed,
             }))
         }
     }
@@ -184,6 +199,9 @@ impl Chain {
             let t = ASurfaceTransaction_create();
             ASurfaceTransaction_setBuffer(t, self.sc, b, -1);
             ASurfaceTransaction_setOnComplete(t, pending.cast(), on_complete);
+            if let Some(on_commit) = set_on_commit() {
+                on_commit(t, Arc::into_raw(self.clone()) as *mut c_void, committed);
+            }
             ASurfaceTransaction_apply(t);
             ASurfaceTransaction_delete(t);
         }
@@ -229,6 +247,14 @@ impl Drop for Chain {
             }
             ASurfaceControl_release(self.sc);
         }
+    }
+}
+
+/// The compositor committed (latched) the transaction: the next frame may go.
+unsafe extern "C" fn committed(context: *mut c_void, _stats: *mut ASurfaceTransactionStats) {
+    let chain = unsafe { Arc::from_raw(context as *const Chain) };
+    if !chain.committed.is_null() {
+        unsafe { chain.call(chain.committed, &[]) };
     }
 }
 
