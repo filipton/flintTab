@@ -34,7 +34,17 @@ class CpuRenderer(
     var onNeedKeyframe: () -> Unit = {}
 
     private val thread = HandlerThread("render", Process.THREAD_PRIORITY_URGENT_DISPLAY).apply { start() }
-    private val handler = Handler(thread.looper)
+    /**
+     * Held by whatever touches the screen: every task of the render thread (through [handler])
+     * and, for a tile that needs no waiting, the thread that read it (see [queueTile]).
+     */
+    private val screenLock = java.util.concurrent.locks.ReentrantLock()
+    private val handler = object : Handler(thread.looper) {
+        override fun dispatchMessage(msg: android.os.Message) {
+            screenLock.lock()
+            try { super.dispatchMessage(msg) } finally { screenLock.unlock() }
+        }
+    }
 
     /**
      * Tells the kernel how long a screen update may take, so it keeps the CPU clocked for it:
@@ -170,7 +180,8 @@ class CpuRenderer(
     override fun frameDecoded(pts: Long, image: Image, done: () -> Unit) {
         decoded.add(Triple(pts, image, done))
         Native.yuvArrived()
-        schedule()
+        // As for tiles: from the decoder's thread when nothing has to wait (see [queueTile]).
+        if (!presentNow()) schedule()
     }
 
     /** Decoded frames not yet taken over by the render thread (into [frames]). */
@@ -220,7 +231,24 @@ class CpuRenderer(
     override fun queueTile(pts: Long, x: Int, y: Int, w: Int, h: Int, luma: ByteBuffer, chroma: ByteBuffer) {
         updates.add(Tile(pts, x, y, w, h, luma, chroma))
         Native.yuvArrived()
-        schedule()
+        if (!presentNow()) schedule()
+    }
+
+    /**
+     * Applies and presents what is queued from the calling (awake) thread, if the screen is free
+     * and the scan allows writing within 0.5 ms: waking the render thread alone takes ~1 ms.
+     * False: the render thread has to (it is busy, or the write has to wait).
+     */
+    private fun presentNow(): Boolean {
+        if (yuvFront == null || !screenLock.tryLock()) return false
+        try {
+            if (!ready) return false
+            processUpdates()
+            show(maxWaitNs = 500_000L)
+            return true
+        } finally {
+            screenLock.unlock()
+        }
     }
 
     override fun setCursorImage(bitmap: Bitmap?, displayWidthPt: Int, sizePt: IntArray, hotPt: IntArray) {
@@ -265,7 +293,7 @@ class CpuRenderer(
             val x = cursorX / 65535f * paintWidth - cursorHot[0]
             val y = cursorY / 65535f * paintHeight - cursorHot[1]
             Native.yuvCursorMove(s, x.toInt(), y.toInt(), cursorShown && img != null)
-            Native.yuvPresent(s, false, false)
+            Native.yuvPresent(s, false, false, -1L)
             return
         }
         val h = handle
@@ -297,6 +325,11 @@ class CpuRenderer(
             // Older: the frame time is the app's vsync, close enough to the panel's.
             val cb = object : android.view.Choreographer.FrameCallback {
                 override fun doFrame(t: Long) {
+                    screenLock.lock()
+                    try { frame(t) } finally { screenLock.unlock() }
+                }
+
+                fun frame(t: Long) {
                     if (loop != vsyncLoop) return
                     val hz = view.display?.refreshRate ?: 60f
                     yuvFront?.let {
@@ -317,6 +350,11 @@ class CpuRenderer(
         }
         val callback = object : android.view.Choreographer.VsyncCallback {
             override fun onVsync(data: android.view.Choreographer.FrameData) {
+                screenLock.lock()
+                try { vsync(data) } finally { screenLock.unlock() }
+            }
+
+            fun vsync(data: android.view.Choreographer.FrameData) {
                 if (loop != vsyncLoop) return
                 val hz = view.display?.refreshRate ?: 60f
                 yuvFront?.let {
@@ -342,13 +380,26 @@ class CpuRenderer(
     private fun process() {
         if (!ready) return
         val started = System.nanoTime()
+        val oldest = (updates.peek() as? Tile)?.queuedAt
         try {
             processUpdates()
+            val applied = System.nanoTime()
             show()
+            if (oldest != null) {
+                passTimes.add(longArrayOf(started - oldest, applied - started, System.nanoTime() - applied))
+                if (passTimes.size >= 400) {
+                    val q = { k: Int, f: Double -> passTimes.map { it[k] }.sorted().let { "%.2f".format(it[((it.size - 1) * f).toInt()] / 1e6) } }
+                    TLog.i("tile passes: render thread woke after ${q(0, 0.5)}/${q(0, 0.95)} ms, applying ${q(1, 0.5)}/${q(1, 0.95)}, presenting ${q(2, 0.5)}/${q(2, 0.95)} (median/p95)")
+                    passTimes.clear()
+                }
+            }
         } finally {
             reportWork(started)
         }
     }
+
+    /** Per render pass that started with a tile: waiting for the thread, applying, presenting (log). */
+    private val passTimes = ArrayList<LongArray>()
 
     /**
      * Puts everything converted so far on screen at once (a frame's tiles together). With the
@@ -356,7 +407,7 @@ class CpuRenderer(
      * reaches the screen. If every buffer is still with the compositor, this runs again as
      * soon as one comes back, with whatever arrived meanwhile.
      */
-    private fun show() {
+    private fun show(maxWaitNs: Long = -1L) {
         val f0 = yuvFront
         if (f0 != null) {
             // Into the scanned-out buffer, timed against the scan: on the panel as it passes.
@@ -365,8 +416,9 @@ class CpuRenderer(
             // While it waits for the scan, something newer may arrive: then it is applied first
             // and all of it written in one go (a few times at most, so a steady stream of
             // updates cannot keep this from the screen).
-            if (Native.yuvPresent(f0.handle, newFrame, deferrals < 3) == PRESENT_DEFERRED) {
-                deferrals++
+            if (Native.yuvPresent(f0.handle, newFrame, maxWaitNs < 0 && deferrals < 3, maxWaitNs) == PRESENT_DEFERRED) {
+                // Gave way (or would have had to wait here): the render thread presents it.
+                if (maxWaitNs < 0) deferrals++
                 schedule()
                 return
             }

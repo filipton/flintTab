@@ -154,7 +154,7 @@ impl Screen {
                 stats: Vec::new(),
             });
         }
-        self.present(false, false) != PRESENT_FAILED
+        self.present(false, false, -1) != PRESENT_FAILED
     }
 
     pub fn set_vsync(&mut self, vsync_ns: i64, period_ns: i64) {
@@ -180,7 +180,9 @@ impl Screen {
     /// with the cursor blended in. Areas far apart stay separate (a few small writes instead of
     /// one box around them), all in the same refresh. `frame`: a new video frame, paced to one
     /// per scan pass (cursor moves are not).
-    pub fn present(&mut self, frame: bool, may_defer: bool) -> i32 {
+    /// `max_wait_ns`: give up (PRESENT_DEFERRED) rather than wait longer for the scan (a
+    /// thread that must not block, e.g. the one reading the link; negative: no limit).
+    pub fn present(&mut self, frame: bool, may_defer: bool, max_wait_ns: i64) -> i32 {
         let Some(f) = &mut self.front else { return PRESENT_DONE };
         let mut rects = std::mem::take(&mut f.pending);
         if rects.is_empty() {
@@ -199,6 +201,14 @@ impl Screen {
         let not_before = if frame { visible } else { 0 };
         let asked = now_ns();
         if let Some(t) = self.plan(&jobs, not_before) {
+            if max_wait_ns >= 0 && t - now_ns() > max_wait_ns {
+                if let Some(f) = &mut self.front {
+                    for r in rects {
+                        add_merged(&mut f.pending, r);
+                    }
+                }
+                return PRESENT_DEFERRED;
+            }
             // A long wait: in steps, giving way to anything that arrives meanwhile.
             while may_defer && t - now_ns() > 1_000_000 {
                 std::thread::sleep(std::time::Duration::from_micros(400));

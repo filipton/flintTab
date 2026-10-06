@@ -299,8 +299,9 @@ pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvPresent(
     h: jlong,
     frame: jni_sys::jboolean,
     may_defer: jni_sys::jboolean,
+    max_wait_ns: jlong,
 ) -> jint {
-    screen(h).present(frame != 0, may_defer != 0)
+    screen(h).present(frame != 0, may_defer != 0, max_wait_ns)
 }
 
 /// A screen update arrived (any thread): a present waiting for the scan gives way to it.
