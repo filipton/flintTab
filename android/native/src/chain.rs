@@ -14,7 +14,7 @@ use std::{
 
 use jni_sys::{JNIEnv, JavaVM, jmethodID, jobject, jvalue};
 
-use crate::front::{AHB, AHardwareBuffer_acquire, AHardwareBuffer_fromHardwareBuffer, AHardwareBuffer_release};
+use crate::front::{AHB, ARect, AHardwareBuffer_acquire, AHardwareBuffer_fromHardwareBuffer, AHardwareBuffer_release};
 
 #[repr(C)]
 pub struct ANativeWindow(c_void);
@@ -42,6 +42,13 @@ unsafe extern "C" {
     fn ASurfaceTransaction_setBufferTransparency(t: *mut ASurfaceTransaction, sc: *mut ASurfaceControl, tr: i8);
     fn ASurfaceTransaction_setBufferDataSpace(t: *mut ASurfaceTransaction, sc: *mut ASurfaceControl, ds: i32);
     fn ASurfaceTransaction_reparent(t: *mut ASurfaceTransaction, sc: *mut ASurfaceControl, parent: *mut ASurfaceControl);
+    fn ASurfaceTransaction_setGeometry(
+        t: *mut ASurfaceTransaction,
+        sc: *mut ASurfaceControl,
+        src: *const ARect,
+        dst: *const ARect,
+        transform: i32,
+    );
     fn ASurfaceTransaction_setOnComplete(t: *mut ASurfaceTransaction, context: *mut c_void, f: OnComplete);
     fn ASurfaceTransactionStats_getLatchTime(stats: *mut ASurfaceTransactionStats) -> i64;
     fn ASurfaceTransactionStats_getPreviousReleaseFenceFd(stats: *mut ASurfaceTransactionStats, sc: *mut ASurfaceControl) -> i32;
@@ -82,8 +89,9 @@ struct Pending {
 }
 
 impl Chain {
-    /// A layer on top of `surface` (the SurfaceView's), owned by the Kotlin object `owner`.
-    pub unsafe fn create(env: *mut JNIEnv, surface: jobject, owner: jobject) -> Option<Arc<Chain>> {
+    /// A layer on top of `surface` (the SurfaceView's), owned by the Kotlin object `owner`:
+    /// buffers of `buf` (w, h) size, scaled by the compositor to `view` (w, h).
+    pub unsafe fn create(env: *mut JNIEnv, surface: jobject, owner: jobject, buf: (i32, i32), view: (i32, i32)) -> Option<Arc<Chain>> {
         unsafe {
             let window = ANativeWindow_fromSurface(env, surface);
             if window.is_null() {
@@ -116,6 +124,9 @@ impl Chain {
             ASurfaceTransaction_setZOrder(t, sc, 0);
             ASurfaceTransaction_setBufferTransparency(t, sc, TRANSPARENCY_OPAQUE);
             ASurfaceTransaction_setBufferDataSpace(t, sc, DATASPACE_BT709);
+            let src = ARect { left: 0, top: 0, right: buf.0, bottom: buf.1 };
+            let dst = ARect { left: 0, top: 0, right: view.0, bottom: view.1 };
+            ASurfaceTransaction_setGeometry(t, sc, &src, &dst, 0);
             ASurfaceTransaction_apply(t);
             ASurfaceTransaction_delete(t);
             Some(Arc::new(Chain {

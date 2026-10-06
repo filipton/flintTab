@@ -91,11 +91,11 @@ class YuvChain private constructor(
             false
         }
 
-        /** Four buffers the size of [view] (landscape, as received); null if not ready. */
-        fun attach(view: SurfaceView, handler: Handler): YuvChain? {
+        /** Four [bw] x [bh] buffers (the stream's size), scaled to [view]; null if not ready. */
+        fun attach(view: SurfaceView, handler: Handler, bw: Int, bh: Int): YuvChain? {
             val parent = view.surfaceControl
             if (!parent.isValid || view.width == 0) return null
-            val (w, h) = view.width and 1.inv() to (view.height and 1.inv())
+            val (w, h) = bw and 1.inv() to (bh and 1.inv())
             val buffers = try {
                 // The compositor holds two (on screen, queued): with four, one is always free.
                 List(4) { HardwareBuffer.create(w, h, HardwareBuffer.YCBCR_420_888, 1, USAGE) }
@@ -114,9 +114,10 @@ class YuvChain private constructor(
                 .setDataSpace(sc, DataSpace.pack(DataSpace.STANDARD_BT709, DataSpace.TRANSFER_SMPTE_170M, DataSpace.RANGE_LIMITED))
                 .setOpaque(sc, true)
                 .setLayer(sc, 0)
+                .setScale(sc, view.width.toFloat() / w, view.height.toFloat() / h)
                 .setVisibility(sc, true)
                 .apply()
-            android.util.Log.i("tabdisplay", "yuv chain: 4 NV12 buffers ${w}x$h")
+            TLog.i("NV12 chain: 4 buffers ${w}x$h, shown at ${view.width}x${view.height}")
             return YuvChain(handle, sc, buffers, handler)
         }
     }

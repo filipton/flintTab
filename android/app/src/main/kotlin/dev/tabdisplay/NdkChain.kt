@@ -82,11 +82,11 @@ class NdkChain private constructor(
             false
         }
 
-        /** Four buffers the size of [view]; null if the view is not ready or this fails. */
-        fun attach(view: SurfaceView, handler: Handler): NdkChain? {
+        /** Four [bw] x [bh] buffers (the stream's size), scaled to [view]; null if not ready or failed. */
+        fun attach(view: SurfaceView, handler: Handler, bw: Int, bh: Int): NdkChain? {
             val surface = view.holder.surface
             if (surface == null || !surface.isValid || view.width == 0) return null
-            val (w, h) = view.width and 1.inv() to (view.height and 1.inv())
+            val (w, h) = bw and 1.inv() to (bh and 1.inv())
             val buffers = try {
                 List(4) { HardwareBuffer.create(w, h, HardwareBuffer.YCBCR_420_888, 1, USAGE) }
             } catch (e: Exception) {
@@ -95,14 +95,14 @@ class NdkChain private constructor(
             }
             val handle = Native.yuvCreate(w, h)
             val c = NdkChain(handle, buffers, handler)
-            c.chain = Native.chainCreate(surface, c)
+            c.chain = Native.chainCreate(surface, c, w, h, view.width, view.height)
             val ok = c.chain != 0L && buffers.all { Native.yuvAddBuffer(handle, it) >= 0 && Native.chainAddBuffer(c.chain, it) }
             if (!ok) {
                 TLog.i("NV12 chain (NDK): the compositor layer could not be set up")
                 c.release()
                 return null
             }
-            TLog.i("NV12 chain (NDK, Android ${android.os.Build.VERSION.SDK_INT}): 4 buffers ${w}x$h")
+            TLog.i("NV12 chain (NDK, Android ${android.os.Build.VERSION.SDK_INT}): 4 buffers ${w}x$h, shown at ${view.width}x${view.height}")
             return c
         }
     }

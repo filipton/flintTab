@@ -326,8 +326,17 @@ fn chain<'a>(h: jlong) -> &'a std::sync::Arc<chain::Chain> {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_dev_tabdisplay_Native_chainCreate(env: *mut JNIEnv, _c: jclass, surface: jobject, owner: jobject) -> jlong {
-    match unsafe { chain::Chain::create(env, surface, owner) } {
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_chainCreate(
+    env: *mut JNIEnv,
+    _c: jclass,
+    surface: jobject,
+    owner: jobject,
+    bw: jint,
+    bh: jint,
+    vw: jint,
+    vh: jint,
+) -> jlong {
+    match unsafe { chain::Chain::create(env, surface, owner, (bw, bh), (vw, vh)) } {
         Some(c) => Box::into_raw(Box::new(c)) as jlong,
         None => 0,
     }

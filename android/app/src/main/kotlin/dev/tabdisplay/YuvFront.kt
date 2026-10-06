@@ -52,10 +52,11 @@ class YuvFront private constructor(
             false
         }
 
-        fun attach(view: SurfaceView): YuvFront? {
+        /** A [bw] x [bh] buffer (the stream's size), scaled to [view]; null if not ready. */
+        fun attach(view: SurfaceView, bw: Int, bh: Int): YuvFront? {
             val parent = view.surfaceControl
             if (!parent.isValid || view.width == 0) return null
-            val (w, h) = view.width and 1.inv() to (view.height and 1.inv())
+            val (w, h) = bw and 1.inv() to (bh and 1.inv())
             val buffer = try {
                 HardwareBuffer.create(w, h, HardwareBuffer.YCBCR_420_888, 1, USAGE)
             } catch (_: Exception) {
@@ -75,9 +76,10 @@ class YuvFront private constructor(
                 .setDataSpace(sc, DataSpace.pack(DataSpace.STANDARD_BT709, DataSpace.TRANSFER_SMPTE_170M, DataSpace.RANGE_LIMITED))
                 .setOpaque(sc, true)
                 .setLayer(sc, 0)
+                .setScale(sc, view.width.toFloat() / w, view.height.toFloat() / h)
                 .setVisibility(sc, true)
                 .apply()
-            android.util.Log.i("tabdisplay", "yuv front buffer ${w}x$h, hint $hint")
+            TLog.i("front buffer ${w}x$h, shown at ${view.width}x${view.height}")
             return YuvFront(handle, sc, buffer)
         }
     }

@@ -95,22 +95,32 @@ class CpuRenderer(
 
     private val ready get() = screen != 0L || handle != 0L
 
+    /** Pixels of what is drawn into: the stream's size for the NV12 paths (scaled to the screen by the compositor). */
+    private val paintWidth get() = if (screen != 0L && streamW > 0) streamW else view.width
+    private val paintHeight get() = if (screen != 0L && streamH > 0) streamH else view.height
+
     /** None of the CPU paths could be set up on this device: the app falls back to plain video. */
     var onUnusable: (() -> Unit)? = null
     private var failedAttaches = 0
 
     private fun attach() {
         if (ready) return
-        when {
+        // The connection waits for this surface, and the stream's size comes over it: offered
+        // as soon as the view has one, not once the buffers exist.
+        if (surface == null && view.holder.surface?.isValid == true) surface = view.holder.surface
+        // Buffers the stream's size (the compositor scales them to the screen): known once
+        // the host has sent its configuration.
+        val (bw, bh) = streamW to streamH
+        if (bw > 0) when {
             useFrontBuffer -> front = CpuFront.attach(view)
-            lowestLatency && YuvFront.supported() -> yuvFront = YuvFront.attach(view)
-            YuvChain.supported() -> yuv = YuvChain.attach(view, handler)
-            NdkChain.supported() -> yuv = NdkChain.attach(view, handler)
+            lowestLatency && YuvFront.supported() -> yuvFront = YuvFront.attach(view, bw, bh)
+            YuvChain.supported() -> yuv = YuvChain.attach(view, handler, bw, bh)
+            NdkChain.supported() -> yuv = NdkChain.attach(view, handler, bw, bh)
             SwapChain.supported() -> chain = SwapChain.attach(view, handler)
         }
         if (!ready) {
             // Laid out and still nothing: this device cannot do it (not just "not yet").
-            val laidOut = view.width > 0 && view.holder.surface?.isValid == true
+            val laidOut = bw > 0 && view.width > 0 && view.holder.surface?.isValid == true
             if (laidOut && ++failedAttaches >= 5) {
                 TLog.i("the fast display paths could not be set up here; switching to plain video")
                 onUnusable?.invoke()
@@ -138,8 +148,16 @@ class CpuRenderer(
 
     override fun configure(w: Int, h: Int) {
         handler.post {
+            // A new stream size: buffers of the new size.
+            if ((w != streamW || h != streamH) && (yuv != null || yuvFront != null)) {
+                yuv?.release()
+                yuv = null
+                yuvFront?.release()
+                yuvFront = null
+            }
             streamW = w
             streamH = h
+            if (!ready) attach()
             fullNext = true
             while (true) {
                 val u = updates.poll() ?: break
@@ -162,7 +180,7 @@ class CpuRenderer(
     override fun setCursorImage(bitmap: Bitmap?, displayWidthPt: Int, sizePt: IntArray, hotPt: IntArray) {
         if (yuv != null && yuvFront == null) return overlayCursor.setImage(bitmap, displayWidthPt, sizePt, hotPt)
         if (bitmap == null || displayWidthPt == 0) return
-        val scale = view.width.toFloat() / displayWidthPt
+        val scale = paintWidth.toFloat() / displayWidthPt
         // Scaled to the panel once here; the native sprite is drawn 1:1.
         val w = maxOf(1, (sizePt[0] * scale).toInt())
         val h = maxOf(1, (sizePt[1] * scale).toInt())
@@ -188,8 +206,8 @@ class CpuRenderer(
                 Native.yuvCursorImage(s, buf, img.width, img.height)
                 cursorUploaded = img
             }
-            val x = cursorX / 65535f * view.width - cursorHot[0]
-            val y = cursorY / 65535f * view.height - cursorHot[1]
+            val x = cursorX / 65535f * paintWidth - cursorHot[0]
+            val y = cursorY / 65535f * paintHeight - cursorHot[1]
             Native.yuvCursorMove(s, x.toInt(), y.toInt(), cursorShown && img != null)
             Native.yuvPresent(s, false)
             return
@@ -389,8 +407,8 @@ class CpuRenderer(
     }
 
     private fun drawFrame(target: Long, img: Image, pts: Long) {
-        val w = minOf(img.width, view.width)
-        val h = minOf(img.height, view.height)
+        val w = minOf(img.width, if (screen != 0L) streamW else view.width)
+        val h = minOf(img.height, if (screen != 0L) streamH else view.height)
         val own = if (fullNext) null else changedArea(pts)
         val extra = carried
         val c = when {
@@ -424,10 +442,10 @@ class CpuRenderer(
         handler.post {
             val h = handle
             if (screen != 0L) {
-                val b = dumpBuf ?: ByteBuffer.allocateDirect(view.width * view.height * 4).order(ByteOrder.nativeOrder()).also { dumpBuf = it }
+                val b = dumpBuf ?: ByteBuffer.allocateDirect(paintWidth * paintHeight * 4).order(ByteOrder.nativeOrder()).also { dumpBuf = it }
                 b.clear()
                 Native.yuvDump(screen, b)
-                val bmp = Bitmap.createBitmap(view.width and 1.inv(), view.height and 1.inv(), Bitmap.Config.ARGB_8888)
+                val bmp = Bitmap.createBitmap(paintWidth and 1.inv(), paintHeight and 1.inv(), Bitmap.Config.ARGB_8888)
                 b.rewind()
                 bmp.copyPixelsFromBuffer(b)
                 java.io.File(path.parentFile, "shadow.png").outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }

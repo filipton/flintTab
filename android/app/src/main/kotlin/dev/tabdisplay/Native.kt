@@ -39,7 +39,7 @@ object Native {
     )
     @JvmStatic external fun yuvRender(handle: Long, index: Int): Boolean
     @JvmStatic external fun yuvDump(handle: Long, out: ByteBuffer)
-    @JvmStatic external fun chainCreate(surface: android.view.Surface, owner: NdkChain): Long
+    @JvmStatic external fun chainCreate(surface: android.view.Surface, owner: NdkChain, bw: Int, bh: Int, vw: Int, vh: Int): Long
     @JvmStatic external fun chainAddBuffer(chain: Long, hb: android.hardware.HardwareBuffer): Boolean
     @JvmStatic external fun chainTake(chain: Long): Int
     @JvmStatic external fun chainSubmit(chain: Long, index: Int, batch: Long)

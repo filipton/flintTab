@@ -140,11 +140,11 @@ class MainActivity : Activity() {
         }
         // On by default where the hardware allows it: skips the compositor's queue (~17 ms at
         // 90 Hz) at the cost of possible tearing. Switching rebuilds the activity.
-        val frontSupported = FrontRenderer.supported()
+        val frontSupported = YuvFront.supported()
         // For measuring: `am start ... --ez front false` sets the switch.
         if (intent.hasExtra("front")) prefs.edit().putBoolean("front", intent.getBooleanExtra("front", true)).commit()
         latencySwitch = Switch(this).apply {
-            text = "Lowest latency (may tear)  "
+            text = if (frontSupported) "Lowest latency  " else "Lowest latency (needs Android 13)  "
             setTextColor(Color.WHITE)
             textSize = 18f
             isEnabled = frontSupported
@@ -182,12 +182,12 @@ class MainActivity : Activity() {
         hideSystemBars()
 
         hostCursor = HostCursor(surfaceView)
-        if (latencySwitch.isChecked) {
+        run {
             val changed = { pts: Long -> session?.takeChangedArea(pts) }
             val shown = { pts: Long, nanos: Long -> session?.frameShown(pts, nanos); Unit }
             // The CPU writes into the scanned-out buffer where the hardware allows it; else the GPU does.
             // Experiment: `--ei variant` 1 = CPU, 2 = CPU with a GPU-allocated buffer, 3 = GL.
-            val variant = intent.getIntExtra("variant", 0)
+            val variant = if (latencySwitch.isChecked) intent.getIntExtra("variant", 0) else 0
             CpuFront.gpuUsage = variant == 2
             CpuFront.singleBuffer = variant in 1..6
             CpuFront.noFrontFlag = variant == 4 || variant == 8
@@ -200,7 +200,9 @@ class MainActivity : Activity() {
                 forcePlainVideo -> null
                 YuvFront.supported() || YuvChain.supported() || NdkChain.supported() || SwapChain.supported() ->
                     CpuRenderer(surfaceView, changed, shown).also {
-                        it.lowestLatency = variant != 9
+                        // The switch picks the front buffer; without it (or before Android 13)
+                        // the compositor-paced NV12 swap chain.
+                        it.lowestLatency = latencySwitch.isChecked && variant != 9
                         it.onUnusable = { runOnUiThread { forcePlainVideo = true; recreate() } }
                     }
                 else -> null // the plain video path
@@ -209,9 +211,11 @@ class MainActivity : Activity() {
                 "Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}), " +
                     "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}: renderer " +
                     when {
+                        front is CpuRenderer && latencySwitch.isChecked && YuvFront.supported() -> "front buffer (lowest latency)"
+                        front is CpuRenderer -> "NV12 swap chain"
                         front != null -> front!!::class.simpleName
-                        android.os.Build.VERSION.SDK_INT < 33 -> "plain video (the fast paths need Android 13)"
-                        else -> "plain video (the display cannot scan out CPU-written buffers)"
+                        forcePlainVideo -> "plain video (the fast paths failed on this device)"
+                        else -> "plain video (this device cannot hand CPU-written buffers to the compositor)"
                     }
             )
             // Debugging: `adb shell am broadcast -a dev.tabdisplay.DUMP` saves what the panel shows.

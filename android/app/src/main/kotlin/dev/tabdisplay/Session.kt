@@ -181,8 +181,10 @@ class Session(
             if (surface == null || !surface.isValid) { Thread.sleep(100); continue }
             try {
                 runOnce(surface)
-            } catch (_: Exception) {
-                // connection refused / dropped: retry below
+            } catch (e: Exception) {
+                // Connection refused (no host yet): retry below quietly. Anything once connected
+                // ended the session: say what.
+                if (connectedOnce) TLog.i("session ended on the tablet: $e at ${e.stackTrace.take(4).joinToString(" < ")}")
             }
             onState(false)
             if (running) Thread.sleep(500)
@@ -203,7 +205,7 @@ class Session(
                 val fd = usb.openAccessory(acc)
                 if (fd != null) {
                     // The accessory driver hands out at most 16 KB per read.
-                    return Link(FileInputStream(fd.fileDescriptor).buffered(1 shl 14), FileOutputStream(fd.fileDescriptor), fd, "USB accessory")
+                    return Link(AccessoryInput(FileInputStream(fd.fileDescriptor)), FileOutputStream(fd.fileDescriptor), fd, "USB accessory")
                 }
             } else if (!askedUsb) {
                 askedUsb = true
@@ -221,6 +223,7 @@ class Session(
      * 1 the hardware decoder plain, 2 Android's software decoder. A level that does not work on
      * this device (a decoder failing, or taking frames and giving none back) moves to the next.
      */
+    @Volatile private var connectedOnce = false
     var decoderLevel = 0
     private val decoderFailures = ArrayList<Long>()
 
@@ -269,6 +272,7 @@ class Session(
         outbox.clear() // nothing from an earlier connection
         out = output
         TLog.connected(::sendLog)
+        connectedOnce = true
 
         var decoder: Decoder? = null
         var config: IntArray? = null // w, h, fps
@@ -756,4 +760,41 @@ private class AudioPlayer(rate: Int, channels: Int) {
         try { track.stop() } catch (_: Exception) {}
         track.release()
     }
+}
+
+/**
+ * Buffered reading from the USB accessory. Not BufferedInputStream: it asks available() how
+ * much is waiting, and some accessory drivers (Huawei's) reject that ioctl, which ended every
+ * session. Each read asks the driver for at most one 16 KB transfer, which all of them take.
+ */
+private class AccessoryInput(private val src: java.io.InputStream) : java.io.InputStream() {
+    private val buf = ByteArray(1 shl 14)
+    private var pos = 0
+    private var len = 0
+
+    private fun fill(): Boolean {
+        pos = 0
+        len = src.read(buf, 0, buf.size)
+        return len > 0
+    }
+
+    override fun read(): Int {
+        if (pos >= len && !fill()) return -1
+        return buf[pos++].toInt() and 0xff
+    }
+
+    override fun read(b: ByteArray, off: Int, n: Int): Int {
+        if (n == 0) return 0
+        if (pos >= len) {
+            // Large reads straight into the caller's array, one transfer at a time.
+            if (n >= buf.size) return src.read(b, off, buf.size)
+            if (!fill()) return -1
+        }
+        val k = minOf(n, len - pos)
+        System.arraycopy(buf, pos, b, off, k)
+        pos += k
+        return k
+    }
+
+    override fun close() = src.close()
 }
