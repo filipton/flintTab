@@ -85,3 +85,34 @@ pub fn restore(adb: &str) {
         }
     }
 }
+
+/// USB-C lets either side power the other, and a tablet can end up powering the computer (a
+/// laptop on battery drains the tablet). Unless that is wanted, the tablet's port is switched
+/// to taking power only. Checked again now and then: the roles are renegotiated, e.g. when the
+/// laptop's charger is plugged in or out. Returns whether it changed anything.
+pub fn keep_sink(adb: &str, serial: &str) -> bool {
+    let Ok(out) = Command::new(adb).args(["-s", serial, "shell", "dumpsys", "usb"]).stderr(Stdio::null()).output() else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The first port's id, power role and data role (port_manager section).
+    let field = |name: &str| {
+        text.lines().map(str::trim).find_map(|l| l.strip_prefix(name).map(str::to_owned))
+    };
+    let (Some(port), Some(power), Some(data)) = (field("id="), field("power_role="), field("data_role=")) else {
+        return false;
+    };
+    if power != "source" {
+        return false;
+    }
+    let ok = Command::new(adb)
+        .args(["-s", serial, "shell", "dumpsys", "usb", "set-port-roles", &port, "sink", &data])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok {
+        println!("tablet {serial} was powering this computer: switched it to charging instead (--tablet-powers-computer allows it)");
+    }
+    ok
+}

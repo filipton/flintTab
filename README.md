@@ -91,6 +91,10 @@ barrel button right-clicks.
 **Audio** is off by default; `--audio` plays the computer's sound on the tablet.
 Only system audio is captured; the host mutes nothing on the computer.
 
+**Power:** over USB-C either side can power the other, and a tablet can end up charging the
+computer (a laptop on battery then drains the tablet). The host keeps each tablet to taking
+power only (checked every 10 s); `--tablet-powers-computer` lets it power the computer.
+
 **Lowest latency** (drawing straight into the buffer the panel scans out, Android 13+) is on by
 default; `--no-lowest-latency` uses the tablet's compositor-paced swap chain instead.
 
@@ -101,7 +105,7 @@ its report (stack trace, last log lines) is printed by the host on the next conn
 
 The stream runs at the tablet's refresh rate (up to 120 Hz) when its decoder can keep up.
 
-Options: `--touch --audio --no-lowest-latency --fps N --bitrate MBPS --keep-display SECS --max-width 2560 --serial SERIAL --no-aoa --keep-tablet-settings --no-launch --apk PATH --no-install --width W --height H`;
+Options: `--touch --audio --no-lowest-latency --tablet-powers-computer --fps N --bitrate MBPS --keep-display SECS --max-width 2560 --serial SERIAL --no-aoa --keep-tablet-settings --no-launch --apk PATH --no-install --width W --height H`;
 macOS: `--ppi 220 --no-hidpi --cursor-in-video`; Linux: `--encoder NAME --portal-monitor --x11-region X,Y`.
 
 ## How it keeps latency low

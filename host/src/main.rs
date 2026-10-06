@@ -109,6 +109,9 @@ pub struct Args {
     /// Play this computer's sound on the tablet
     #[arg(long)]
     audio: bool,
+    /// Let a tablet power this computer over USB-C (by default it is kept to taking power)
+    #[arg(long)]
+    tablet_powers_computer: bool,
     /// Do not run adb at all (the tablet connects some other way, e.g. a test client)
     #[arg(long, hide = true)]
     no_adb: bool,
@@ -181,7 +184,9 @@ fn spawn_adb_watcher(args: &Args, busy: Arc<AtomicBool>, current: Arc<std::sync:
     let install = !args.no_install;
     let tweak = !args.keep_tablet_settings;
     let apk = args.apk.clone();
+    let keep_sink = !args.tablet_powers_computer;
     thread::spawn(move || {
+        let mut last_power_check = std::time::Instant::now() - Duration::from_secs(60);
         let mut connected: Option<String> = None;
         let mut tweaked: Option<String> = None;
         loop {
@@ -191,6 +196,13 @@ fn spawn_adb_watcher(args: &Args, busy: Arc<AtomicBool>, current: Arc<std::sync:
                 let spec = format!("tcp:{port}");
                 let app_spec = "tcp:27183";
                 let device = pick_device(&adb, wanted.as_deref());
+                if keep_sink
+                    && let Some(serial) = device.as_deref()
+                    && last_power_check.elapsed() >= Duration::from_secs(10)
+                {
+                    last_power_check = std::time::Instant::now();
+                    tablet::keep_sink(&adb, serial);
+                }
                 // Before the port forward, so the app cannot connect while the caps still apply.
                 if tweak && device != tweaked {
                     if let Some(serial) = device.as_deref() {
