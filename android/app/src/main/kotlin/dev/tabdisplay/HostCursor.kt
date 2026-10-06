@@ -65,13 +65,19 @@ class HostCursor(private val view: SurfaceView) {
     @Synchronized
     fun move(x: Int, y: Int, show: Boolean) {
         lastX = x; lastY = y; visible = show
-        val sc = ensureLayer() ?: return
-        val px = x / 65535f * view.width - hotPt[0] * scale
-        val py = y / 65535f * view.height - hotPt[1] * scale
-        SurfaceControl.Transaction()
-            .setPosition(sc, px, py)
-            .setVisibility(sc, show)
-            .apply()
+        // A cursor that cannot be drawn just now must not end the session.
+        try {
+            val sc = ensureLayer() ?: return
+            val px = x / 65535f * view.width - hotPt[0] * scale
+            val py = y / 65535f * view.height - hotPt[1] * scale
+            SurfaceControl.Transaction()
+                .setPosition(sc, px, py)
+                .setVisibility(sc, show)
+                .apply()
+        } catch (e: RuntimeException) {
+            note("cursor layer: $e")
+            releaseLayer()
+        }
     }
 
     /** The video surface is going away (its layer, and ours with it). */
@@ -81,8 +87,9 @@ class HostCursor(private val view: SurfaceView) {
     }
 
     private fun ensureLayer(): SurfaceControl? {
-        val p = view.surfaceControl
-        if (!p.isValid) { note("video surface invalid"); releaseLayer(); return null }
+        // Null once the surface is gone (the app went to the background).
+        val p: SurfaceControl? = view.surfaceControl
+        if (p == null || !p.isValid) { note("video surface invalid"); releaseLayer(); return null }
         if (p != parent) releaseLayer()
         layer?.let { return it }
         val bmp = image ?: run { note("no image yet"); return null }
