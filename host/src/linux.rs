@@ -524,7 +524,16 @@ struct Encoder {
     /// Debugging: TD_BREAK_ENCODER=<element> makes that encoder fail after a few frames.
     break_after: Option<usize>,
     frames: AtomicUsize,
+    /// Frames pushed since the encoder last produced any output, and when that was.
+    /// Some drivers stall without a word (no error, no output): once proven, such an
+    /// encoder is switched away from like a failed one.
+    since_output: Arc<AtomicUsize>,
+    last_output: Arc<Mutex<Instant>>,
 }
+
+/// No output for this many pushed frames over this long: the encoder is silently stuck.
+const SILENCE_FRAMES: usize = 10;
+const SILENCE_FOR: Duration = Duration::from_secs(3);
 
 /// The running time of `buf` in `sample`'s segment, in µs: the pts it was pushed with
 /// (encoders may shift pts, x264 by 1000 h, and the segment with it).
@@ -544,7 +553,14 @@ impl Encoder {
         tx: &mpsc::Sender<Vec<u8>>,
     ) -> Result<(Self, &'static str)> {
         let mut last_err = match wanted {
-            Some(e) => anyhow!("encoder {e} is not available (see gst-inspect-1.0 {e})"),
+            Some(e) => {
+                let have: Vec<_> = encoders(cfg)
+                    .iter()
+                    .map(|(n, _, _)| *n)
+                    .filter(|n| gst::ElementFactory::find(n).is_some())
+                    .collect();
+                anyhow!("encoder {e} is not available (use one of: {})", have.join(", "))
+            }
             None => anyhow!("no H.264 encoder found (install gstreamer1.0-plugins-bad and -ugly)"),
         };
         let StreamConfig { width: w, height: h, fps, .. } = *cfg;
@@ -600,7 +616,10 @@ impl Encoder {
         let sink = bin.by_name("sink").unwrap().downcast::<gst_app::AppSink>().unwrap();
         let pending: Pending = Default::default();
         let (probe_tx, probe_rx) = mpsc::sync_channel::<()>(1);
+        let since_output = Arc::new(AtomicUsize::new(0));
+        let last_output = Arc::new(Mutex::new(Instant::now()));
         let (f, tx, p) = (frames.clone(), tx.clone(), pending.clone());
+        let (since, last) = (since_output.clone(), last_output.clone());
         let mut first = true;
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
@@ -608,6 +627,9 @@ impl Encoder {
                     let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     let buf = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let map = buf.map_readable().map_err(|_| gst::FlowError::Error)?;
+                    // Any output at all (even before the first SPS) proves the encoder alive.
+                    *last.lock().unwrap() = Instant::now();
+                    since.store(0, Ordering::Relaxed);
                     let pts = running_us(&sample, buf).unwrap_or(0);
                     let Some(area) = p.lock().unwrap().remove(&pts) else {
                         // The test frame (pts 0): the encoder works.
@@ -640,7 +662,17 @@ impl Encoder {
         src.push_event(gst::event::Caps::new(&caps));
         src.push_event(gst::event::Segment::new(&gst::FormattedSegment::<gst::ClockTime>::new()));
         let break_after = (std::env::var("TD_BREAK_ENCODER").as_deref() == Ok(name)).then_some(2);
-        let encoder = Self { pipeline, src, pending, failed: Default::default(), name, break_after, frames: AtomicUsize::new(0) };
+        let encoder = Self {
+            pipeline,
+            src,
+            pending,
+            failed: Default::default(),
+            name,
+            break_after,
+            frames: AtomicUsize::new(0),
+            since_output,
+            last_output,
+        };
 
         // One black frame: many encoders only fail once they see data.
         let info = gstreamer_video::VideoInfo::builder(gstreamer_video::VideoFormat::Nv12, w, h).build()?;
@@ -687,6 +719,13 @@ impl Encoder {
         if self.failed.load(Ordering::Relaxed) {
             return false;
         }
+        if self.since_output.load(Ordering::Relaxed) >= SILENCE_FRAMES
+            && self.last_output.lock().unwrap().elapsed() >= SILENCE_FOR
+        {
+            eprintln!("{name} took {SILENCE_FRAMES} frames with no output for {SILENCE_FOR:?}; trying the next encoder", name = self.name);
+            self.failed.store(true, Ordering::Relaxed);
+            return false;
+        }
         {
             let mut p = self.pending.lock().unwrap();
             p.retain(|&t, _| t + 2_000_000 > pts); // frames an encoder dropped
@@ -702,6 +741,7 @@ impl Encoder {
             self.failed.store(true, Ordering::Relaxed);
             return false;
         }
+        self.since_output.fetch_add(1, Ordering::Relaxed);
         // Still inside: an encoder that holds frames back. Have it finish them now.
         if self.pending.lock().unwrap().contains_key(&pts) {
             self.drain();

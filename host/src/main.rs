@@ -125,8 +125,8 @@ pub struct Args {
     /// (the separate cursor is drawn by the tablet and moves with much less delay)
     #[arg(long)]
     cursor_in_video: bool,
-    /// Linux: H.264 encoder element to use instead of the first available one
-    /// (nvh264enc, vah264lpenc, vah264enc, vaapih264enc, qsvh264enc, x264enc)
+    /// Linux: H.264 encoder element to use instead of the first working one
+    /// (vah264lpenc, vah264enc, nvautogpuh264enc, nvh264enc, vaapih264enc, qsvh264enc, x264enc)
     #[arg(long)]
     encoder: Option<String>,
     /// Linux: capture this X11 screen area (X,Y; size = the tablet's) instead of a portal virtual monitor
