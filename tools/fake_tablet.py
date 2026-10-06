@@ -10,7 +10,7 @@ W,H,FPS = int(os.environ.get("W",1280)),int(os.environ.get("H",800)),60
 s = socket.create_connection(("127.0.0.1", 27183))
 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 TILES = os.environ.get("TILES") == "1"  # also take small changes as pixel tiles
-s.sendall(b"TDSP" + bytes([4]) + struct.pack(">III", W, H, FPS) + bytes([1 if TILES else 0]))
+s.sendall(b"TDSP" + bytes([5]) + struct.pack(">III", W, H, FPS) + bytes([1 if TILES else 0]))
 _log = "fake tablet: hello from the log channel".encode()
 s.sendall(bytes([8, 0]) + struct.pack(">H", len(_log)) + _log)
 def lz4(src, size):
