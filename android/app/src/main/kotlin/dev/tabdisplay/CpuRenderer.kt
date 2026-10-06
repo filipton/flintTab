@@ -169,6 +169,7 @@ class CpuRenderer(
 
     override fun frameDecoded(pts: Long, image: Image, done: () -> Unit) {
         decoded.add(Triple(pts, image, done))
+        Native.yuvArrived()
         schedule()
     }
 
@@ -218,6 +219,7 @@ class CpuRenderer(
 
     override fun queueTile(pts: Long, x: Int, y: Int, w: Int, h: Int, luma: ByteBuffer, chroma: ByteBuffer) {
         updates.add(Tile(pts, x, y, w, h, luma, chroma))
+        Native.yuvArrived()
         schedule()
     }
 
@@ -263,7 +265,7 @@ class CpuRenderer(
             val x = cursorX / 65535f * paintWidth - cursorHot[0]
             val y = cursorY / 65535f * paintHeight - cursorHot[1]
             Native.yuvCursorMove(s, x.toInt(), y.toInt(), cursorShown && img != null)
-            Native.yuvPresent(s, false)
+            Native.yuvPresent(s, false, false)
             return
         }
         val h = handle
@@ -360,8 +362,16 @@ class CpuRenderer(
             // Into the scanned-out buffer, timed against the scan: on the panel as it passes.
             // Tiles of one Mac frame go out as separate messages, pts 1 µs apart: one frame.
             val newFrame = shown.any { it - lastFramePts > 1000 }
+            // While it waits for the scan, something newer may arrive: then it is applied first
+            // and all of it written in one go (a few times at most, so a steady stream of
+            // updates cannot keep this from the screen).
+            if (Native.yuvPresent(f0.handle, newFrame, deferrals < 3) == PRESENT_DEFERRED) {
+                deferrals++
+                schedule()
+                return
+            }
+            deferrals = 0
             shown.maxOrNull()?.let { lastFramePts = maxOf(lastFramePts, it) }
-            Native.yuvPresent(f0.handle, newFrame)
             if (newFrame) Native.yuvCountFrame(f0.handle)
             val now = System.nanoTime()
             for (p in shown) onShown(p, now)
@@ -394,6 +404,10 @@ class CpuRenderer(
         for (p in shown) onShown(p, now)
         shown.clear()
     }
+
+    /** Presents in a row that gave way to newer updates (see [show]). */
+    private var deferrals = 0
+    private val PRESENT_DEFERRED = 2
 
     /** The newest update presented (front mode). */
     private var lastFramePts = Long.MIN_VALUE / 2

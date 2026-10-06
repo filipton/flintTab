@@ -12,7 +12,6 @@ use gstreamer::{self as gst, prelude::*};
 use gstreamer_app as gst_app;
 use gstreamer_video::prelude::*;
 use std::{
-    collections::VecDeque,
     os::fd::{AsRawFd, OwnedFd},
     path::PathBuf,
     sync::{

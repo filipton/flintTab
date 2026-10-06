@@ -51,7 +51,8 @@ object Native {
     @JvmStatic external fun chainVsync(chain: Long): Long
     @JvmStatic external fun yuvAttachFront(handle: Long, hb: android.hardware.HardwareBuffer, hint: Int): Boolean
     @JvmStatic external fun yuvVsync(handle: Long, vsyncNanos: Long, periodNanos: Long)
-    @JvmStatic external fun yuvPresent(handle: Long, frame: Boolean): Boolean
+    @JvmStatic external fun yuvPresent(handle: Long, frame: Boolean, mayDefer: Boolean): Int
+    @JvmStatic external fun yuvArrived()
     @JvmStatic external fun yuvCountFrame(handle: Long)
     @JvmStatic external fun yuvCursorImage(handle: Long, rgba: ByteBuffer, w: Int, h: Int)
     @JvmStatic external fun yuvCursorMove(handle: Long, x: Int, y: Int, shown: Boolean)

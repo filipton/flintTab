@@ -12,6 +12,17 @@ use jni_sys::{JNIEnv, jobject};
 
 const CPU_WRITE_RARELY: u64 = 2 << 4;
 
+/// Bumped when a screen update arrives (tile, decoded frame), from any thread: a present
+/// waiting for the scan gives way to it (see [`Screen::present`]).
+pub static ARRIVALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What [`Screen::present`] did.
+pub const PRESENT_FAILED: i32 = 0;
+pub const PRESENT_DONE: i32 = 1;
+/// Not written: something newer arrived while waiting for the scan. The caller applies it and
+/// presents everything together (one wait instead of one after the other).
+pub const PRESENT_DEFERRED: i32 = 2;
+
 pub struct Screen {
     w: usize,
     h: usize,
@@ -143,7 +154,7 @@ impl Screen {
                 stats: Vec::new(),
             });
         }
-        self.present(false)
+        self.present(false, false) != PRESENT_FAILED
     }
 
     pub fn set_vsync(&mut self, vsync_ns: i64, period_ns: i64) {
@@ -169,12 +180,13 @@ impl Screen {
     /// with the cursor blended in. Areas far apart stay separate (a few small writes instead of
     /// one box around them), all in the same refresh. `frame`: a new video frame, paced to one
     /// per scan pass (cursor moves are not).
-    pub fn present(&mut self, frame: bool) -> bool {
-        let Some(f) = &mut self.front else { return true };
+    pub fn present(&mut self, frame: bool, may_defer: bool) -> i32 {
+        let Some(f) = &mut self.front else { return PRESENT_DONE };
         let mut rects = std::mem::take(&mut f.pending);
         if rects.is_empty() {
-            return true;
+            return PRESENT_DONE;
         }
+        let seen = ARRIVALS.load(std::sync::atomic::Ordering::Relaxed);
         let (hint, buf, per_px, visible) = (f.hint, f.buf, f.ns_per_px, f.visible_ns);
         rects.sort_by(|a, b| self.scan_rows(hint, *a).0.total_cmp(&self.scan_rows(hint, *b).0));
         let jobs: Vec<(f64, f64, f64, f64)> = rects
@@ -187,6 +199,18 @@ impl Screen {
         let not_before = if frame { visible } else { 0 };
         let asked = now_ns();
         if let Some(t) = self.plan(&jobs, not_before) {
+            // A long wait: in steps, giving way to anything that arrives meanwhile.
+            while may_defer && t - now_ns() > 1_000_000 {
+                std::thread::sleep(std::time::Duration::from_micros(400));
+                if ARRIVALS.load(std::sync::atomic::Ordering::Relaxed) != seen {
+                    if let Some(f) = &mut self.front {
+                        for r in rects {
+                            add_merged(&mut f.pending, r);
+                        }
+                    }
+                    return PRESENT_DEFERRED;
+                }
+            }
             wait_until(t);
         }
         let started = now_ns();
@@ -211,7 +235,7 @@ impl Screen {
                 f.stats.push((started - asked, done - started, area));
             }
         }
-        ok
+        if ok { PRESENT_DONE } else { PRESENT_FAILED }
     }
 
     /// When to start the writes `jobs` (scan rows [a, b) of `rows`, and duration, back to

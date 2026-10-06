@@ -37,6 +37,7 @@ fn prune(dir: &std::path::Path, prefix: &str, keep: usize) {
 /// stdout and stderr as they were before [`tee`] (-1: not teed).
 static ORIGINAL: [std::sync::atomic::AtomicI32; 2] = [std::sync::atomic::AtomicI32::new(-1), std::sync::atomic::AtomicI32::new(-1)];
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// Gives stdout and stderr back (before the process replaces itself: the tee's threads do not
 /// survive that, and output into their pipes would go nowhere).
 pub fn untee() {

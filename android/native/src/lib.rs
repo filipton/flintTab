@@ -293,8 +293,20 @@ pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvVsync(_env: *mut JNI
 
 /// Front mode: writes everything changed since the last call, timed against the scan.
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvPresent(_env: *mut JNIEnv, _c: jclass, h: jlong, frame: jni_sys::jboolean) -> jni_sys::jboolean {
-    screen(h).present(frame != 0) as jni_sys::jboolean
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvPresent(
+    _env: *mut JNIEnv,
+    _c: jclass,
+    h: jlong,
+    frame: jni_sys::jboolean,
+    may_defer: jni_sys::jboolean,
+) -> jint {
+    screen(h).present(frame != 0, may_defer != 0)
+}
+
+/// A screen update arrived (any thread): a present waiting for the scan gives way to it.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_dev_tabdisplay_Native_yuvArrived(_env: *mut JNIEnv, _c: jclass) {
+    yuv::ARRIVALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[unsafe(no_mangle)]
