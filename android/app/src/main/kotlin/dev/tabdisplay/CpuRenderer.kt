@@ -72,6 +72,12 @@ class CpuRenderer(
     private var streamW = 0
     private var streamH = 0
     private var fullNext = true
+    /**
+     * What video frames that were given up on (never decoded in time) would have changed: the
+     * next decoded frame (a complete, newer picture) redraws it too, or it would stay stale on
+     * screen (a closed menu still showing).
+     */
+    private var carried: IntArray? = null
     private var dumpBuf: ByteBuffer? = null
 
     // Cursor (network thread writes, render thread draws)
@@ -312,6 +318,9 @@ class CpuRenderer(
 
     /** Decoded frames given back unshown (see [processUpdates]); logged when it changes. */
     private var orphans = 0
+    /** Video frames given up on (not decoded within 150 ms); counted, logged now and then. */
+    private var skipped = 0
+    private var skippedLogged = 0L
 
     private fun processUpdates() {
         val h = handle
@@ -336,10 +345,16 @@ class CpuRenderer(
                             shown.add(u.pts)
                             updates.poll()
                         }
-                        // Lost (the decoder skipped it): decoding takes ~8-13 ms, so 50 ms is plenty,
-                        // and what is queued behind it does not wait longer.
-                        frames.keys.any { it > u.pts } || System.nanoTime() - u.queuedAt > 50_000_000L -> {
-                            android.util.Log.i("tabdisplay", "video frame never decoded, skipped after ${(System.nanoTime() - u.queuedAt) / 1_000_000} ms")
+                        // Lost (the decoder skipped it, or is far behind): decoding takes ~8-40 ms, so
+                        // 150 ms is plenty, and what is queued behind it does not wait longer.
+                        frames.keys.any { it > u.pts } || System.nanoTime() - u.queuedAt > 150_000_000L -> {
+                            // Its area is redrawn from the next decoded frame (see [carried]).
+                            val a = changedArea(u.pts)
+                            if (a == null) fullNext = true
+                            else carried = carried?.let { c ->
+                                intArrayOf(minOf(c[0], a[0]), minOf(c[1], a[1]), maxOf(c[2], a[2]), maxOf(c[3], a[3]))
+                            } ?: a
+                            skipped++
                             updates.poll()
                         }
                         else -> {
@@ -349,6 +364,12 @@ class CpuRenderer(
                     }
                 }
             }
+        }
+        if (skipped + orphans > 0 && System.nanoTime() - skippedLogged > 10_000_000_000L) {
+            TLog.i("video frames late: $skipped not decoded within 150 ms (their areas redrawn from the next), $orphans arrived after")
+            skipped = 0
+            orphans = 0
+            skippedLogged = System.nanoTime()
         }
         // Frames nobody waits for (they came after their update was given up as lost): give
         // them back now. Each holds one of the decoder's few output buffers; once all are
@@ -361,7 +382,7 @@ class CpuRenderer(
                 if (e.key !in waiting) {
                     e.value.second()
                     it.remove()
-                    android.util.Log.i("tabdisplay", "decoded frame came too late, given back (${++orphans} so far)")
+                    ++orphans
                 }
             }
         }
@@ -370,8 +391,15 @@ class CpuRenderer(
     private fun drawFrame(target: Long, img: Image, pts: Long) {
         val w = minOf(img.width, view.width)
         val h = minOf(img.height, view.height)
-        val c = if (fullNext) null else changedArea(pts)
+        val own = if (fullNext) null else changedArea(pts)
+        val extra = carried
+        val c = when {
+            own == null -> null
+            extra == null -> own
+            else -> intArrayOf(minOf(own[0], extra[0]), minOf(own[1], extra[1]), maxOf(own[2], extra[2]), maxOf(own[3], extra[3]))
+        }
         fullNext = false
+        carried = null
         val x0: Int; val y0: Int; val x1: Int; val y1: Int
         if (c == null) {
             x0 = 0; y0 = 0; x1 = w; y1 = h

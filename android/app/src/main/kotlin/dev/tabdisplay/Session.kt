@@ -222,6 +222,7 @@ class Session(
      * this device (a decoder failing, or taking frames and giving none back) moves to the next.
      */
     var decoderLevel = 0
+    private val decoderFailures = ArrayList<Long>()
 
     private fun newDecoder(surface: Surface, w: Int, h: Int, fps: Int): Decoder {
         val r = front
@@ -273,11 +274,23 @@ class Session(
         var config: IntArray? = null // w, h, fps
         var needKeyframe = false
         var frameBuf = ByteArray(1 shl 20) // reused: no per-frame allocation/GC
-        /** The decoder misbehaved: the next setup, and a keyframe for it. */
-        fun replaceDecoder(d: Decoder, why: String) {
+        /**
+         * The decoder misbehaved: rebuilt, and a keyframe for it. One that gave nothing back at
+         * all, or failed three times within half a minute, makes way for the next setup; a
+         * single hiccup does not (a slow frame is not a broken decoder).
+         */
+        fun replaceDecoder(d: Decoder, why: String, broken: Boolean) {
             d.close()
-            if (decoderLevel < 2) decoderLevel++
-            TLog.i("decoder ${d.name}: $why; switching to setup $decoderLevel")
+            val now = System.nanoTime()
+            decoderFailures.removeAll { now - it > 30_000_000_000L }
+            decoderFailures.add(now)
+            if ((broken || decoderFailures.size >= 3) && decoderLevel < 2) {
+                decoderLevel++
+                decoderFailures.clear()
+                TLog.i("decoder ${d.name}: $why; switching to setup $decoderLevel")
+            } else {
+                TLog.i("decoder ${d.name}: $why; restarting it")
+            }
             val c = config!!
             decoder = newDecoder(surface, c[0], c[1], c[2])
             needKeyframe = true
@@ -343,8 +356,8 @@ class Session(
                             when {
                                 // Decoder died (e.g. a codec error): rebuild it and ask the host for
                                 // a keyframe instead of tearing the whole connection down.
-                                !ok -> replaceDecoder(d, d.error ?: "stopped taking frames")
-                                d.silent() -> replaceDecoder(d, "took ${d.inputs} frames and gave none back")
+                                !ok -> replaceDecoder(d, d.error ?: "stopped taking frames", broken = false)
+                                d.silent() -> replaceDecoder(d, "took ${d.inputs} frames and gave none back", broken = true)
                             }
                         }
                         // Flow control: the host keeps at most a couple of frames unacknowledged.
@@ -551,7 +564,7 @@ private class Decoder(
         private set
     private val freeInputs = LinkedBlockingQueue<Int>()
     /** How long without a free input means stuck: software decoding is just slow. */
-    private val stuckNanos = if (level >= 2) 1_000_000_000L else 50_000_000L
+    private val stuckNanos = if (level >= 2) 1_000_000_000L else 500_000_000L
     val name: String
     /** Frames fed and frames out, for the watchdog: a decoder can take everything and give nothing. */
     @Volatile var inputs = 0
