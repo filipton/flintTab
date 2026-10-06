@@ -1,3 +1,4 @@
+#include <algorithm>
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
 
@@ -83,13 +84,27 @@ private:
   }
 };
 
+// "Looks like" widths of the scaled Retina modes, and the height for one (even, the panel's shape).
+static const unsigned int kLooksLike[] = {1280, 1440, 1600, 1920, 2048};
+static unsigned int LooksLikeHeight(unsigned int lw, unsigned int width, unsigned int height) {
+  return (unsigned int)((double)lw * height / width / 2 + 0.5) * 2;
+}
+
 void VDisplay::InitializeDescriptor(NSString *displayName, unsigned int width,
                                     unsigned int height, int ppi) {
   _descriptor = [[CGVirtualDisplayDescriptor alloc] init];
   _descriptor.name = displayName;
-  // Room for the scaled Retina modes (up to twice the panel).
-  _descriptor.maxPixelsWide = width * 2;
-  _descriptor.maxPixelsHigh = height * 2;
+  // Room for the scaled Retina modes and no more: with room for twice the panel, macOS also
+  // offers (and picks by default) the panel's own size drawn at twice its pixels, 4x the
+  // compositing and a scale-down for the same picture: ~2 ms more per frame before capture.
+  unsigned int maxW = width, maxH = height;
+  for (unsigned int lw : kLooksLike) {
+    if (lw <= width / 2 || lw >= width) continue;
+    maxW = std::max(maxW, lw * 2);
+    maxH = std::max(maxH, LooksLikeHeight(lw, width, height) * 2);
+  }
+  _descriptor.maxPixelsWide = maxW;
+  _descriptor.maxPixelsHigh = maxH;
 
   double ratio = 25.4 / ppi;
   _descriptor.sizeInMillimeters = CGSizeMake(width * ratio, height * ratio);
@@ -122,10 +137,9 @@ void VDisplay::InitializeSettings(unsigned int width, unsigned int height,
     // low-resolution mode would be stretched up instead, and blurry).
     NSMutableArray<CGVirtualDisplayMode *> *modes = [NSMutableArray arrayWithObject:mode];
     [mode release];
-    static const unsigned int looksLike[] = {1280, 1440, 1600, 1920, 2048};
-    for (unsigned int lw : looksLike) {
+    for (unsigned int lw : kLooksLike) {
       if (lw <= width / 2 || lw >= width) continue;
-      unsigned int lh = (unsigned int)((double)lw * height / width / 2 + 0.5) * 2;
+      unsigned int lh = LooksLikeHeight(lw, width, height);
       CGVirtualDisplayMode *scaled =
           [[CGVirtualDisplayMode alloc] initWithWidth:lw * 2
                                                height:lh * 2
