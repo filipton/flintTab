@@ -48,8 +48,11 @@ docker run --rm --platform linux/amd64 -v "$PWD":/src -w /src \
 for image in ubuntu:24.04 archlinux:latest; do
   step "Linux file on a clean $image"
   docker run --rm --platform linux/amd64 -v "$PWD":/src:ro -e OUT="$out" "$image" sh -c '
-    if command -v pacman >/dev/null; then pacman -Sy --noconfirm --disable-sandbox python >/dev/null 2>&1
-    else apt-get update -qq && apt-get install -y -qq python3 >/dev/null 2>&1; fi
+    for try in 1 2 3; do  # (package downloads under emulation sometimes fail: retry)
+      if command -v pacman >/dev/null; then pacman -Sy --noconfirm --disable-sandbox python >/dev/null 2>&1
+      else apt-get update -qq && apt-get install -y -qq python3 >/dev/null 2>&1; fi
+      command -v python3 >/dev/null && break
+    done
     cp /src/$OUT/tabdisplay-linux-x86_64 /tmp/td
     /tmp/td --no-adb --test-source --fps 60 >/tmp/host.log 2>&1 &
     sleep 5
