@@ -67,7 +67,9 @@ class Session(
 
     private val worker = thread(name = "session", isDaemon = true) {
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
-        loop()
+        val tid = Process.myTid()
+        HotThreads.add(tid)
+        try { loop() } finally { HotThreads.remove(tid) }
     }
 
 
@@ -625,7 +627,10 @@ private class Decoder(
     /** What the codec reported when it failed. */
     @Volatile var error: String? = null
         private set
-    private val callbacks = HandlerThread("decoder", Process.THREAD_PRIORITY_URGENT_DISPLAY).apply { start() }
+    private val callbacks = HandlerThread("decoder", Process.THREAD_PRIORITY_URGENT_DISPLAY).apply {
+        start()
+        HotThreads.add(threadId)
+    }
 
     init {
         val info = if (level >= 2) pickSoftwareDecoder() else pickDecoder()
@@ -708,6 +713,7 @@ private class Decoder(
         }
         if (!started) {
             codec.release()
+            HotThreads.remove(callbacks.threadId)
             callbacks.quitSafely()
             throw IllegalStateException("${codec.name} took no configuration")
         }
@@ -751,6 +757,7 @@ private class Decoder(
         open = false
         try { codec.stop() } catch (_: Exception) {}
         codec.release()
+        HotThreads.remove(callbacks.threadId)
         callbacks.quitSafely()
     }
 }
@@ -860,6 +867,9 @@ private class AccessoryInput(private val src: java.io.InputStream) : java.io.Inp
         pos += k
         return k
     }
+
+    /** What is already here (never asks the driver: Huawei's rejects that ioctl). */
+    override fun available(): Int = len - pos
 
     override fun close() = src.close()
 }

@@ -53,6 +53,28 @@ class CpuRenderer(
      */
     private var hint: android.os.PerformanceHintManager.Session? = null
 
+    private var renderTid = 0
+
+    /**
+     * The hint covers every thread that puts updates on screen (this one, the link reader, the
+     * decoder's): they wake from idle on a slow core otherwise (~1 ms before they even run).
+     */
+    private fun refreshHint() {
+        val tids = (listOf(renderTid) + HotThreads.tids).filter { it > 0 }.distinct().toIntArray()
+        val manager = view.context.getSystemService(android.os.PerformanceHintManager::class.java) ?: return
+        val old = hint
+        hint = try {
+            manager.createHintSession(tids, 1_000_000L) // 1 ms per update
+        } catch (_: Exception) {
+            null
+        } ?: try {
+            manager.createHintSession(intArrayOf(renderTid), 1_000_000L)
+        } catch (_: Exception) {
+            null
+        }
+        if (hint !== old) try { old?.close() } catch (_: Exception) {}
+    }
+
     private fun reportWork(started: Long) {
         try {
             hint?.reportActualWorkDuration(System.nanoTime() - started)
@@ -169,12 +191,9 @@ class CpuRenderer(
         }
         surface = view.holder.surface
         followVsync()
-        hint = try {
-            view.context.getSystemService(android.os.PerformanceHintManager::class.java)
-                ?.createHintSession(intArrayOf(Process.myTid()), 1_000_000L) // 1 ms per update
-        } catch (_: Exception) {
-            null
-        }
+        renderTid = Process.myTid()
+        refreshHint()
+        HotThreads.onChange = { handler.post(::refreshHint) }
     }
 
     override fun frameDecoded(pts: Long, image: Image, done: () -> Unit) {
@@ -656,5 +675,19 @@ class CpuRenderer(
             overlayCursor.release()
         }
         thread.quitSafely()
+    }
+}
+
+/** Threads besides the render thread that put updates on screen (for the CPU performance hint). */
+object HotThreads {
+    val tids: MutableSet<Int> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    @Volatile var onChange: (() -> Unit)? = null
+
+    fun add(tid: Int) {
+        if (tids.add(tid)) onChange?.invoke()
+    }
+
+    fun remove(tid: Int) {
+        if (tids.remove(tid)) onChange?.invoke()
     }
 }
