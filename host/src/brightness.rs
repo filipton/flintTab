@@ -84,6 +84,15 @@ impl Brightness {
         *self.own.lock().unwrap() = Some(v.min(100));
     }
 
+    /// Sets `level` (0..=100) as if chosen here (remembered like a key press).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn set(&self, level: u8) {
+        let level = level.min(100);
+        LEVELS.lock().unwrap().get_or_insert_with(HashMap::new).insert(self.tablet.clone(), Some(level));
+        self.send(Some(level));
+        save(&self.tablet, Some(level));
+    }
+
     /// Up or down `steps` of `of` across the range (macOS: 16 per key, 64 with ⌥⇧).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn step(&self, steps: i32, of: i32) -> u8 {

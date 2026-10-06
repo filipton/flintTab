@@ -82,6 +82,8 @@ struct Running {
     cursor: Option<cursor::CursorSender>,
     /// The brightness keys set the tablet's brightness while the mouse is on it.
     keys: Option<keys::BrightnessKeys>,
+    /// The tablet's brightness follows the Mac's screen (`--follow-mac-brightness`).
+    follow: Option<keys::FollowMac>,
     gate: Arc<Gate<Frame<CVPixelBuffer>>>,
     encode_thread: Option<thread::JoinHandle<()>>,
 }
@@ -96,6 +98,7 @@ impl Drop for Running {
         }
         drop(self.cursor.take());
         drop(self.keys.take());
+        drop(self.follow.take());
         drop(self.capture.take());
         self.gate.close();
         if let Some(t) = self.encode_thread.take() {
@@ -182,13 +185,16 @@ impl Host for MacHost {
                 })
             })
         };
-        let mut running = Running { test_window: None, capture: None, cursor: None, keys: None, gate: gate.clone(), encode_thread: Some(encode_thread) };
+        let mut running = Running { test_window: None, capture: None, cursor: None, keys: None, follow: None, gate: gate.clone(), encode_thread: Some(encode_thread) };
 
         // The cursor goes to the tablet separately, ahead of the video, unless asked otherwise.
         if !args.cursor_in_video {
             running.cursor = Some(cursor::CursorSender::start(display_id, tx.clone()));
         }
         running.keys = keys::BrightnessKeys::start(display_id, cfg.brightness.clone());
+        if args.follow_mac_brightness {
+            running.follow = keys::FollowMac::start(cfg.brightness.clone());
+        }
         running.capture = Some(capture::Capture::start(
             display_id,
             w,

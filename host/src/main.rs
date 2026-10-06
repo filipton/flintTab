@@ -116,6 +116,10 @@ pub struct Args {
     /// tablet). macOS: the brightness keys set it too while the mouse is on the tablet's display
     #[arg(long, value_parser = brightness::parse_arg)]
     brightness: Option<brightness::Level>,
+    /// macOS: the tablet's brightness follows this Mac's own screen (its slider in System
+    /// Settings and Control Center, and its keys); macOS gives a virtual display no slider of its own
+    #[arg(long)]
+    follow_mac_brightness: bool,
     /// Let a tablet power this computer over USB-C (by default it is kept to taking power)
     #[arg(long)]
     tablet_powers_computer: bool,

@@ -8,8 +8,13 @@ use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 use std::{
     ffi::c_void,
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
+    time::Duration,
 };
 
 use crate::brightness::Brightness;
@@ -38,6 +43,8 @@ unsafe extern "C" {
     fn CGDisplayBounds(display: u32) -> CGRect;
     fn CGEventCreate(source: *const c_void) -> *mut c_void;
     fn CGEventGetLocation(event: *const c_void) -> CGPoint;
+    fn CGGetOnlineDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    fn CGDisplayIsBuiltin(display: u32) -> u32;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -164,4 +171,76 @@ extern "C" fn on_event(_proxy: *mut c_void, kind: u32, event: *mut c_void, info:
         println!("tablet brightness {level}%");
     }
     std::ptr::null_mut()
+}
+
+/// The tablet's brightness follows the Mac's built-in screen: its slider in System Settings and
+/// Control Center, its keys and auto-brightness (macOS gives a virtual display no slider).
+pub struct FollowMac {
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+/// How often the Mac's level is read (a call to corebrightnessd; a slider drag stays smooth).
+const FOLLOW_POLL: Duration = Duration::from_millis(100);
+
+impl FollowMac {
+    /// None without a built-in screen (DisplayServices drives no other).
+    pub fn start(brightness: Arc<Brightness>) -> Option<Self> {
+        let get = display_services_get()?;
+        let builtin = builtin_display()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let mut last: Option<u8> = None;
+                while !stop.load(Ordering::Relaxed) {
+                    let mut v = 0f32;
+                    if unsafe { get(builtin, &mut v) } == 0 {
+                        let level = (v.clamp(0.0, 1.0) * 100.0).round() as u8;
+                        if last != Some(level) {
+                            brightness.set(level);
+                            last = Some(level);
+                        }
+                    }
+                    thread::sleep(FOLLOW_POLL);
+                }
+            })
+        };
+        println!("the tablet's brightness follows this Mac's screen");
+        Some(Self { stop, thread: Some(thread) })
+    }
+}
+
+impl Drop for FollowMac {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            t.join().ok();
+        }
+    }
+}
+
+type GetBrightness = unsafe extern "C" fn(u32, *mut f32) -> i32;
+
+/// DisplayServicesGetBrightness (private; what the slider shows, 0..=1).
+fn display_services_get() -> Option<GetBrightness> {
+    unsafe {
+        let lib = libc::dlopen(c"/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices".as_ptr(), libc::RTLD_NOW);
+        let f = (!lib.is_null()).then(|| libc::dlsym(lib, c"DisplayServicesGetBrightness".as_ptr())).filter(|f| !f.is_null());
+        if f.is_none() {
+            println!("cannot follow the Mac's brightness: DisplayServices is missing");
+        }
+        f.map(|f| std::mem::transmute::<*mut c_void, GetBrightness>(f))
+    }
+}
+
+fn builtin_display() -> Option<u32> {
+    let mut ids = [0u32; 16];
+    let mut n = 0u32;
+    unsafe { CGGetOnlineDisplayList(16, ids.as_mut_ptr(), &mut n) };
+    let found = ids[..n as usize].iter().copied().find(|&d| unsafe { CGDisplayIsBuiltin(d) } != 0);
+    if found.is_none() {
+        println!("cannot follow the Mac's brightness: this Mac has no built-in screen");
+    }
+    found
 }
