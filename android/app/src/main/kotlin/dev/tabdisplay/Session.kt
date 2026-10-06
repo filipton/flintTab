@@ -732,11 +732,12 @@ private class Decoder(
             val buf = codec.getInputBuffer(i)!!
             buf.clear()
             buf.put(au, 0, size)
+            val filled = System.nanoTime()
             codec.queueInputBuffer(i, 0, size, pts, 0)
-            feedTimes.add(longArrayOf(got - start, System.nanoTime() - got))
+            feedTimes.add(longArrayOf(got - start, filled - got, System.nanoTime() - filled))
             if (feedTimes.size >= 300) {
-                val q = { k: Int, f: Double -> feedTimes.map { it[k] }.sorted().let { "%.1f".format(it[((it.size - 1) * f).toInt()] / 1e6) } }
-                TLog.i("decoder input: waited ${q(0, 0.5)}/${q(0, 0.95)} ms for a buffer, queueing took ${q(1, 0.5)}/${q(1, 0.95)} ms (median/p95)")
+                val q = { k: Int, f: Double -> feedTimes.map { it[k] }.sorted().let { "%.2f".format(it[((it.size - 1) * f).toInt()] / 1e6) } }
+                TLog.i("decoder input: waited ${q(0, 0.5)}/${q(0, 0.95)} ms for a buffer, filling ${q(1, 0.5)}/${q(1, 0.95)}, queueInputBuffer ${q(2, 0.5)}/${q(2, 0.95)} ms (median/p95)")
                 feedTimes.clear()
             }
             if (inputs++ == 0) firstInputAt = System.nanoTime()
