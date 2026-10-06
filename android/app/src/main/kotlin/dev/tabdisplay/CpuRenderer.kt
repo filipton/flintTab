@@ -276,6 +276,9 @@ class CpuRenderer(
         // Scaled to the panel once here; the native sprite is drawn 1:1.
         val w = maxOf(1, (sizePt[0] * scale).toInt())
         val h = maxOf(1, (sizePt[1] * scale).toInt())
+        // A display width caught mid-reconfiguration (a few points) would scale the cursor to
+        // gigabytes: no real cursor is a quarter of the screen.
+        if (w > paintWidth / 4 || h > paintWidth / 4) return
         cursorHot = intArrayOf((hotPt[0] * scale).toInt(), (hotPt[1] * scale).toInt())
         cursorScale = scale
         cursorImage = Bitmap.createScaledBitmap(bitmap.copy(Bitmap.Config.ARGB_8888, false), w, h, true)

@@ -73,7 +73,9 @@ impl CursorSender {
                 let mut shape_at = Instant::now() - SHAPE_EVERY;
                 while !stop.load(Ordering::Relaxed) {
                     let b = unsafe { CGDisplayBounds(display_id) };
-                    if shape_at.elapsed() >= SHAPE_EVERY {
+                    // (A display being reconfigured can report a width of a few points, which
+                    // would scale the cursor on the tablet to an enormous size: wait it out.)
+                    if shape_at.elapsed() >= SHAPE_EVERY && b.size.x >= 320.0 {
                         shape_at = Instant::now();
                         if let Some(shape) = current_shape(b.size.x)
                             && last_shape.as_ref() != Some(&shape)
